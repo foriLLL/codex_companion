@@ -24,7 +24,7 @@ Emby 卡片宽度为 300px，高度不超过 400px，并会在较矮窗口中自
 | --- | --- |
 | 使用 Release 应用 | macOS 13+；`/Applications/ChatGPT.app`；不要求 Node.js |
 | 从源码运行 | Node.js 22+、npm；依赖安装会提供构建所需的 Bun |
-| 本机重封装/转码 | 可选的系统 FFmpeg，推荐 `brew install ffmpeg` |
+| 本机重封装/转码 | 可选的系统 FFmpeg；Release 安装器会优先通过现有 Homebrew 自动安装 |
 
 没有 FFmpeg 时，红果播放、Emby HLS 和兼容 MP4 直连仍可使用；只有 MKV、
 HEVC、EC-3、复杂多音轨或字幕烧录等本机处理路径不可用。也可以通过
@@ -51,6 +51,11 @@ bash install-codex-companion.sh
 
 应用安装到 `~/Applications/Codex Companion.app`。如果仓库尚未发布 Release，
 请使用下面的源码方式；不要从第三方下载未经签名的安装包。
+
+安装器发现系统缺少 FFmpeg 时，会在已有 Homebrew 的机器上默认执行
+`brew install ffmpeg`。Homebrew 不存在或安装失败不会影响主程序安装，结束时会
+明确提示受影响的视频格式和补装命令。如需主动跳过自动安装，可以运行
+`CODEX_COMPANION_SKIP_FFMPEG=1 bash install-codex-companion.sh`。
 
 ### 从源码运行
 
