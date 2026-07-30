@@ -117,7 +117,12 @@ function makeClient(settings, calls) {
       if (String(url).includes("/Subtitles/")) {
         const text = String(url).includes("Stream.vtt")
           ? "WEBVTT\n\n00:00.000 --> 00:01.000\n字幕"
-          : "[Script Info]\nScriptType: v4.00+";
+          : `[Script Info]
+ScriptType: v4.00+
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,ASS 字幕`;
         return options.responseType === "text"
           ? { text, contentType: "text/vtt", url }
           : { bytes: new TextEncoder().encode(text), contentType: "text/vtt", url };
@@ -133,7 +138,7 @@ function makeClient(settings, calls) {
   };
 }
 
-test("字幕流映射区分外部 VTT、ASS 和图形字幕，并尊重默认/强制轨道", () => {
+test("字幕流映射把文字字幕统一交给 WebVTT，并仅烧录图形字幕", () => {
   const source = {
     DefaultSubtitleStreamIndex: 3,
     MediaStreams: [
@@ -155,7 +160,7 @@ test("字幕流映射区分外部 VTT、ASS 和图形字幕，并尊重默认/�
   const subtitles = mapSubtitleStreams(source);
   assert.deepEqual(subtitles.map(({ index, mode, isExternal }) => ({ index, mode, isExternal })), [
     { index: 2, mode: "external-vtt", isExternal: true },
-    { index: 3, mode: "burn-in", isExternal: false },
+    { index: 3, mode: "external-vtt", isExternal: false },
     { index: 4, mode: "burn-in", isExternal: false }
   ]);
   assert.equal(defaultSubtitleIndex(source, subtitles), 3);
@@ -746,7 +751,7 @@ test("HLS 本地代理启动失败时降级为纯 hlsUrl 并记 warn，播放生
   assert.equal(calls.some((call) => call.method === "stopped"), true);
 });
 
-test("HLS 字幕切换重建 hlsUrl 时 hlsProxyUrl 同步更新且不重新注册", async () => {
+test("HLS 图形字幕切换重建 hlsUrl 时 hlsProxyUrl 同步更新且不重新注册", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -770,8 +775,8 @@ test("HLS 字幕切换重建 hlsUrl 时 hlsProxyUrl 同步更新且不重新注�
             SupportsTranscoding: true,
             DefaultSubtitleStreamIndex: 5,
             MediaStreams: [{
-              Type: "Subtitle", Index: 5, Codec: "ass", Language: "chi",
-              IsTextSubtitleStream: true, IsDefault: true
+              Type: "Subtitle", Index: 5, Codec: "hdmv_pgs_subtitle", Language: "chi",
+              IsTextSubtitleStream: false, IsDefault: true
             }]
           }]
         };
@@ -961,7 +966,7 @@ test("playback.open 随带字幕偏好时一次选好，不再依赖默认选择
   assert.equal(off.selectedSubtitleIndex, null);
 });
 
-test("HLS 的 ASS 字幕由 Emby Encode，关闭时停止旧转码并原位重启", async () => {
+test("HLS 的图形字幕由 Emby Encode，关闭时停止旧转码并原位重启", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -985,8 +990,8 @@ test("HLS 的 ASS 字幕由 Emby Encode，关闭时停止旧转码并原位重�
             SupportsTranscoding: true,
             DefaultSubtitleStreamIndex: 5,
             MediaStreams: [{
-              Type: "Subtitle", Index: 5, Codec: "ass", Language: "chi",
-              IsTextSubtitleStream: true, IsDefault: true
+              Type: "Subtitle", Index: 5, Codec: "hdmv_pgs_subtitle", Language: "chi",
+              IsTextSubtitleStream: false, IsDefault: true
             }]
           }]
         };
@@ -1029,7 +1034,7 @@ test("HLS 的 ASS 字幕由 Emby Encode，关闭时停止旧转码并原位重�
   assert.equal(switchCalls.find((call) => call.method === "stopped").session.playSessionId, "ass-session-1");
 });
 
-test("HLS 字幕新会话预检失败时保留旧字幕和旧 PlaySession", async () => {
+test("HLS 图形字幕新会话预检失败时保留旧字幕和旧 PlaySession", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -1052,8 +1057,8 @@ test("HLS 字幕新会话预检失败时保留旧字幕和旧 PlaySession", asyn
             SupportsTranscoding: true,
             DefaultSubtitleStreamIndex: 4,
             MediaStreams: [{
-              Type: "Subtitle", Index: 4, Codec: "ass",
-              IsTextSubtitleStream: true, IsDefault: true
+              Type: "Subtitle", Index: 4, Codec: "hdmv_pgs_subtitle",
+              IsTextSubtitleStream: false, IsDefault: true
             }]
           }]
         };
@@ -1086,7 +1091,7 @@ test("HLS 字幕新会话预检失败时保留旧字幕和旧 PlaySession", asyn
   assert.equal(calls.findLast((call) => call.method === "stopEncoding").playSessionId, "session-2");
 });
 
-test("仅直连媒体的 PGS/ASS 使用本机 FFmpeg，关闭字幕后恢复 MP4 媒体桥", async () => {
+test("仅直连媒体只为 PGS 启动 FFmpeg，ASS 切为 WebVTT 后恢复 MP4 媒体桥", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -1171,10 +1176,17 @@ test("仅直连媒体的 PGS/ASS 使用本机 FFmpeg，关闭字幕后恢复 MP4
     subtitleStreamIndex: 3,
     positionTicks: 40_000_000
   });
-  assert.equal(selectedAss.streamMode, "ffmpeg-fmp4");
-  assert.equal(created[1].kind, "ffmpeg");
-  assert.equal(created[1].options.subtitleTrack.codec, "ass");
-  assert.match(new TextDecoder().decode(created[1].options.subtitleData), /^\[Script Info\]/);
+  assert.equal(selectedAss.streamMode, "direct-mp4");
+  assert.equal(selectedAss.subtitleMode, "external-vtt");
+  assert.equal(selectedAss.restartRequired, true);
+  assert.equal(created[1].kind, "direct");
+  assert.equal(ffmpegDestroyed, true);
+  const loadedAss = await service.handleRpc("playback.subtitle.load", {
+    playbackId: opened.playbackId,
+    subtitleStreamIndex: 3
+  });
+  assert.match(loadedAss.data, /^WEBVTT/);
+  assert.match(loadedAss.data, /ASS 字幕/);
 
   const switched = await service.handleRpc("playback.subtitle.select", {
     playbackId: opened.playbackId,
@@ -1182,12 +1194,11 @@ test("仅直连媒体的 PGS/ASS 使用本机 FFmpeg，关闭字幕后恢复 MP4
     positionTicks: 50_000_000
   });
   assert.equal(switched.streamMode, "direct-mp4");
-  assert.equal(switched.restartRequired, true);
-  assert.equal(created[2].kind, "direct");
-  assert.equal(ffmpegDestroyed, true);
+  assert.equal(switched.restartRequired, false);
+  assert.equal(created.length, 2);
 });
 
-test("本机 FFmpeg 外挂 ASS 使用 Node 私有字幕数据，DeliveryUrl 不暴露给 Renderer", async () => {
+test("外挂 ASS 在 Node 内转换为 WebVTT，DeliveryUrl 不暴露给 Renderer", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -1196,7 +1207,6 @@ test("本机 FFmpeg 外挂 ASS 使用 Node 私有字幕数据，DeliveryUrl 不�
     deviceId: "device"
   };
   const resourceUrls = [];
-  let ffmpegOptions = null;
   const service = new EmbyService({
     storage: new FakeStorage(config, "token"),
     clientFactory: (settings) => {
@@ -1232,7 +1242,14 @@ test("本机 FFmpeg 外挂 ASS 使用 Node 私有字幕数据，DeliveryUrl 不�
         if (String(url).includes("/Subtitles/")) {
           throw new EmbyError("NOT_FOUND", "标准字幕端点不可用");
         }
-        return { bytes: Uint8Array.of(91, 83, 99, 114, 105, 112, 116, 32, 73, 110, 102, 111, 93) };
+        return {
+          bytes: new TextEncoder().encode(`[Script Info]
+ScriptType: v4.00+
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,私有 ASS 字幕`)
+        };
       };
       return client;
     },
@@ -1240,13 +1257,7 @@ test("本机 FFmpeg 外挂 ASS 使用 Node 私有字幕数据，DeliveryUrl 不�
       async initialize() { return { tracks: [{ id: 0, mime: "video/mp4", initData: "AQ==" }] }; },
       destroy() {}
     }),
-    ffmpegSessionFactory: (options) => {
-      ffmpegOptions = options;
-      return {
-        async initialize() { return { tracks: [{ id: 0, mime: "video/mp4", initData: "AQ==" }] }; },
-        destroy() {}
-      };
-    },
+    ffmpegSessionFactory: () => { throw new Error("ASS 不应启动 FFmpeg"); },
     randomUUIDImpl: () => "external-ass-playback"
   });
 
@@ -1257,13 +1268,19 @@ test("本机 FFmpeg 外挂 ASS 使用 Node 私有字幕数据，DeliveryUrl 不�
     subtitleStreamIndex: 2,
     positionTicks: 10_000_000
   });
-  assert.equal(selected.streamMode, "ffmpeg-fmp4");
+  assert.equal(selected.streamMode, "direct-mp4");
+  assert.equal(selected.subtitleMode, "external-vtt");
+  assert.equal(selected.restartRequired, false);
+  const loaded = await service.handleRpc("playback.subtitle.load", {
+    playbackId: opened.playbackId,
+    subtitleStreamIndex: 2
+  });
   assert.deepEqual(resourceUrls, [
     "https://emby.example/emby/Videos/movie/direct-source/Subtitles/2/Stream.ass",
     "https://emby.example/emby/private/subtitle.ass"
   ]);
-  assert.equal(ffmpegOptions.subtitleTrack.index, 2);
-  assert.deepEqual([...ffmpegOptions.subtitleData], [91, 83, 99, 114, 105, 112, 116, 32, 73, 110, 102, 111, 93]);
+  assert.match(loaded.data, /^WEBVTT/);
+  assert.match(loaded.data, /私有 ASS 字幕/);
 });
 
 test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS 转码", async () => {
@@ -1476,7 +1493,7 @@ test("仅支持直连的 MKV 交给本机 FFmpeg 媒体桥，不调用 Emby 转�
   assert.equal(calls.some((call) => call.method === "stopEncoding"), false);
 });
 
-test("字幕新长流被 CDN 持续拒绝时刷新地址并降级分块 Range，保留原 PlaySession", async () => {
+test("图形字幕新长流被 CDN 持续拒绝时刷新地址并降级分块 Range，保留原 PlaySession", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -1493,7 +1510,7 @@ test("字幕新长流被 CDN 持续拒绝时刷新地址并降级分块 Range，
   const mediaStreams = [
     { Type: "Video", Index: 0, Codec: "h264" },
     { Type: "Audio", Index: 1, Codec: "aac" },
-    { Type: "Subtitle", Index: 2, Codec: "ass", Language: "chi", IsTextSubtitleStream: true, IsExternal: false }
+    { Type: "Subtitle", Index: 2, Codec: "hdmv_pgs_subtitle", Language: "chi", IsTextSubtitleStream: false, IsExternal: false }
   ];
   const mediaSourceFor = (tag) => ({
     Id: "mp4-source",
@@ -1578,7 +1595,7 @@ test("字幕新长流被 CDN 持续拒绝时刷新地址并降级分块 Range，
   assert.equal(rangeAttempts.length, 1);
   assert.equal(rangeAttempts[0].resolvedUrl, null);
 
-  // 播放约 404 秒后切换 ASS 字幕：烧录流重启时旧 CDN 地址已过期。
+  // 播放约 404 秒后切换图形字幕：烧录流重启时旧 CDN 地址已过期。
   const selected = await service.handleRpc("playback.subtitle.select", {
     playbackId: opened.playbackId,
     subtitleStreamIndex: 2,
@@ -1621,7 +1638,7 @@ test("字幕新长流被 CDN 持续拒绝时刷新地址并降级分块 Range，
   assert.equal(progress.session.playSessionId, "session-v1");
 });
 
-test("CDN 拒绝新旧媒体流共存时，停止旧流后重试字幕流初始化成功", async () => {
+test("CDN 拒绝新旧媒体流共存时，停止旧流后重试图形字幕流初始化成功", async () => {
   // 与上一个用例同场景，但分块 Range 也一律 403（反盗连按“第二个读者”卡）：
   // 只有停掉旧流（第一位读者让出）之后才放行。
   const config = {
@@ -1636,7 +1653,7 @@ test("CDN 拒绝新旧媒体流共存时，停止旧流后重试字幕流初始�
   const mediaStreams = [
     { Type: "Video", Index: 0, Codec: "h264" },
     { Type: "Audio", Index: 1, Codec: "aac" },
-    { Type: "Subtitle", Index: 2, Codec: "ass", Language: "chi", IsTextSubtitleStream: true, IsExternal: false }
+    { Type: "Subtitle", Index: 2, Codec: "hdmv_pgs_subtitle", Language: "chi", IsTextSubtitleStream: false, IsExternal: false }
   ];
   const service = new EmbyService({
     storage: new FakeStorage(config, "token"),
@@ -1972,6 +1989,7 @@ function multiSourceService() {
     serverId: "server", userId: "user", username: "alice", deviceId: "device"
   };
   const calls = [];
+  const ffmpegCreations = [];
   const service = new EmbyService({
     storage: new FakeStorage(config, "token"),
     clientFactory: (settings) => {
@@ -1984,10 +2002,13 @@ function multiSourceService() {
       client.getSeasons = async () => ({ Items: [{ Id: "season", Name: "第一季", Type: "Season", IndexNumber: 1 }] });
       return client;
     },
-    ffmpegSessionFactory: () => ({ destroy() {} }),
+    ffmpegSessionFactory: (options) => {
+      ffmpegCreations.push(options);
+      return { destroy() {} };
+    },
     randomUUIDImpl: () => "pb-multi"
   });
-  return { service, calls };
+  return { service, calls, ffmpegCreations };
 }
 
 test("series.get 返回可选源列表 sourceOptions", async () => {
@@ -2003,6 +2024,27 @@ test("playback.open 默认选中带字幕的 4K 源，字幕轨随之带出", as
   assert.equal(opened.mediaSourceId, "src-4k");
   assert.equal(opened.sourceKey, "4k|mkv#0");
   assert.equal(opened.subtitles.length, 1, "4K 源应带出 1 条字幕，字幕按钮才会显示");
+});
+
+test("4K HEVC + ASS 只转码音视频，文字字幕独立转换为 WebVTT", async () => {
+  const { service, ffmpegCreations } = multiSourceService();
+  const opened = await service.handleRpc("playback.open", {
+    itemId: "ep1",
+    subtitlePreference: { off: false, language: "chi" }
+  });
+  assert.equal(opened.streamMode, "ffmpeg-fmp4");
+  assert.equal(opened.subtitleMode, "external-vtt");
+  assert.equal(opened.selectedSubtitleIndex, 2);
+  assert.equal(ffmpegCreations.length, 1);
+  assert.equal(ffmpegCreations[0].subtitleTrack, null);
+  assert.equal(ffmpegCreations[0].subtitleData, null);
+
+  const subtitle = await service.handleRpc("playback.subtitle.load", {
+    playbackId: opened.playbackId,
+    subtitleStreamIndex: 2
+  });
+  assert.match(subtitle.data, /^WEBVTT/);
+  assert.match(subtitle.data, /ASS 字幕/);
 });
 
 test("playback.open 按 preferredSourceKey 切到 1080p mkv 源", async () => {

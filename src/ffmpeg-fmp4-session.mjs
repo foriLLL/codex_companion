@@ -648,7 +648,7 @@ export function buildFfmpegArguments({
       const unshift = startTimeSeconds > 0 ? `,setpts=PTS-${startTimeSeconds.toFixed(3)}/TB` : "";
       args.push(
         "-filter_complex",
-        `[0:v:0]${shift}subtitles='${filterPath(subtitleInput)}'${streamOption}${unshift}[v]`,
+        `[0:v:0]${shift}subtitles=filename='${filterPath(subtitleInput)}'${streamOption}${unshift}[v]`,
         "-map", "[v]"
       );
     } else {

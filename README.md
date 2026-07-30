@@ -27,7 +27,7 @@ Emby 卡片宽度为 300px，高度不超过 400px，并会在较矮窗口中自
 | 本机重封装/转码 | 可选的系统 FFmpeg；Release 安装器会优先通过现有 Homebrew 自动安装 |
 
 没有 FFmpeg 时，红果播放、Emby HLS 和兼容 MP4 直连仍可使用；只有 MKV、
-HEVC、EC-3、复杂多音轨或字幕烧录等本机处理路径不可用。也可以通过
+HEVC、EC-3、复杂多音轨或图形字幕烧录等本机处理路径不可用。也可以通过
 `CODEX_COMPANION_FFMPEG=/absolute/path/to/ffmpeg` 指定已有 FFmpeg。
 
 Codex 必须在启动时启用 CDP，无法对已经普通启动的进程事后开启。因此首次
@@ -106,7 +106,11 @@ npm run build:app -- --target darwin-x64
 
 1. 服务端允许转码时使用 H.264/AAC HLS。
 2. 单路 H.264 + 至多单路 AAC 的 MP4 直接增量转换为 fMP4。
-3. HEVC、EC-3、多音轨、其他容器或烧录字幕交给用户安装的 FFmpeg，输出 H.264/AAC fMP4。
+3. HEVC、EC-3、多音轨、其他容器或图形字幕烧录交给用户安装的 FFmpeg，输出 H.264/AAC fMP4。
+
+SRT、WebVTT、ASS 和 SSA 等文字字幕由播放器单独渲染；其中 ASS/SSA 会在本机
+转换为 WebVTT，不会仅为显示文字而重新编码整段 4K 视频。PGS、VobSub 和 DVB
+等图形字幕仍需要烧录。
 
 因此不兼容编码不会先交给 Renderer 再失败；需要第 3 条但系统没有 FFmpeg 时，
 界面会明确提示安装或指定 FFmpeg。

@@ -117,7 +117,7 @@ test("FFmpeg 参数分别覆盖 ASS、PGS、VobSub 和 DVB 烧录", () => {
   });
   assert.match(
     embeddedAss[embeddedAss.indexOf("-filter_complex") + 1],
-    /setpts=PTS\+12\.500\/TB,subtitles='http\\:\/\/127\.0\.0\.1\\:1234\/media\/source':si=0,setpts=PTS-12\.500\/TB/
+    /setpts=PTS\+12\.500\/TB,subtitles=filename='http\\:\/\/127\.0\.0\.1\\:1234\/media\/source':si=0,setpts=PTS-12\.500\/TB/
   );
   assert.equal(embeddedAss.includes("libx264"), true);
 

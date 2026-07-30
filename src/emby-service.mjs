@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assToWebVtt } from "./ass-to-vtt.mjs";
 import {
   DEFAULT_RESOURCE_LIMIT,
   DEFAULT_SUBTITLE_LIMIT,
@@ -111,7 +112,9 @@ export function mapSubtitleStreams(mediaSource) {
       const language = String(stream?.DisplayLanguage ?? stream?.Language ?? "").trim();
       const label = String(stream?.DisplayTitle ?? stream?.Title ?? language ?? "").trim()
         || `字幕 ${index}`;
-      const isText = stream?.IsTextSubtitleStream === true;
+      // 部分 Emby 版本会把内嵌 ASS 错标为非文字字幕。编码本身比该布尔字段可靠：
+      // ASS/SSA 在 Node 侧转为 WebVTT，避免仅为字幕重编码整段 4K 视频。
+      const isText = stream?.IsTextSubtitleStream === true || STYLED_SUBTITLE_CODECS.has(codec);
       return {
         index,
         label,
@@ -121,7 +124,7 @@ export function mapSubtitleStreams(mediaSource) {
         isForced: stream?.IsForced === true,
         isHearingImpaired: stream?.IsHearingImpaired === true,
         isExternal: stream?.IsExternal === true,
-        mode: isText && !STYLED_SUBTITLE_CODECS.has(codec) ? "external-vtt" : "burn-in"
+        mode: isText ? "external-vtt" : "burn-in"
       };
     })
     .filter(Boolean);
@@ -906,21 +909,39 @@ export class EmbyService {
       throw new EmbyError("SUBTITLE_REQUIRES_BURN_IN", "该字幕必须通过视频转码显示");
     }
     return this.#withSession(async (client) => {
-      const url = client.subtitleUrl(session.itemId, session.mediaSourceId, subtitle.index, {
-        format: "vtt",
+      const styledText = STYLED_SUBTITLE_CODECS.has(subtitle.codec);
+      const standardUrl = client.subtitleUrl(session.itemId, session.mediaSourceId, subtitle.index, {
+        format: styledText ? "ass" : "vtt",
         startPositionTicks: 0
       });
-      const result = await client.loadResource(url, {
-        signal,
-        responseType: "bytes",
-        maxBytes: DEFAULT_SUBTITLE_LIMIT
-      });
+      const source = session.subtitleSources?.get(subtitle.index);
+      const urls = [standardUrl];
+      if (styledText && subtitle.isExternal && source?.DeliveryUrl) {
+        urls.push(new URL(source.DeliveryUrl, `${client.baseUrl}/`).href);
+      }
+      let result = null;
+      let lastError = null;
+      for (const url of [...new Set(urls)]) {
+        try {
+          result = await client.loadResource(url, {
+            signal,
+            responseType: "bytes",
+            maxBytes: DEFAULT_SUBTITLE_LIMIT
+          });
+          break;
+        } catch (error) {
+          if (signal?.aborted || error?.code === "CANCELLED") throw error;
+          lastError = error;
+        }
+      }
+      if (!result) throw lastError;
       let text;
       try {
         text = new TextDecoder("utf-8", { fatal: true }).decode(result.bytes).replace(/^\uFEFF/, "");
       } catch (cause) {
         throw new EmbyError("INVALID_SUBTITLE_ENCODING", "Emby 字幕不是有效 UTF-8 文本", { cause });
       }
+      if (styledText) text = assToWebVtt(text);
       if (!/^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)/.test(text)) {
         throw new EmbyError("INVALID_SUBTITLE_RESPONSE", "Emby 返回的字幕不是有效 WebVTT");
       }

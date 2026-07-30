@@ -46,22 +46,33 @@ test("mock 探针覆盖认证、目录、剧集、图片和 HLS 首分片且不�
           SupportsTranscoding: true,
           MediaStreams: [
             {
-              Type: "Subtitle", Index: 2, Codec: "subrip", Language: "chi",
-              DisplayTitle: "简体中文", IsTextSubtitleStream: true, IsExternal: true
-            },
-            {
               Type: "Subtitle", Index: 3, Codec: "ass", Language: "jpn",
               DisplayTitle: "日文 ASS", IsTextSubtitleStream: true
+            },
+            {
+              Type: "Subtitle", Index: 4, Codec: "hdmv_pgs_subtitle", Language: "chi",
+              DisplayTitle: "中文 PGS", IsTextSubtitleStream: false
             }
           ]
         }]
       };
     },
-    subtitleUrl() { return "https://emby.example/subtitle.vtt"; },
+    subtitleUrl(_itemId, _mediaSourceId, index, options = {}) {
+      return `https://emby.example/subtitle-${index}.${options.format ?? "vtt"}`;
+    },
     hlsUrl() { return "https://emby.example/master.m3u8"; },
     async loadResource(url, { responseType } = {}) {
       calls.push(["resource", url, responseType]);
-      if (url.endsWith("subtitle.vtt")) {
+      if (url.endsWith("subtitle-3.ass")) {
+        return {
+          bytes: new TextEncoder().encode(`[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,探针 ASS 字幕`),
+          contentType: "text/x-ass",
+          url
+        };
+      }
+      if (url.endsWith(".vtt")) {
         return { text: "WEBVTT\n\n00:00.000 --> 00:01.000\n字幕", contentType: "text/vtt", url };
       }
       if (url.endsWith("master.m3u8")) return { text: "#EXTM3U\nvariant.m3u8", contentType: "x", url };
@@ -85,8 +96,8 @@ test("mock 探针覆盖认证、目录、剧集、图片和 HLS 首分片且不�
   assert.ok(calls.some(([name]) => name === "episodes"));
   assert.ok(calls.some(([name]) => name === "stop"));
   assert.doesNotMatch(output.text, /password|token/);
-  assert.match(output.text, /简体中文 · chi · subrip · 文字\/VTT · 外挂/);
-  assert.match(output.text, /日文 ASS · jpn · ass · 烧录 · 内嵌/);
+  assert.match(output.text, /日文 ASS · jpn · ass · 文字\/VTT · 内嵌/);
+  assert.match(output.text, /中文 PGS · chi · hdmv_pgs_subtitle · 烧录 · 内嵌/);
 });
 
 test("mock 探针在禁止转码时验证 MP4 Range/fMP4，而不是请求 HLS", async () => {

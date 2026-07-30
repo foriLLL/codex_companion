@@ -2,6 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
+import { assToWebVtt } from "../src/ass-to-vtt.mjs";
 import { pathToFileURL } from "node:url";
 import {
   EmbyClient,
@@ -185,11 +186,19 @@ export async function runProbe({
   let checkedTextSubtitle = false;
   let checkedBurnInSubtitle = false;
   if (textSubtitle) {
+    const styledText = ["ass", "ssa"].includes(textSubtitle.codec);
     const subtitle = await client.loadResource(
-      client.subtitleUrl(playable.Id, mediaSource.Id, textSubtitle.index),
-      { responseType: "text", maxBytes: 4 * 1024 * 1024 }
+      client.subtitleUrl(playable.Id, mediaSource.Id, textSubtitle.index, {
+        format: styledText ? "ass" : "vtt"
+      }),
+      styledText
+        ? { responseType: "bytes", maxBytes: 4 * 1024 * 1024 }
+        : { responseType: "text", maxBytes: 4 * 1024 * 1024 }
     );
-    if (!/^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)/.test(String(subtitle.text ?? "").replace(/^\uFEFF/, ""))) {
+    const text = styledText
+      ? assToWebVtt(new TextDecoder("utf-8", { fatal: true }).decode(subtitle.bytes))
+      : String(subtitle.text ?? "").replace(/^\uFEFF/, "");
+    if (!/^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)/.test(text)) {
       throw new EmbyError("INVALID_SUBTITLE_RESPONSE", "字幕接口没有返回有效 WebVTT");
     }
     checkedTextSubtitle = true;
