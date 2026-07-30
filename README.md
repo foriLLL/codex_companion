@@ -1,154 +1,179 @@
 # Codex Companion
 
-通过 Chrome DevTools Protocol（CDP）向 Codex Desktop 的原生 pinned summary 右栏注入两个独立的 Shadow DOM 卡片：上方红果短剧卡片支持搜索、选集、播放和自动连播，下方 `300×400px` Emby 卡片支持多服务器切换、官方媒体库分类浏览、续播、最近添加、搜索、选季/选集和播放。两张卡片与 pinned summary 同步显示和隐藏，关闭原生右栏时不会创建独立的备用侧栏。
+Codex Companion 是一个仅支持 macOS 的非官方桌面增强工具。它通过本机
+Chrome DevTools Protocol（CDP），在 Codex Desktop（`ChatGPT.app`）的右栏中
+加入红果短剧和 Emby 两张隔离的 Shadow DOM 卡片，不修改 `app.asar`、
+`/Applications/ChatGPT.app` 或其应用签名。
 
-实现不修改 `/Applications/ChatGPT.app`、`app.asar` 或应用签名。
+> 当前版本：`v0.0.1`，属于早期预览。Codex Desktop 的 DOM 更新可能导致注入
+> 暂时失效。最后验证环境为 ChatGPT/Codex `26.721.81911`、macOS `26.5.2`。
 
-## 卡片显示方式（两种，配置窗可切换）
+## 功能
 
-- **独立按钮（默认）**：在原生 Toggle Summary 按钮左侧并排注入一个「卡片按钮」，点击复用原生右栏的开合动画显示卡片。与 Toggle Summary **互斥**——打开一个会关掉另一个，也可同时关闭。按钮外观克隆自原生按钮，主题/悬停/焦点一致。
-- **随 Summary 显示**：卡片跟随原生 pinned summary 一起显示/隐藏（旧行为）。
+- 红果短剧：公开内容浏览、搜索、选集、播放和倒计时自动连播。
+- Emby：多服务器、媒体库、继续观看、最近添加、搜索、选季选集、字幕和进度上报。
+- 独立卡片按钮或跟随 Summary 显示；两张卡片可分别关闭并调整顺序。
+- 媒体按需流式传输并限制缓冲，不把整部视频下载成 Blob。
+- Emby Token 保存在 macOS Keychain；配置文件权限为 `0600`。
 
-定位原生 summary 按钮采用多语言 + 结构信号，界面切换语言（含中文）不影响。
+Emby 卡片宽度为 300px，高度不超过 400px，并会在较矮窗口中自适应。
 
-## 一键安装（面向用户，无需 Node）
+## 系统要求
 
-分发物是 `bun --compile` 的自包含二进制加 `ffmpeg` sidecar，打包进 `Codex Companion.app`，用户机器**无需预装 Node**：
+| 场景 | 要求 |
+| --- | --- |
+| 使用 Release 应用 | macOS 13+；`/Applications/ChatGPT.app`；不要求 Node.js |
+| 从源码运行 | Node.js 22+、npm；依赖安装会提供构建所需的 Bun |
+| 本机重封装/转码 | 可选的系统 FFmpeg，推荐 `brew install ffmpeg` |
+
+没有 FFmpeg 时，红果播放、Emby HLS 和兼容 MP4 直连仍可使用；只有 MKV、
+HEVC、EC-3、复杂多音轨或字幕烧录等本机处理路径不可用。也可以通过
+`CODEX_COMPANION_FFMPEG=/absolute/path/to/ffmpeg` 指定已有 FFmpeg。
+
+Codex 必须在启动时启用 CDP，无法对已经普通启动的进程事后开启。因此首次
+使用前需要从菜单完全退出 Codex。
+
+## 安装
+
+### 已签名 Release
+
+正式 Release 只发布通过 Developer ID 签名和 Apple 公证的应用。安装脚本会
+校验下载哈希、归档路径、Bundle ID、代码签名和公证结果，然后保留原版本直到
+新版本验证完成：
 
 ```bash
-curl -fsSL https://github.com/foriLLL/codex-companion/releases/latest/download/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fL \
+  https://github.com/foriLLL/codex_companion/releases/latest/download/install.sh \
+  -o install-codex-companion.sh
+less install-codex-companion.sh
+bash install-codex-companion.sh
 ```
 
-脚本按 CPU 架构下载对应 tarball，安装到 `~/Applications/Codex Companion.app`，去除 Gatekeeper 隔离属性并打开。之后通过「Codex Companion」启动 Codex（首次会带调试参数拉起官方 Codex 并常驻维护注入）；由于 macOS 对已运行的 app 只做激活，首次启动后再点官方 ChatGPT 也不冲突。Codex 退出会自动清理；若检测到 Codex 未带调试参数运行，会发原生通知引导重新启动，不会强制关闭正在运行的任务。日志在 `~/Library/Logs/Codex Companion/launcher.log`。
+应用安装到 `~/Applications/Codex Companion.app`。如果仓库尚未发布 Release，
+请使用下面的源码方式；不要从第三方下载未经签名的安装包。
 
-> 未签名/未公证产物依赖安装脚本去隔离；正式分发建议 Apple Developer ID 签名 + 公证。`ffmpeg-static` 为 GPL 构建，`.app` 内附 `Resources/ffmpeg.LICENSE`，随附分发受 GPL 约束。
-
-### 从源码构建 .app
+### 从源码运行
 
 ```bash
+git clone https://github.com/foriLLL/codex_companion.git
+cd codex_companion
 npm ci
-npm run build:app            # 默认 darwin-arm64
-npm run build:app -- --target darwin-x64
-```
-
-产物在 `dist/Codex Companion.app`。
-
-## 工作原理
-
-Renderer 不直接访问 Emby 或短剧站点，也不把整部视频缓存为 Blob：
-
-1. 卡片通过 CDP binding 向常驻 Node 进程发送控制与元数据 RPC；RPC 回包作为 `Runtime.callFunctionOn` 参数投递，不把响应内容拼进可执行源码。
-2. Node 分别维护短剧和 Emby 服务；Emby Token 只留在 Node，红果官网页面、封面和签名 MP4 也全部由 Node 获取。
-3. 红果官网播放页提供签名 MP4；Node 使用 HTTP Range 和 `mp4box@2.4.1` 增量转成 fMP4，不会下载完整视频。分片以有上限的 RPC 参数交给 Renderer，不会生成携带媒体内容的动态脚本。
-4. Emby 在允许服务端转码时使用本地 `hls.js@1.6.16` 播放 H.264 + AAC HLS；Codex 的 `app://` CSP 禁止访问 loopback，因此 HLS loader 由 Node 代拉同源资源。禁止转码时，MP4 复用 Range/fMP4 管线，MKV 等其他容器通过一条带背压的持续 Range 流交给 Node 内的 FFmpeg，实时重封装为 fragmented MP4。
-5. SRT/WebVTT 字幕由 Node 转成受控的 WebVTT Blob track，不重启视频；ASS/SSA 和 PGS/VobSub/DVB 图形字幕通过 Emby HLS 或本机 FFmpeg 烧录。
-6. FFmpeg 会先判断轨道：H.264/AAC 只改变容器、画质不变；HEVC、AC3 或烧录字幕才转换为 H.264/AAC。
-7. Renderer 只接收有限分片并写入 MediaSource 时间轴，不直连源站、Emby、localhost 或 123 盘 CDN，也不会逐块替换 `<video src>`。
-8. 返回、切换视频、登出、renderer 关闭或维护进程停止时，取消待处理请求、字幕 Blob 和 FFmpeg 子进程；Emby 还会上报最终进度并停止活跃转码。
-
-因此正常播放只保留有限缓冲，不会先下载完整视频。HLS 当前参数为：前向 30 秒、后向 15 秒、24MiB 缓冲、单资源 8MiB、最多 4 个并发资源请求、最高 720p。MP4 随机访问每次 Range 最多 1MiB；FFmpeg 媒体桥会从当前偏移建立一个持续 Range，并把 CDN 响应边到边转发，Renderer 达到 30 秒前向缓冲后产生的 backpressure 会一路暂停到 CDN。seek 会取消旧流、从新位置重连，同时保持同一条原生进度时间轴。
-
-## 运行要求
-
-- macOS 上已安装 `/Applications/ChatGPT.app`（界面产品名为 Codex）。
-- Node.js 22 或更高版本。
-- Codex 必须带 CDP 参数启动。已经普通启动的进程无法事后打开 CDP。
-- Emby 服务器使用 HTTP 或证书有效的 HTTPS；第一版不关闭 TLS 校验，也不支持自签名证书。
-
-## 先验证 Emby 服务器
-
-正式连接卡片前，建议运行只读探针：
-
-```bash
-cd codex-companion
-npm install
-npm run probe:emby -- --server https://emby.example.com --username alice --search 三体
-```
-
-密码只在交互式终端中无回显输入，不能通过 `--password` 传入。探针不会写配置或钥匙串；它依次验证认证、媒体目录/图片和 PlaybackInfo，列出字幕的语言、编码、内嵌/外挂及默认/强制状态，并根据服务器能力验证 WebVTT、HLS 烧录或本机 FFmpeg 烧录的首批分片。空媒体库时可通过 `--item <项目ID>` 指定一个可播放项目。
-
-## 启动
-
-先从菜单完全退出当前 Codex，然后运行：
-
-```bash
-cd codex-companion
+npm test
 npm start
 ```
 
-脚本会在 `127.0.0.1` 上分配随机 CDP 端口，启动官方 Codex，注入本地 hls.js 与卡片，并常驻维护 renderer、短剧和 Emby RPC。按 `Ctrl-C` 会先停止媒体请求、Emby 播放会话和活跃转码，再停止注入维护；不会关闭 Codex。
+停止维护进程按 `Ctrl-C`。这会结束媒体请求、转码和 Emby 播放会话，但不会关闭
+Codex Desktop。
 
-开发时如果 Codex 已经由本工具启动，停止旧维护进程后可复用启动日志中的端口：
-
-```bash
-npm run attach -- --port 56837
-```
-
-短剧和 Emby 都必须使用 `npm start` 或常驻的 `npm run attach`。`npm run inject -- --port ...` 会在单次注入后退出，RPC 接收方随之消失，只适合检查静态布局；它不能维持内容浏览或播放。
-
-其他命令：
+### 构建本地应用
 
 ```bash
-# 移除卡片
-npm run unmount -- --port 56837
-
-# 自动化测试和无头 Chromium smoke
-npm test
-npm run smoke
+npm run build:app
+npm run build:app -- --target darwin-x64
 ```
 
-## 使用红果短剧卡片
+产物位于 `dist/Codex Companion.app`。本地构建默认未签名，只用于开发验证；
+公开 Release 工作流会在上传前强制签名和公证。构建产物不包含 FFmpeg。
 
-卡片只读取 [hongguoduanju.com](https://hongguoduanju.com/) 公开网页中的 SSR 数据。首页推荐来自官网 banner 和目录；搜索在官网公开目录中本地完成。选择短剧后只展示官网标记为可访问的集数，点击即可播放。Node 按需读取签名 MP4，播放覆盖整张卡片并保留原生进度、音量和全屏控制；返回会立即停止解析器和旧 Range 请求。
+## 使用
 
-一集播放结束且官网仍有下一集时，卡片会显示“即将为你播放下一集”并倒计时 5 秒；可以立即播放或取消。取消后仍可手动播放下一集或重播，最后一集只显示重播。返回、换集、报错或卸载卡片都会取消倒计时。
+### 红果短剧
 
-这里没有使用红果 SDK、私有 API 或账号权益，也不会绕过官网的集数限制。例如详情页显示全 76 集但只开放前 5 集时，卡片只提供前 5 集。签名地址过期会重新读取对应官网播放页一次。官网页面结构和公开内容仍可能变化；红果的数据获取与播放状态独立于 Emby，退出任一播放器不会修改另一张卡片的状态。
+卡片只读取 [hongguoduanju.com](https://hongguoduanju.com/) 公开网页中的 SSR
+数据和网页标记为可访问的集数。它不使用红果 SDK、私有 API、登录态或账号权益，
+也不绕过 DRM 和访问控制。签名媒体地址过期时会重新读取对应播放页一次。
 
-## 在卡片中连接 Emby
+官网结构、内容可用性和访问规则都可能变化。使用者应自行确认其所在地法律、
+站点条款及内容权利允许相应访问；本项目不提供、托管或授权任何视频内容。
 
-未连接视图输入服务器地址、用户名和密码。地址可以是服务器根地址，也可以带 `/emby` 路径；客户端会统一规范化。成功后首页优先显示 Emby 官方 `Views`（例如华语电影、动画片、综艺），点击后按服务端目录层级浏览；下方保留“继续观看”和“最近添加”。搜索支持 `Movie`、`Series`、`Episode`、`Video`：
+### Emby
 
-- 首页右上角的服务器按钮会列出全部已保存连接；点击另一台服务器会复用它自己的 Keychain Token 并立即刷新首页。可以继续添加服务器、只退出当前服务器，或确认后移除当前连接，均不会覆盖其他连接。
-- 旧版单服务器 `emby.json` 会在首次保存时自动升级为多服务器格式，不需要重新登录。
-
-- `Series` 进入季和选集列表。
-- `Movie`、`Episode`、`Video` 直接开始播放。
-- 播放覆盖整张 Emby 卡片；剧集播放时顶部提供“上一集 / 当前集 / 下一集”，点击当前集会在视频内打开季与选集面板。从“继续观看”直接进入单集时，卡片会在后台补齐剧集上下文，不阻塞首帧。
-- 返回会停止请求和转码，并恢复之前的列表及滚动位置。
-- 播放器右上角“字幕”菜单支持关闭和多轨切换。SRT/WebVTT 即时切换；ASS/SSA、PGS、VobSub、DVB 从当前时间重启烧录流，并恢复原来的暂停状态、音量和静音状态。
-- 当前 Renderer 会记住用户显式选择的“关闭”或字幕语言，播放下一集时优先匹配；退出 Codex 后不保留这一偏好。
-- 播放结束不会自动连播，需要用户选择重播或下一集。
-
-非敏感连接信息保存在：
+首次打开卡片时输入服务器地址、用户名和密码。非敏感连接信息保存在：
 
 ```text
 ~/Library/Application Support/codex-companion/emby.json
 ```
 
-文件权限为 `0600`，只包含当前服务器标识、各服务器地址、ServerId、UserId、用户名和稳定 DeviceId。每个连接的 AccessToken 独立保存在 macOS Keychain，service 为 `codex-companion.emby`、account 为 `{ServerId}:{UserId}`。密码仅存在于登录请求内存中，登录成功后立即清空输入，不会落盘。退出当前服务器只删除它的 Keychain Token；Token 失效或服务器返回 401 时也只清除当前连接的 Token。
+文件只包含服务器地址和标识、UserId、用户名与 DeviceId。每个 AccessToken 独立
+存入 macOS Keychain，service 为 `codex-companion.emby`，密码不会落盘。
 
-从旧版 `codex-hg` 升级时，首次读取会自动把原配置、首页缓存和 Keychain Token 迁移到 `codex-companion`；旧数据会保留，方便回退。
+播放路径按以下顺序选择：
 
-## 支持边界
+1. 服务端允许转码时使用 H.264/AAC HLS。
+2. 单路 H.264 + 至多单路 AAC 的 MP4 直接增量转换为 fMP4。
+3. HEVC、EC-3、多音轨、其他容器或烧录字幕交给用户安装的 FFmpeg，输出 H.264/AAC fMP4。
 
-当前版本支持 macOS、多 Emby 服务器/账号连接和视频媒体。暂不支持：
+因此不兼容编码不会先交给 Renderer 再失败；需要第 3 条但系统没有 FFmpeg 时，
+界面会明确提示安装或指定 FFmpeg。
 
-- Emby Connect 和局域网自动发现服务器；
-- Live TV、音频库、DRM；
-- 自签名 HTTPS；
-- 无法被 FFmpeg 6.0 读取或转换的罕见容器/编码；
-- 后台播放、Emby 自动连播；
-- 在线字幕搜索、下载、上传、时间轴偏移和双语字幕合并；
-- 通过 iframe 嵌入 Emby Web；
-- 修改或关闭 Codex CSP。
+连接前可以运行只读探针：
 
-短剧路线目前只支持 `hongguoduanju.com` 公开播放页提供的 MP4，以及 Renderer 原生支持的音视频编码；不支持登录态内容、DRM、账号权益或绕过站点访问控制。
+```bash
+npm run probe:emby -- --server https://emby.example.com --username alice --search 三体
+```
 
-## 安全边界
+密码仅通过终端无回显输入；探针不写配置或钥匙串。
 
-CDP 是高权限接口。调试端口只绑定回环地址且默认随机分配；不要改成 `0.0.0.0`，也不要暴露到局域网或公网。
+## 工作原理
 
-Node 是唯一接触远程网络和 Emby 凭证的组件。短剧目录与详情只允许访问 `hongguoduanju.com`，媒体和图片只允许 HTTPS 且必须通过公网地址校验；MP4 每次 Range 最多读取 1MiB。Emby HLS、图片和字幕强制与 Emby origin 同源。Emby 直连只允许由同源地址发起；跨源 CDN 的每次连接都强制使用 HTTPS、校验 DNS 并固定到已验证的公网 IP，再打开不携带 Emby Token 的持续 Range；断流时从已接收偏移有限重连。FFmpeg 只访问带随机路径的 `127.0.0.1` 临时媒体桥，以及权限为 `0600` 的随机临时外挂字幕文件；两者均不会进入 Renderer，并在播放结束时删除。媒体桥再由 Node 使用认证 Header 访问 Emby。Emby Token 只发给 Emby origin，不会发给 CDN、FFmpeg 命令行、DOM、媒体 URL或日志。Renderer 不直接请求红果官网、Emby、CDN 或 localhost；媒体回包由静态 `Runtime.callFunctionOn` 参数投递，媒体数据不会进入可执行源码。`hls.js`、`mp4box`、`undici` 和 `ffmpeg-static` 均为精确锁定的本地 npm 依赖，不使用 CDN bundle。
+1. 启动器仅在 `127.0.0.1` 上分配随机 CDP 端口并启动 Codex。
+2. Renderer 通过 CDP binding 发送控制和元数据 RPC，响应通过静态
+   `Runtime.callFunctionOn` 参数传递，媒体内容不会拼入动态脚本。
+3. Node 进程访问红果、Emby 和允许的媒体 CDN；Renderer 不直接接触凭证或远端。
+4. MP4 使用有限 Range 和 MP4Box 增量生成 fMP4；HLS 与 FFmpeg 流都有背压和缓冲上限。
+5. 返回、seek、切集、登出、Renderer 关闭或维护进程退出时，会取消请求、Blob URL、
+   字幕文件、转码进程和服务端活跃播放会话。
 
-红果与 Emby 仅共享 Codex 主题和右栏滚动，媒体状态、`video`、Blob URL、播放会话和控制接口互不复用。
+常用开发命令：
+
+```bash
+npm start                         # 启动 Codex 并常驻注入
+npm run attach -- --port 56837   # 复用已经开启的 CDP 端口
+npm run unmount -- --port 56837  # 移除卡片
+npm test                          # Node 内置测试运行器
+npm run smoke                     # Chromium 冒烟测试
+```
+
+`npm run inject` 只做一次静态注入后退出，RPC 随即不可用，不能用于实际浏览或播放。
+
+## 安全与隐私
+
+CDP 是高权限调试接口。项目强制绑定 loopback 和随机端口，禁止将端口改为
+`0.0.0.0` 或暴露到局域网/公网；只应在可信的本机账户中运行。
+
+Emby Token 只发往配置的 Emby origin，不进入 DOM、媒体 URL、FFmpeg 命令行或
+日志。跨源媒体 CDN 必须使用 HTTPS，并经过地址、DNS 和公网 IP 校验。依赖版本
+由 `package-lock.json` 固定，运行时不加载 CDN 脚本。
+
+安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。不要在公开 issue 中提交
+Token、服务器地址、日志原文或其他隐私信息。
+
+## 已知边界
+
+- 不支持 Windows、Linux、Emby Connect、服务器自动发现、Live TV、音频库和 DRM。
+- 不关闭 TLS 校验，不支持自签名 Emby HTTPS。
+- 不支持后台播放、Emby 自动连播、在线字幕搜索或字幕时间轴偏移。
+- 红果仅支持公开播放页提供的 MP4 和当前 Renderer/FFmpeg 可处理的编码。
+- Codex Desktop 更新后，原生右栏定位规则可能需要同步更新。
+
+## 卸载
+
+完全退出 Codex Companion 后删除：
+
+```bash
+rm -rf "$HOME/Applications/Codex Companion.app"
+```
+
+如需同时清除 Emby 配置，请手动删除
+`~/Library/Application Support/codex-companion/`，并在“钥匙串访问”中删除
+`codex-companion.emby` 项。删除配置与凭证不可恢复。
+
+## 参与贡献
+
+开发流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变化见
+[CHANGELOG.md](CHANGELOG.md)，第三方组件见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+项目源码采用 [MIT License](LICENSE)。Codex Companion 与 OpenAI、ChatGPT、
+Codex、字节跳动、红果短剧及 Emby 均无隶属、授权或背书关系；相关名称和商标
+归各自权利人所有。

@@ -166,6 +166,23 @@ function mediaSourceVideoStream(mediaSource) {
   return streams.find((stream) => String(stream?.Type ?? "").toLowerCase() === "video") ?? null;
 }
 
+// DirectMp4Session 会把媒体源内的全部音视频轨道写入同一个 MSE MIME。
+// Renderer 稳定支持的直连交集只有单路 H.264 + 至多单路 AAC；HEVC、EC-3、
+// 多音轨等必须先交给本机 FFmpeg 规整为 H.264/AAC，否则会在浏览器端才报
+// MEDIA_CODEC_UNSUPPORTED，既无法播放也来不及自动降级。
+export function mediaSourceSupportsRendererFmp4(mediaSource) {
+  const streams = Array.isArray(mediaSource?.MediaStreams) ? mediaSource.MediaStreams : [];
+  const videos = streams.filter((stream) => String(stream?.Type ?? "").toLowerCase() === "video");
+  const audios = streams.filter((stream) => String(stream?.Type ?? "").toLowerCase() === "audio");
+  if (videos.length !== 1 || audios.length > 1) return false;
+  const videoCodec = String(videos[0]?.Codec ?? "").toLowerCase();
+  const videoBitDepth = Number(videos[0]?.BitDepth);
+  const audioCodec = String(audios[0]?.Codec ?? "").toLowerCase();
+  return ["h264", "avc", "avc1"].includes(videoCodec)
+    && (!Number.isFinite(videoBitDepth) || videoBitDepth <= 8)
+    && (audios.length === 0 || ["aac", "mp4a"].includes(audioCodec));
+}
+
 function mediaSourceHasSubtitles(mediaSource) {
   const streams = Array.isArray(mediaSource?.MediaStreams) ? mediaSource.MediaStreams : [];
   return streams.some((stream) => String(stream?.Type ?? "").toLowerCase() === "subtitle");
@@ -660,6 +677,7 @@ export class EmbyService {
           return !fallbackTranscoding
             && (source?.SupportsDirectPlay === true || source?.SupportsDirectStream === true)
             && ["mp4", "m4v", "mov"].includes(container)
+            && mediaSourceSupportsRendererFmp4(source)
             && typeof source?.DirectStreamUrl === "string"
             && source.DirectStreamUrl.length > 0;
         });
@@ -684,7 +702,10 @@ export class EmbyService {
         || (typeof mediaSource?.TranscodingUrl === "string" && mediaSource.TranscodingUrl.length > 0);
       const transcodingSource = selectedSupportsTranscoding ? mediaSource : null;
       const directSource = !transcodingSource
-        && selectedSupportsDirect && selectedHasDirectUrl && ["mp4", "m4v", "mov"].includes(selectedContainer)
+        && selectedSupportsDirect
+        && selectedHasDirectUrl
+        && ["mp4", "m4v", "mov"].includes(selectedContainer)
+        && mediaSourceSupportsRendererFmp4(mediaSource)
         ? mediaSource
         : null;
       const ffmpegSource = !transcodingSource && !directSource && selectedSupportsDirect && selectedHasDirectUrl

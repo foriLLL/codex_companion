@@ -5,10 +5,6 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "要构建的 tag（如 v0.0.1）；留空则用当前分支 HEAD"
-        required: false
 
 permissions:
   contents: write
@@ -21,24 +17,20 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
-          # 各架构在对应架构的 runner 上构建：ffmpeg-static 的 postinstall 只下载
-          # 构建机架构的二进制，交叉打包会塞错架构（见 build-app.mjs 的架构校验）。
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-26
             asset: codex-companion-darwin-arm64.tar.gz
           - target: darwin-x64
-            runner: macos-13
+            runner: macos-26-intel
             asset: codex-companion-darwin-x64.tar.gz
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -46,16 +38,107 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PACKAGE_VERSION="$(node -p 'require("./package.json").version')"
+          test "${GITHUB_REF_NAME#v}" = "$PACKAGE_VERSION" || {
+            echo "tag $GITHUB_REF_NAME 与 package.json $PACKAGE_VERSION 不一致" >&2
+            exit 1
+          }
+
       - name: Install dependencies
         run: npm ci --no-audit
 
       - name: Run tests
         run: npm test
 
-      - name: Build .app bundle
+      - name: Build app bundle
         run: node scripts/build-app.mjs --target ${{ matrix.target }} --out dist
 
-      - name: Package tarball + checksum
+      - name: Require release signing secrets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            test -n "${!name}" || {
+              echo "缺少 release secret: $name；拒绝发布未签名或未公证的应用。" >&2
+              exit 1
+            }
+          done
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "APPLE_TEAM_ID 格式错误；必须是 10 位大写字母或数字。" >&2
+            exit 1
+          }
+
+      - name: Import Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/codex-companion.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          CERTIFICATE_PATH="$RUNNER_TEMP/codex-companion.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          {
+            echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign, notarize and staple
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          APP="dist/Codex Companion.app"
+          NOTARY_ARCHIVE="$RUNNER_TEMP/codex-companion-notary.zip"
+          codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" \
+            "$APP/Contents/Resources/codex-companion"
+          codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ACTUAL_TEAM_ID="$(codesign -dv --verbose=4 "$APP" 2>&1 \
+            | awk -F= '/^TeamIdentifier=/ { print $2; exit }')"
+          test "$ACTUAL_TEAM_ID" = "$APPLE_TEAM_ID" || {
+            echo "签名证书 Team ID 为 $ACTUAL_TEAM_ID，与 APPLE_TEAM_ID 不一致。" >&2
+            exit 1
+          }
+          ditto -c -k --keepParent "$APP" "$NOTARY_ARCHIVE"
+          xcrun notarytool submit "$NOTARY_ARCHIVE" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
+
+      - name: Prepare signer-pinned installer
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          sed "s/__APPLE_TEAM_ID__/$APPLE_TEAM_ID/g" packaging/install.sh > dist/install.sh
+          chmod 0755 dist/install.sh
+          bash -n dist/install.sh
+          grep -F "EXPECTED_TEAM_ID=\"$APPLE_TEAM_ID\"" dist/install.sh
+
+      - name: Package tarball and checksum
         working-directory: dist
         run: |
           tar -czf "${{ matrix.asset }}" "Codex Companion.app"
@@ -69,11 +152,18 @@ jobs:
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
 
-      - name: Attach to release
+      - name: Attach signed app to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.4.1
         with:
           files: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
-            packaging/install.sh
+            dist/install.sh
+
+      - name: Delete temporary keychain
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        run: |
+          if test -n "${KEYCHAIN_PATH:-}" && test -f "$KEYCHAIN_PATH"; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

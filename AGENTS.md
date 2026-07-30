@@ -7,7 +7,7 @@ Codex Companion — 通过 Chrome DevTools Protocol (CDP) 向 Codex Desktop
 ## 技术栈
 - JavaScript ESM (`.mjs`, `"type": "module"`)，Node.js >= 22
 - 打包用 Bun (`bun --compile`)；启动器为 Swift/SwiftUI (AppKit)
-- 依赖本地精确锁定，无 CDN：ffmpeg-static、hls.js、mp4box、undici
+- 依赖本地精确锁定，无 CDN：hls.js、mp4box、undici；FFmpeg 由用户自行安装
 
 ## 目录结构
 - `src/` — 核心逻辑。入口 `cli.mjs`；`injection.mjs` 为注入的卡片
@@ -18,7 +18,6 @@ Codex Companion — 通过 Chrome DevTools Protocol (CDP) 向 Codex Desktop
 - `scripts/` — 构建 (`build-app.mjs`)、生成 (`generate-hls-embed.mjs`)、
   探测 (`probe-emby.mjs`)、冒烟 (`smoke-*.mjs`)
 - `packaging/` — `install.sh` 与 macOS 启动器 (`mac-app/`)
-- `docs/REVIEW-NOTES.md` — 发版前代码评审记录
 
 ## 常用命令
 - 启动并注入：`npm start`（会以带 CDP flag 的方式拉起 Codex）
@@ -36,7 +35,7 @@ Codex Companion — 通过 Chrome DevTools Protocol (CDP) 向 Codex Desktop
 - **CDP 必须在启动时开启**：无法对已运行的 Codex 事后附加。改动前
   先完全退出 Codex，再 `npm start`
 - **测试必须用 `node --test`，不要用 `bun test`**：Bun 转译器会改写
-  函数体，破坏基于 `toString()` 的源码断言（见 REVIEW-NOTES A1）。
+  函数体，破坏基于 `toString()` 的源码断言。
   Bun 仅用于编译打包
 - `src/hls-embedded.generated.mjs` 为生成产物且 gitignored；dev 模式
   会回退到磁盘读取，本地缺失属正常
@@ -45,4 +44,6 @@ Codex Companion — 通过 Chrome DevTools Protocol (CDP) 向 Codex Desktop
   `~/Library/Application Support/codex-companion/emby.json` (0600)
 - `npm run inject` 是一次性注入后退出，RPC 随之结束，只能看静态布局，
   不能用于浏览/播放
-- ffmpeg-static 为 GPL 构建，分发受 GPL 约束
+- 公开 `.app` 不打包 FFmpeg；本机转码只调用用户通过 PATH、常见包管理器路径或
+  `CODEX_COMPANION_FFMPEG` 指定的系统 FFmpeg
+- tag Release 必须 Developer ID 签名并经 Apple 公证；缺少凭据时工作流应失败关闭

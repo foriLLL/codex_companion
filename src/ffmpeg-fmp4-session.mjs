@@ -492,7 +492,10 @@ export class FfmpegFmp4Session {
       throw new TypeError("readRange 或 openRangeStream 必须至少提供一个");
     }
     if (!ffmpegPathImpl) {
-      throw new EmbyError("FFMPEG_UNAVAILABLE", "未找到 FFmpeg，无法处理此媒体格式");
+      throw new EmbyError(
+        "FFMPEG_UNAVAILABLE",
+        "未找到系统 FFmpeg；请运行 brew install ffmpeg，或设置 CODEX_COMPANION_FFMPEG"
+      );
     }
     this.ffmpegPath = ffmpegPathImpl;
     this.spawnImpl = spawnImpl;

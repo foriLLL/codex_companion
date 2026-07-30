@@ -112,26 +112,19 @@ async function main() {
   ]);
   await chmod(binaryOut, 0o755);
 
-  // 3. 复制 ffmpeg sidecar（GPL 构建：分发物必须附带 LICENSE）
-  //    ffmpeg-static 的 postinstall 只下载“构建机架构”的二进制，因此交叉打包（在 arm64
-  //    机器上构建 x64 产物）会塞错架构。复制后用 `file` 校验，架构不符直接 fail，
-  //    绝不发布一个运行时 "Bad CPU type" 的坏包。
-  const ffmpegSrc = require("ffmpeg-static");
-  const ffmpegDest = join(resources, "ffmpeg");
-  await cp(ffmpegSrc, ffmpegDest);
-  await chmod(ffmpegDest, 0o755);
-  const { stdout: fileInfo } = await execFileAsync("file", ["-b", ffmpegDest]);
-  if (!fileInfo.includes(target.arch)) {
-    throw new Error(
-      `ffmpeg sidecar 架构与目标不符：目标 ${target.arch}，实际 “${fileInfo.trim()}”。\n` +
-      `交叉打包时请在对应架构的 runner 上重新 npm ci（ffmpeg-static 只下载构建机架构）。`
-    );
+  // 3. 随应用附带项目及所有直接打包依赖的许可说明。
+  // FFmpeg 不再进入分发物；需要本机转码时只解析用户自行安装的 ffmpeg。
+  const licenses = [
+    [join(repoRoot, "LICENSE"), "LICENSE"],
+    [join(repoRoot, "THIRD_PARTY_NOTICES.md"), "THIRD_PARTY_NOTICES.md"],
+    [join(repoRoot, "node_modules", "hls.js", "LICENSE"), "hls.js.LICENSE"],
+    [join(repoRoot, "node_modules", "mp4box", "LICENSE"), "mp4box.LICENSE"],
+    [join(repoRoot, "node_modules", "undici", "LICENSE"), "undici.LICENSE"],
+    [join(repoRoot, "packaging", "licenses", "BUN-LICENSE.md"), "BUN-LICENSE.md"]
+  ];
+  for (const [source, destination] of licenses) {
+    await cp(source, join(resources, destination));
   }
-  // GPL 许可证必须随附：缺失即 fail，不静默吞。
-  await cp(
-    join(repoRoot, "node_modules", "ffmpeg-static", "ffmpeg.LICENSE"),
-    join(resources, "ffmpeg.LICENSE")
-  );
 
   // 4. 编译 Swift 配置窗为 CFBundleExecutable → MacOS/launcher
   console.log(`[build-app] swiftc（${target.swift}）…`);
@@ -151,7 +144,7 @@ async function main() {
   await buildAppIcon(resources);
 
   console.log(`[build-app] 完成：${appRoot}`);
-  console.log("[build-app] 未签名产物，分发前需 codesign + notarize，或让用户去 quarantine（见 install.sh）。");
+  console.log("[build-app] 本地产物未签名；公开 Release 必须经 Developer ID 签名和 Apple 公证。");
 }
 
 main().catch((error) => {

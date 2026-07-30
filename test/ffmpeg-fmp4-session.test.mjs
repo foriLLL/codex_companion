@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import ffmpegPath from "ffmpeg-static";
 import { EmbyError } from "../src/emby-client.mjs";
+import { resolveFfmpegPath } from "../src/ffmpeg-path.mjs";
 import {
   FfmpegFmp4Session,
   RangeProxy,
@@ -16,6 +16,7 @@ import {
 } from "../src/ffmpeg-fmp4-session.mjs";
 
 const execFileAsync = promisify(execFile);
+const ffmpegPath = resolveFfmpegPath();
 
 test("FFmpeg 策略优先重封装 H.264/AAC，仅为不兼容编码转码", () => {
   assert.deepEqual(ffmpegStrategy({
@@ -250,6 +251,10 @@ test("RangeProxy 在播放器取消读取时终止持续上游流", async (t) =>
 });
 
 test("FFmpeg 会把 MKV 按需重封装为可追加的 fragmented MP4，并支持重启 seek", async (t) => {
+  if (!ffmpegPath) {
+    t.skip("未安装系统 FFmpeg");
+    return;
+  }
   const directory = await mkdtemp(join(tmpdir(), "codex-companion-ffmpeg-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const fixture = join(directory, "fixture.mkv");
@@ -309,6 +314,10 @@ test("FFmpeg 会把 MKV 按需重封装为可追加的 fragmented MP4，并支�
 });
 
 test("FFmpeg 媒体桥保留上游 Range 的可操作错误", async (t) => {
+  if (!ffmpegPath) {
+    t.skip("未安装系统 FFmpeg");
+    return;
+  }
   const session = new FfmpegFmp4Session({
     mediaSource: { MediaStreams: [{ Type: "Video", Codec: "h264" }] },
     readRange: async () => {
@@ -323,6 +332,10 @@ test("FFmpeg 媒体桥保留上游 Range 的可操作错误", async (t) => {
 });
 
 test("FFmpeg 使用 libass 烧录内嵌 ASS，并在 seek 后保持可播放时间轴", async (t) => {
+  if (!ffmpegPath) {
+    t.skip("未安装系统 FFmpeg");
+    return;
+  }
   const directory = await mkdtemp(join(tmpdir(), "codex-companion-ffmpeg-ass-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const subtitle = join(directory, "subtitle.ass");
@@ -386,6 +399,10 @@ Dialogue: 0,0:00:00.20,0:00:02.50,Default,,0,0,0,,字幕测试
 });
 
 test("VideoToolbox 硬件编码在 macOS 上产出合法 fMP4（无 h264_videotoolbox 时跳过）", async (t) => {
+  if (!ffmpegPath) {
+    t.skip("未安装系统 FFmpeg");
+    return;
+  }
   if (process.platform !== "darwin") {
     t.skip("非 macOS：无 VideoToolbox");
     return;

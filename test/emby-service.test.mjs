@@ -10,6 +10,7 @@ import {
   mapMediaSourceOption,
   mapMediaSourceOptions,
   mapSubtitleStreams,
+  mediaSourceSupportsRendererFmp4,
   pickMediaSource,
   secondsToTicks
 } from "../src/emby-service.mjs";
@@ -1288,7 +1289,11 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
           SupportsDirectPlay: true,
           SupportsDirectStream: true,
           SupportsTranscoding: false,
-          DirectStreamUrl: "/Videos/movie/stream.mp4?Static=true"
+          DirectStreamUrl: "/Videos/movie/stream.mp4?Static=true",
+          MediaStreams: [
+            { Type: "Video", Index: 0, Codec: "h264" },
+            { Type: "Audio", Index: 1, Codec: "aac" }
+          ]
         }]
       });
       client.loadDirectRange = async (_url, options) => {
@@ -1331,7 +1336,7 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
     subtitles: [],
     selectedSubtitleIndex: null,
     subtitleMode: "off",
-    qualityLabel: "SD MP4",
+    qualityLabel: "SD MP4 H264",
     sourceKey: "sd|mp4#0"
   });
   assert.equal(calls.some((call) => call.method === "started"), true);
@@ -1825,6 +1830,75 @@ test("DTO 与进度换算处理缺失字段和边界", () => {
   });
 });
 
+test("MP4 只在单路 H.264/AAC 时直连 Renderer", () => {
+  assert.equal(mediaSourceSupportsRendererFmp4({
+    MediaStreams: [
+      { Type: "Video", Codec: "h264" },
+      { Type: "Audio", Codec: "aac" }
+    ]
+  }), true);
+  assert.equal(mediaSourceSupportsRendererFmp4({
+    MediaStreams: [
+      { Type: "Video", Codec: "hevc" },
+      { Type: "Audio", Codec: "aac" }
+    ]
+  }), false);
+  assert.equal(mediaSourceSupportsRendererFmp4({
+    MediaStreams: [
+      { Type: "Video", Codec: "h264", BitDepth: 10 },
+      { Type: "Audio", Codec: "aac" }
+    ]
+  }), false);
+  assert.equal(mediaSourceSupportsRendererFmp4({
+    MediaStreams: [
+      { Type: "Video", Codec: "h264" },
+      { Type: "Audio", Codec: "aac" },
+      { Type: "Audio", Codec: "eac3" }
+    ]
+  }), false);
+});
+
+test("不兼容 MP4 在进入 Renderer 前自动切换到 FFmpeg", async () => {
+  const config = {
+    baseUrl: "https://emby.example/emby",
+    serverId: "server",
+    userId: "user",
+    username: "alice",
+    deviceId: "device"
+  };
+  const calls = [];
+  const service = new EmbyService({
+    storage: new FakeStorage(config, "token"),
+    clientFactory: (settings) => {
+      const client = makeClient(settings, calls);
+      client.getPlaybackInfo = async () => ({
+        PlaySessionId: "hevc-session",
+        MediaSources: [{
+          Id: "hevc-source",
+          Container: "mp4",
+          RunTimeTicks: 10_000_000,
+          SupportsDirectPlay: true,
+          SupportsDirectStream: true,
+          SupportsTranscoding: false,
+          DirectStreamUrl: "/Videos/movie/stream.mp4",
+          MediaStreams: [
+            { Type: "Video", Index: 0, Codec: "hevc" },
+            { Type: "Audio", Index: 1, Codec: "aac" },
+            { Type: "Audio", Index: 2, Codec: "eac3" }
+          ]
+        }]
+      });
+      return client;
+    },
+    ffmpegSessionFactory: () => ({ destroy() {} }),
+    randomUUIDImpl: () => "hevc-playback"
+  });
+
+  const opened = await service.handleRpc("playback.open", { itemId: "movie" });
+  assert.equal(opened.streamMode, "ffmpeg-fmp4");
+  await service.handleRpc("playback.stop", { playbackId: opened.playbackId });
+});
+
 // ===== 多源选择（选源）=====
 
 function multiSourceMediaSources() {
@@ -1910,6 +1984,7 @@ function multiSourceService() {
       client.getSeasons = async () => ({ Items: [{ Id: "season", Name: "第一季", Type: "Season", IndexNumber: 1 }] });
       return client;
     },
+    ffmpegSessionFactory: () => ({ destroy() {} }),
     randomUUIDImpl: () => "pb-multi"
   });
   return { service, calls };
