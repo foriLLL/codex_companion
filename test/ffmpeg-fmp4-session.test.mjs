@@ -18,6 +18,58 @@ import {
 const execFileAsync = promisify(execFile);
 const ffmpegPath = resolveFfmpegPath();
 
+async function ffmpegHasFilter(name) {
+  if (!ffmpegPath) return false;
+  const { stdout = "" } = await execFileAsync(ffmpegPath, ["-hide_banner", "-filters"])
+    .catch(() => ({ stdout: "" }));
+  return stdout.split(/\r?\n/).some((line) => line.trim().split(/\s+/)[1] === name);
+}
+
+test("Bun 发布运行时使用原生 loopback Range 服务并保持字节精确", async () => {
+  const bunPath = join(process.cwd(), "node_modules", ".bin", "bun");
+  const moduleUrl = new URL("../src/ffmpeg-fmp4-session.mjs", import.meta.url).href;
+  const script = `
+    import { RangeProxy } from ${JSON.stringify(moduleUrl)};
+    const nativeServe = Bun.serve;
+    const timeoutCalls = [];
+    Bun.serve = (options) => nativeServe({
+      ...options,
+      fetch: (request, server) => options.fetch(request, {
+        timeout(target, seconds) {
+          timeoutCalls.push(seconds);
+          return server.timeout(target, seconds);
+        }
+      })
+    });
+    const source = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const proxy = new RangeProxy({
+      openRangeStream: async ({ start, end }) => ({
+        start,
+        end: end ?? source.length - 1,
+        total: source.length,
+        contentType: "application/octet-stream",
+        body: (async function* () {
+          yield source.subarray(start, (end ?? source.length - 1) + 1);
+        })()
+      })
+    });
+    const url = await proxy.start();
+    const runtime = proxy.serverRuntime;
+    const response = await fetch(url, { headers: { Range: "bytes=3-8" } });
+    const bytes = [...new Uint8Array(await response.arrayBuffer())];
+    await proxy.close();
+    Bun.serve = nativeServe;
+    console.log(JSON.stringify({ runtime, status: response.status, bytes, timeoutCalls }));
+  `;
+  const { stdout } = await execFileAsync(bunPath, ["--eval", script], { timeout: 10_000 });
+  assert.deepEqual(JSON.parse(stdout.trim()), {
+    runtime: "bun",
+    status: 206,
+    bytes: [3, 4, 5, 6, 7, 8],
+    timeoutCalls: [0]
+  });
+});
+
 test("FFmpeg 策略优先重封装 H.264/AAC，仅为不兼容编码转码", () => {
   assert.deepEqual(ffmpegStrategy({
     MediaStreams: [
@@ -336,6 +388,10 @@ test("FFmpeg 使用 libass 烧录内嵌 ASS，并在 seek 后保持可播放时�
     t.skip("未安装系统 FFmpeg");
     return;
   }
+  if (!await ffmpegHasFilter("subtitles")) {
+    t.skip("当前 FFmpeg 未包含 libass subtitles filter");
+    return;
+  }
   const directory = await mkdtemp(join(tmpdir(), "codex-companion-ffmpeg-ass-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const subtitle = join(directory, "subtitle.ass");
@@ -359,7 +415,7 @@ Dialogue: 0,0:00:00.20,0:00:02.50,Default,,0,0,0,,字幕测试
     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
     "-i", subtitle,
     "-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0",
-    "-shortest",
+    "-t", "3",
     "-c:v", "libx264", "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-c:s", "ass",
     fixture
@@ -407,6 +463,10 @@ test("VideoToolbox 硬件编码在 macOS 上产出合法 fMP4（无 h264_videoto
     t.skip("非 macOS：无 VideoToolbox");
     return;
   }
+  if (!await ffmpegHasFilter("subtitles")) {
+    t.skip("当前 FFmpeg 未包含 libass subtitles filter");
+    return;
+  }
   const encoders = await execFileAsync(ffmpegPath, ["-hide_banner", "-encoders"]).then((r) => r.stdout).catch(() => "");
   if (!encoders.includes("h264_videotoolbox")) {
     t.skip("当前 ffmpeg 无 h264_videotoolbox 编码器");
@@ -435,7 +495,7 @@ Dialogue: 0,0:00:00.20,0:00:02.50,Default,,0,0,0,,字幕测试
     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
     "-i", subtitle,
     "-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0",
-    "-shortest",
+    "-t", "3",
     "-c:v", "libx264", "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-c:s", "ass",
     fixture

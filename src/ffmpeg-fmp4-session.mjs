@@ -37,6 +37,24 @@ function parseRangeHeader(value) {
   return { start, end, partial: true };
 }
 
+function readableStreamFrom(iterable) {
+  const iterator = iterable[Symbol.asyncIterator]();
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await iterator.return?.(reason);
+    }
+  });
+}
+
 function boxSize(buffer) {
   if (buffer.length < 8) return null;
   const small = buffer.readUInt32BE(0);
@@ -115,12 +133,32 @@ export class RangeProxy {
     this.onError = onError;
     this.secretPath = `/media/${randomUUIDImpl()}`;
     this.server = null;
+    this.serverRuntime = null;
     this.url = null;
     this.controllers = new Set();
   }
 
   async start() {
     if (this.server) return this.url;
+    // Bun 对 node:http ServerResponse 的大文件持续写入存在字节偏移：同一 MKV
+    // 在 Node 下 FFmpeg 从 4372 继续解析，在 Bun 下会从 4369 继续，导致 Cues
+    // 失效并顺序扫描整部文件。发布二进制运行在 Bun，必须使用原生 Bun.serve。
+    if (process.versions?.bun && typeof globalThis.Bun?.serve === "function") {
+      const server = globalThis.Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        idleTimeout: 60,
+        fetch: (request, activeServer) => this.#handleBun(request, activeServer),
+        error: (error) => {
+          this.onError?.(error);
+          return new Response(null, { status: 502 });
+        }
+      });
+      this.server = server;
+      this.serverRuntime = "bun";
+      this.url = `http://127.0.0.1:${server.port}${this.secretPath}`;
+      return this.url;
+    }
     const server = createServer((request, response) => {
       void this.#handle(request, response);
     });
@@ -138,6 +176,7 @@ export class RangeProxy {
       throw new EmbyError("FFMPEG_PROXY_FAILED", "无法启动 FFmpeg 本机媒体桥");
     }
     this.server = server;
+    this.serverRuntime = "node";
     this.url = `http://127.0.0.1:${address.port}${this.secretPath}`;
     return this.url;
   }
@@ -147,8 +186,13 @@ export class RangeProxy {
     this.controllers.clear();
     const server = this.server;
     this.server = null;
+    this.serverRuntime = null;
     this.url = null;
     if (!server) return;
+    if (typeof server.stop === "function") {
+      server.stop(true);
+      return;
+    }
     await new Promise((resolve) => {
       server.close(resolve);
       server.closeAllConnections?.();
@@ -229,6 +273,179 @@ export class RangeProxy {
       request.off("aborted", abort);
       this.controllers.delete(controller);
     }
+  }
+
+  async #handleBun(request, server) {
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    // Bun 的 Request.signal.reason 是 code=20 的 DOMException；统一包装成业务层
+    // CANCELLED，FFmpeg 主动关闭旧 Range 以 seek 时不能把它升级成播放失败。
+    const abort = () => controller.abort(cancelled(request.signal.reason));
+    request.signal.addEventListener("abort", abort, { once: true });
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      request.signal.removeEventListener("abort", abort);
+      this.controllers.delete(controller);
+    };
+    try {
+      const requestUrl = new URL(request.url);
+      if (requestUrl.pathname !== this.secretPath || !["GET", "HEAD"].includes(request.method)) {
+        cleanup();
+        return new Response(null, { status: 404 });
+      }
+      const requested = parseRangeHeader(request.headers.get("range"));
+      // 播放器暂停或前端缓冲充足时，FFmpeg 会因 stdout 背压暂时停止读取输入。
+      // Bun 的服务级 idleTimeout 也作用于流式响应；合法媒体请求必须允许长期静默，
+      // 否则恢复播放时输入连接已经被关闭，FFmpeg 会把媒体误判为提前结束。
+      server.timeout(request, 0);
+      return this.openRangeStream
+        ? await this.#bunStreamResponse(request, requested, controller.signal, cleanup)
+        : await this.#bunChunkedResponse(request, requested, controller.signal, cleanup);
+    } catch (error) {
+      cleanup();
+      if (!["CANCELLED", "ABORTED"].includes(error?.code)) this.onError?.(error);
+      return new Response(null, { status: error?.code === "INVALID_RANGE" ? 416 : 502 });
+    }
+  }
+
+  async #bunStreamResponse(request, requested, signal, cleanup) {
+    const first = await this.openRangeStream({
+      start: requested.start,
+      end: request.method === "HEAD" ? requested.start : requested.end,
+      signal
+    });
+    const total = Number.isSafeInteger(first.total) ? first.total : null;
+    const finalEnd = requested.end === null
+      ? (total === null ? null : total - 1)
+      : (total === null ? requested.end : Math.min(requested.end, total - 1));
+    const headers = {
+      "Accept-Ranges": "bytes",
+      "Content-Type": first.contentType || "application/octet-stream",
+      "Cache-Control": "no-store"
+    };
+    if (requested.partial) {
+      const responseEnd = finalEnd ?? first.end;
+      headers["Content-Range"] = `bytes ${requested.start}-${responseEnd}/${total ?? "*"}`;
+      if (Number.isSafeInteger(responseEnd)) {
+        headers["Content-Length"] = String(Math.max(0, responseEnd - requested.start + 1));
+      }
+    } else if (total !== null) {
+      headers["Content-Length"] = String(total);
+    }
+    if (request.method === "HEAD") {
+      await first.cancel?.();
+      cleanup();
+      return new Response(null, { status: requested.partial ? 206 : 200, headers });
+    }
+
+    const owner = this;
+    const body = readableStreamFrom((async function* () {
+      let active = first;
+      let offset = requested.start;
+      let retries = 0;
+      const cancelActive = async (reason) => {
+        const current = active;
+        active = null;
+        await current?.cancel?.(reason);
+      };
+      try {
+        while (!signal.aborted) {
+          let received = 0;
+          try {
+            for await (const chunkValue of active.body) {
+              if (signal.aborted) throw signal.reason ?? cancelled();
+              let chunk = Buffer.from(chunkValue);
+              if (finalEnd !== null) {
+                const remaining = finalEnd - offset + 1;
+                if (remaining <= 0) break;
+                if (chunk.length > remaining) chunk = chunk.subarray(0, remaining);
+              }
+              if (chunk.length === 0) continue;
+              offset += chunk.length;
+              received += chunk.length;
+              yield chunk;
+              if (finalEnd !== null && offset > finalEnd) break;
+            }
+          } catch (error) {
+            if (signal.aborted) throw cancelled(error);
+            await cancelActive(error);
+            if (received > 0) retries = 0;
+            else if (++retries > 2) throw error;
+            active = await owner.openRangeStream({ start: offset, end: finalEnd, signal });
+            continue;
+          }
+          await cancelActive();
+          if (finalEnd !== null && offset > finalEnd) return;
+          if (received === 0) {
+            throw new EmbyError("MEDIA_STREAM_TRUNCATED", "媒体 CDN 流提前结束", { retryable: true });
+          }
+          retries = 0;
+          active = await owner.openRangeStream({ start: offset, end: finalEnd, signal });
+        }
+        throw signal.reason ?? cancelled();
+      } catch (error) {
+        if (!["CANCELLED", "ABORTED"].includes(error?.code)) owner.onError?.(error);
+        throw error;
+      } finally {
+        await cancelActive();
+        cleanup();
+      }
+    })());
+    return new Response(body, { status: requested.partial ? 206 : 200, headers });
+  }
+
+  async #bunChunkedResponse(request, requested, signal, cleanup) {
+    const firstEnd = requested.end === null
+      ? requested.start + RANGE_CHUNK_BYTES - 1
+      : Math.min(requested.end, requested.start + RANGE_CHUNK_BYTES - 1);
+    const first = await this.readRange({ start: requested.start, end: firstEnd, signal });
+    const total = Number.isSafeInteger(first.total) ? first.total : null;
+    const finalEnd = requested.end === null
+      ? (total === null ? null : total - 1)
+      : (total === null ? requested.end : Math.min(requested.end, total - 1));
+    const headers = {
+      "Accept-Ranges": "bytes",
+      "Content-Type": first.contentType || "application/octet-stream",
+      "Cache-Control": "no-store"
+    };
+    if (requested.partial && total !== null && finalEnd !== null) {
+      headers["Content-Range"] = `bytes ${requested.start}-${finalEnd}/${total}`;
+      headers["Content-Length"] = String(Math.max(0, finalEnd - requested.start + 1));
+    } else if (!requested.partial && total !== null) {
+      headers["Content-Length"] = String(total);
+    }
+    if (request.method === "HEAD") {
+      cleanup();
+      return new Response(null, { status: requested.partial ? 206 : 200, headers });
+    }
+
+    const owner = this;
+    const body = readableStreamFrom((async function* () {
+      let result = first;
+      let offset = requested.start;
+      try {
+        while (!signal.aborted) {
+          const bytes = result.bytes;
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return;
+          yield Buffer.from(bytes);
+          offset = result.end + 1;
+          if (finalEnd !== null && offset > finalEnd) return;
+          const nextEnd = finalEnd === null
+            ? offset + RANGE_CHUNK_BYTES - 1
+            : Math.min(finalEnd, offset + RANGE_CHUNK_BYTES - 1);
+          result = await owner.readRange({ start: offset, end: nextEnd, signal });
+        }
+        throw signal.reason ?? cancelled();
+      } catch (error) {
+        if (!["CANCELLED", "ABORTED"].includes(error?.code)) owner.onError?.(error);
+        throw error;
+      } finally {
+        cleanup();
+      }
+    })());
+    return new Response(body, { status: requested.partial ? 206 : 200, headers });
   }
 
   async #pipeRangeStream(request, response, requested, signal) {
