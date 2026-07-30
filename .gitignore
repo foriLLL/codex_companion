@@ -1,0 +1,24 @@
+node_modules/
+.DS_Store
+*.log
+.codex-companion*.json
+.codex-hg*.json
+
+# 打包产物与编译期生成文件
+dist/
+src/hls-embedded.generated.mjs
+
+# 防御性：避免误提交本地配置/状态转储与发布产物
+config.json
+runtime.json
+emby.json
+emby-home.json
+*.tar.gz
+*.app/
+.env
+*.local
+
+# 内部研究/规划文档（不随公开仓库发布）
+Codex 插件与 MCP Apps 能力边界调研.md
+Emby 卡片接入计划.md
+codex 皮肤实现路线.md

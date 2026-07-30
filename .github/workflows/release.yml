@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的 tag（如 v0.0.1）；留空则用当前分支 HEAD"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          # 各架构在对应架构的 runner 上构建：ffmpeg-static 的 postinstall 只下载
+          # 构建机架构的二进制，交叉打包会塞错架构（见 build-app.mjs 的架构校验）。
+          - target: darwin-arm64
+            runner: macos-14
+            asset: codex-companion-darwin-arm64.tar.gz
+          - target: darwin-x64
+            runner: macos-13
+            asset: codex-companion-darwin-x64.tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build .app bundle
+        run: node scripts/build-app.mjs --target ${{ matrix.target }} --out dist
+
+      - name: Package tarball + checksum
+        working-directory: dist
+        run: |
+          tar -czf "${{ matrix.asset }}" "Codex Companion.app"
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.4.1
+        with:
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+            packaging/install.sh
