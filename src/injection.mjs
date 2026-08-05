@@ -1,4 +1,5 @@
-export const INJECTION_VERSION = "0.0.1";
+// 独立于发行版本：同一个 v0.0.1 开发周期内注入源码变化也必须触发已打开页面重挂载。
+export const INJECTION_VERSION = "0.0.1-r4";
 export const HOST_ID = "codex-companion-root";
 export const RAIL_ID = "codex-companion-rail";
 export const BRIDGE_KEY = "__CODEX_COMPANION__";
@@ -879,13 +880,15 @@ function codexCompanionBootstrap(config) {
           outline: none;
           background: #000;
         }
-        .emby-video {
+        .emby-video,
+        .emby-video-frame {
           display: block;
           width: 100%;
           height: 100%;
-          object-fit: contain;
           background: #000;
         }
+        .emby-video { object-fit: contain; }
+        .emby-video-frame { border: 0; }
         .emby-video::cue {
           color: #fff;
           background: rgba(0,0,0,.72);
@@ -2011,6 +2014,7 @@ function codexCompanionBootstrap(config) {
     let volumeReportTimer = null;
     let activeHls = null;
     let activeDirectPlayer = null;
+    let lastMseDiagnostics = null;
     let playbackStopping = false;
     let workerFallbackReported = false;
     let subtitleRequestId = null;
@@ -4022,11 +4026,12 @@ function codexCompanionBootstrap(config) {
         chips.append(chip);
       }
       view.append(chips);
-      // 选源 chips：仅当该剧有多个可选源时显示。默认高亮"推荐"源（有字幕的第一项，
-      // 与后端默认选源一致）；用户点选后记入按 seriesId 的会话偏好，跨集生效。
+      // 选源 chips：仅当该剧有多个可选源时显示。推荐项由后端按最高画质档、
+      // 字幕可用性与端到端播放成本统一计算；用户点选后记入按 seriesId 的会话偏好。
       if (embyState.sourceOptions.length > 1) {
         const seriesId = embyState.seriesItem?.id;
-        const recommended = embyState.sourceOptions.find((option) => option.hasSubtitles)
+        const recommended = embyState.sourceOptions.find((option) => option.recommended)
+          ?? embyState.sourceOptions.find((option) => option.hasSubtitles)
           ?? embyState.sourceOptions[0];
         const activeKey = preferredSourceKey(seriesId) ?? recommended?.sourceKey;
         const sourceChips = makeElement("div", "emby-chips emby-source-chips");
@@ -4174,9 +4179,20 @@ function codexCompanionBootstrap(config) {
       }
     }
 
+    const currentEmbyVideo = () => {
+      const local = embyApp.querySelector(".emby-video");
+      if (local) return local;
+      const frame = embyApp.querySelector(".emby-video-frame");
+      try {
+        return frame?.contentDocument?.querySelector("video") ?? null;
+      } catch {
+        return null;
+      }
+    };
+
     const playbackPayload = (eventName) => {
       const playback = embyState.playback;
-      const embyVideo = embyApp.querySelector(".emby-video");
+      const embyVideo = currentEmbyVideo();
       if (!playback) return null;
       return {
         playbackId: playback.playbackId,
@@ -4204,7 +4220,7 @@ function codexCompanionBootstrap(config) {
       status.hidden = !message;
     };
 
-    const releaseSubtitleTrack = (video = embyApp.querySelector(".emby-video")) => {
+    const releaseSubtitleTrack = (video = currentEmbyVideo()) => {
       if (subtitleRequestId) cancelRpc(subtitleRequestId, true);
       subtitleRequestId = null;
       if (video) {
@@ -4323,19 +4339,21 @@ function codexCompanionBootstrap(config) {
       activeHls = null;
       activeDirectPlayer?.destroy?.();
       activeDirectPlayer = null;
-      const video = embyApp.querySelector(".emby-video");
+      const video = currentEmbyVideo();
       releaseSubtitleTrack(video);
       if (video) {
         video.pause();
         video.removeAttribute("src");
         video.load();
       }
+      const frame = embyApp.querySelector(".emby-video-frame");
+      if (frame) frame.src = "about:blank";
     };
 
     const switchEmbySubtitle = async (subtitleStreamIndex) => {
       if (subtitleSwitching || !embyState.playback) return;
       const playback = embyState.playback;
-      const video = embyApp.querySelector(".emby-video");
+      const video = currentEmbyVideo();
       if (!video) return;
       const subtitle = subtitleStreamIndex === null
         ? null
@@ -4449,7 +4467,7 @@ function codexCompanionBootstrap(config) {
       }
     };
 
-    const requireLoopbackHlsUrl = (value) => {
+    const requireLoopbackMediaUrl = (value) => {
       try {
         const url = new URL(String(value ?? ""));
         const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -4469,6 +4487,74 @@ function codexCompanionBootstrap(config) {
       }
     };
 
+    const configureLoopbackVideoFrame = async (frame, playback, proxyUrl) => {
+      // app:// 主文档的 CSP 禁止 media-src 127.0.0.1；同源 blob 子文档不会继承
+      // 这条主文档策略。把原生 <video> 放进无脚本 blob iframe 后，媒体 Range
+      // 直接流经 loopback HTTP，不再把 Base64 分片塞进 CDP/Renderer 堆。
+      const frameSource = [
+        "<!doctype html><meta charset=\"utf-8\">",
+        "<style>",
+        "html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000}",
+        "video{display:block;width:100%;height:100%;object-fit:contain;background:#000}",
+        "video::cue{color:#fff;background:rgba(0,0,0,.72);font-family:-apple-system,system-ui,sans-serif;font-size:min(4.5vh,44px);text-shadow:0 1px 2px #000,0 0 2px #000}",
+        "video::-webkit-media-controls-toggle-closed-captions-button,video::-webkit-media-controls-fullscreen-button{display:none}",
+        "</style><video controls playsinline preload=\"metadata\"></video>"
+      ].join("");
+      const frameUrl = URL.createObjectURL(new Blob([frameSource], { type: "text/html;charset=utf-8" }));
+      try {
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => finish(reject, rpcError("MEDIA_FRAME_TIMEOUT", "原生媒体容器启动超时", true)), 10_000);
+          const finish = (callback, value) => {
+            clearTimeout(timeout);
+            frame.removeEventListener("load", onLoad);
+            frame.removeEventListener("error", onError);
+            callback(value);
+          };
+          const onLoad = () => finish(resolve);
+          const onError = () => finish(reject, rpcError("MEDIA_FRAME_FAILED", "原生媒体容器启动失败", true));
+          frame.addEventListener("load", onLoad, { once: true });
+          frame.addEventListener("error", onError, { once: true });
+          frame.src = frameUrl;
+        });
+      } finally {
+        URL.revokeObjectURL(frameUrl);
+      }
+      if (disposed || !frame.isConnected || embyState.playback !== playback) {
+        throw rpcError("ABORTED", "播放器已经关闭");
+      }
+      let video = null;
+      try {
+        video = frame.contentDocument?.querySelector("video") ?? null;
+      } catch {}
+      if (!video) throw rpcError("MEDIA_FRAME_FAILED", "原生媒体容器中没有视频元素", true);
+      video.disablePictureInPicture = true;
+      video.src = proxyUrl;
+      video.load();
+      await new Promise((resolve, reject) => {
+        if (video.readyState >= 1) {
+          resolve();
+          return;
+        }
+        const timeout = setTimeout(() => finish(reject, rpcError("MEDIA_METADATA_TIMEOUT", "视频元数据加载超时", true)), 30_000);
+        const finish = (callback, value) => {
+          clearTimeout(timeout);
+          video.removeEventListener("loadedmetadata", onMetadata);
+          video.removeEventListener("error", onError);
+          callback(value);
+        };
+        const onMetadata = () => finish(resolve);
+        const onError = () => finish(
+          reject,
+          rpcError("MEDIA_LOAD_FAILED", video.error?.message || "原生视频加载失败", true)
+        );
+        video.addEventListener("loadedmetadata", onMetadata, { once: true });
+        video.addEventListener("error", onError, { once: true });
+      });
+      const startTime = Number(playback.startPositionTicks || 0) / 10_000_000;
+      if (Number.isFinite(startTime) && startTime > 0) video.currentTime = startTime;
+      return video;
+    };
+
     const configureHls = (embyVideo, playback) => {
       const Hls = globalThis.Hls;
       if (typeof Hls !== "function" || (typeof Hls.isSupported === "function" && !Hls.isSupported())) {
@@ -4481,7 +4567,7 @@ function codexCompanionBootstrap(config) {
       // loader。其他宿主若允许 loopback，可继续使用本地代理并保留一次降级能力。
       const hlsProxyUrl = location.protocol === "app:"
         ? null
-        : requireLoopbackHlsUrl(playback.hlsProxyUrl);
+        : requireLoopbackMediaUrl(playback.hlsProxyUrl);
       const useHlsProxy = Boolean(hlsProxyUrl) && playback.hlsProxyFallback !== true;
       const hlsOptions = {
         enableWorker,
@@ -4568,22 +4654,75 @@ function codexCompanionBootstrap(config) {
       setActivePlayer,
       clearActivePlayer,
       isStopping,
-      onFailure
+      onFailure,
+      onQuotaExceeded
     }) => {
       if (typeof MediaSource !== "function" || typeof MediaSource.isTypeSupported !== "function") {
         throw rpcError("MSE_UNAVAILABLE", "当前 Renderer 不支持 MediaSource 播放");
       }
       const mediaSource = new MediaSource();
       const objectUrl = URL.createObjectURL(mediaSource);
+      let resolveInitialBuffer;
+      const initialBufferReady = new Promise((resolve) => { resolveInitialBuffer = resolve; });
+      const requestedInitialBuffer = Number(playback?.initialBufferSeconds);
+      const defaultInitialBuffer = rpcPrefix === "playback.direct"
+        ? (playback?.streamMode === "ffmpeg-fmp4" ? 6 : 4)
+        : 0.5;
+      const initialBufferTarget = Number.isFinite(requestedInitialBuffer) && requestedInitialBuffer > 0.5
+        ? Math.min(12, requestedInitialBuffer)
+        : defaultInitialBuffer;
+      // SourceBuffer 的配额按字节而不是按秒计算。以 40 MiB 编码数据为常驻预算，
+      // 再给正在传输/解码的分片留出余量：低码率仍保留 12s + 5s，高码率则自动
+      // 缩短（40 Mbps 约为 6.7s + 1.7s），避免“时间不长但字节已满”。
+      const mediaBitrate = Number(playback?.mediaBitrate);
+      const bufferBudgetSeconds = Number.isFinite(mediaBitrate) && mediaBitrate > 0
+        ? (40 * 1024 * 1024 * 8) / mediaBitrate
+        : Infinity;
+      let backBufferSeconds = Number.isFinite(bufferBudgetSeconds)
+        ? Math.max(1, Math.min(5, bufferBudgetSeconds * 0.2))
+        : 5;
+      let maxForwardBufferSeconds = Number.isFinite(bufferBudgetSeconds)
+        ? Math.max(initialBufferTarget, Math.min(12, bufferBudgetSeconds - backBufferSeconds))
+        : 12;
+      // MSE remove 会连带删除直到下一关键帧的依赖帧。直连 MP4 初始化后用真实最大
+      // GOP 间隔保留完整当前 GOP；0.5s 边缘容差则避免播放头落在被取整后的微小空洞
+      // 前时误判为“完全没缓冲”，继而高速预取直至 SourceBuffer 配额耗尽。
+      let bufferEdgeToleranceSeconds = 0.5;
+      const tuneBufferForKeyframes = (keyframeIntervalValue) => {
+        if (rpcPrefix !== "playback.direct" || playback?.streamMode !== "direct-mp4") return;
+        const keyframeInterval = Number(keyframeIntervalValue);
+        if (!Number.isFinite(keyframeInterval) || keyframeInterval <= 0) return;
+        const retainedGop = Math.min(12, keyframeInterval + 0.5);
+        backBufferSeconds = Math.max(backBufferSeconds, retainedGop);
+        maxForwardBufferSeconds = Number.isFinite(bufferBudgetSeconds)
+          ? Math.max(initialBufferTarget, Math.min(12, bufferBudgetSeconds - backBufferSeconds))
+          : 12;
+        bufferEdgeToleranceSeconds = Math.max(0.5, Math.min(1, keyframeInterval * 0.1));
+      };
       const player = {
         destroyed: false,
         generation: 0,
         controller: null,
         seekTimer: null,
+        seekController: null,
+        seekInFlight: false,
+        pendingSeekTime: null,
+        pointerActive: false,
+        pointerSawSeek: false,
         sourceBuffers: new Map(),
+        parserComplete: new Map(),
+        keyframeTimes: [],
+        quotaRetries: 0,
+        quotaKeyframeRecoveries: 0,
+        quotaRestarts: Math.max(0, Number(playback?.mseQuotaRestarts) || 0),
+        lastQuotaRecovery: null,
+        recoveringQuota: false,
+        initialSeekTarget: null,
         mediaSource,
         objectUrl,
         started: false,
+        initialBufferFailure: null,
+        initialBufferTimer: null,
         destroy: null
       };
       setActivePlayer(player);
@@ -4631,7 +4770,12 @@ function codexCompanionBootstrap(config) {
         }
       });
 
-      const append = async (sourceBuffer, bytes) => {
+      const isQuotaExceeded = (errorValue) => (
+        errorValue?.name === "QuotaExceededError"
+        || /SourceBuffer is full|QuotaExceededError/i.test(String(errorValue?.message || errorValue || ""))
+      );
+
+      const appendOnce = async (sourceBuffer, bytes) => {
         if (sourceBuffer.updating) await waitForUpdateEnd(sourceBuffer, () => {});
         await waitForUpdateEnd(sourceBuffer, () => sourceBuffer.appendBuffer(bytes));
       };
@@ -4641,20 +4785,23 @@ function codexCompanionBootstrap(config) {
         for (let index = 0; index < embyVideo.buffered.length; index += 1) {
           const start = embyVideo.buffered.start(index);
           const end = embyVideo.buffered.end(index);
-          if (time >= start - 0.1 && time <= end) return Math.max(0, end - time);
+          if (time >= start - bufferEdgeToleranceSeconds && time <= end) return Math.max(0, end - time);
         }
         return 0;
       };
 
       const isBuffered = (time) => {
         for (let index = 0; index < embyVideo.buffered.length; index += 1) {
-          if (time >= embyVideo.buffered.start(index) && time <= embyVideo.buffered.end(index) - 0.1) return true;
+          if (
+            time >= embyVideo.buffered.start(index) - bufferEdgeToleranceSeconds
+            && time <= embyVideo.buffered.end(index) - 0.1
+          ) return true;
         }
         return false;
       };
 
-      const waitForDemand = () => new Promise((resolve) => {
-        if (player.destroyed || bufferAhead() < 15) {
+      const waitForDemand = (forwardLimit = maxForwardBufferSeconds) => new Promise((resolve) => {
+        if (player.destroyed || bufferAhead() < forwardLimit) {
           resolve();
           return;
         }
@@ -4675,26 +4822,194 @@ function codexCompanionBootstrap(config) {
         embyVideo.addEventListener("play", finish, { once: true });
       });
 
-      const evictBackBuffer = async () => {
-        const removeEnd = (Number(embyVideo.currentTime) || 0) - 15;
+      const evictBefore = async (removeEnd) => {
         if (removeEnd <= 0) return;
-        await Promise.all([...player.sourceBuffers.values()].map(async (sourceBuffer) => {
-          if (sourceBuffer.updating || sourceBuffer.buffered.length === 0) return;
-          const start = sourceBuffer.buffered.start(0);
-          const end = Math.min(removeEnd, sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1));
-          if (end > start + 0.25) await waitForUpdateEnd(sourceBuffer, () => sourceBuffer.remove(start, end));
+        await Promise.all([...player.sourceBuffers.entries()].map(async ([trackId, sourceBuffer]) => {
+          if (sourceBuffer.updating) return;
+          const duration = Number(mediaSource.duration);
+          const end = Number.isFinite(duration) && duration > 0
+            ? Math.min(removeEnd, duration)
+            : removeEnd;
+          if (end <= 0.25) return;
+          // 一个 SourceBuffer 内含音频+视频时，buffered 是各 track 可播区间的交集。
+          // 从 buffered.start 开始删会漏掉交集之前仍驻留的单轨 coded frames；必须
+          // 从时间轴 0 删除，才会同时回收两条 track 的隐藏数据和真实媒体配额。
+          await waitForUpdateEnd(sourceBuffer, () => sourceBuffer.remove(0, end));
+          // remove 只删除 coded frames，不一定释放 ISO-BMFF byte-stream parser 的
+          // 输入缓存。仅在一个完整 moof+mdat 边界上 abort，重置 parser 后让 Chromium
+          // 真正回收已删数据；分片被拆成多次 RPC 时绝不能在中途 abort。
+          if (
+            player.parserComplete.get(trackId) === true
+            && !sourceBuffer.updating
+            && mediaSource.readyState === "open"
+          ) {
+            try { sourceBuffer.abort(); } catch {}
+          }
         }));
+      };
+
+      const evictBackBuffer = async (retainedSeconds = backBufferSeconds) => {
+        await evictBefore((Number(embyVideo.currentTime) || 0) - retainedSeconds);
+      };
+
+      const flushDecoderReferences = async () => {
+        const current = Number(embyVideo.currentTime) || 0;
+        let start = null;
+        let end = null;
+        for (let index = 0; index < embyVideo.buffered.length; index += 1) {
+          const rangeStart = embyVideo.buffered.start(index);
+          const rangeEnd = embyVideo.buffered.end(index);
+          if (current >= rangeStart - bufferEdgeToleranceSeconds && current <= rangeEnd) {
+            start = rangeStart;
+            end = rangeEnd;
+            break;
+          }
+        }
+        if (start === null || end - start < 0.08) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return false;
+        }
+        // remove/updateend 只保证 coded frames 已从 SourceBuffer 时间轴删除，不保证
+        // 解码器同步放开旧帧引用。同一可播区间内轻推 10ms 会刷新 decoder 而不触发
+        // 网络 seek；等 seeked 后再 append，避免“时间轴只剩 0.4s 仍报 full”。
+        const target = Math.min(end - 0.03, Math.max(start + 0.03, current + 0.01));
+        if (!Number.isFinite(target) || Math.abs(target - current) < 0.001) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return false;
+        }
+        await new Promise((resolve) => {
+          let timeout = null;
+          const finish = () => {
+            clearTimeout(timeout);
+            embyVideo.removeEventListener("seeked", finish);
+            resolve();
+          };
+          timeout = setTimeout(finish, 300);
+          embyVideo.addEventListener("seeked", finish, { once: true });
+          embyVideo.currentTime = target;
+        });
+        return true;
+      };
+
+      const recoverQuotaAtKeyframe = async () => {
+        if (player.keyframeTimes.length === 0) {
+          player.lastQuotaRecovery = "no-keyframes";
+          return false;
+        }
+        if (embyVideo.buffered.length === 0) {
+          player.lastQuotaRecovery = "no-buffer";
+          return false;
+        }
+        const current = Number(embyVideo.currentTime) || 0;
+        let rangeStart = null;
+        let rangeEnd = null;
+        for (let index = 0; index < embyVideo.buffered.length; index += 1) {
+          const start = embyVideo.buffered.start(index);
+          const end = embyVideo.buffered.end(index);
+          if (current >= start - bufferEdgeToleranceSeconds && current <= end) {
+            rangeStart = start;
+            rangeEnd = end;
+            break;
+          }
+        }
+        if (rangeStart === null) {
+          player.lastQuotaRecovery = "outside-buffer";
+          return false;
+        }
+        const candidates = player.keyframeTimes.filter((time) => (
+          time > rangeStart + 0.05 && time < rangeEnd - 0.05
+        ));
+        if (candidates.length === 0) {
+          player.lastQuotaRecovery = `no-boundary:${rangeStart.toFixed(2)}-${rangeEnd.toFixed(2)}`;
+          return false;
+        }
+        // 边界附近不能留 ±0.05s 的“无人区”：重试常恰好发生在 54.05s，若同时
+        // 要求 past<=54.00、future>54.10，会错过正好 54.00 的关键帧。
+        const passed = candidates.filter((time) => time <= current).at(-1);
+        const cutoff = passed ?? candidates.find((time) => time > current);
+        if (!Number.isFinite(cutoff)) {
+          player.lastQuotaRecovery = "no-cutoff";
+          return false;
+        }
+
+        // 若安全边界还在播放头前方，让现有缓冲继续播放到该关键帧；到达后精确
+        // 删除它之前的 coded frames。比“再等固定 N 秒”可靠，也不会删进当前 GOP。
+        while (!player.destroyed && (Number(embyVideo.currentTime) || 0) < cutoff + 0.05) {
+          if (bufferAhead() <= 0.1) {
+            player.lastQuotaRecovery = `buffer-ended-before:${cutoff.toFixed(2)}`;
+            return false;
+          }
+          await waitForDemand(-1);
+        }
+        if (player.destroyed) throw rpcError("ABORTED", "播放器已经关闭");
+        await evictBefore(Math.max(0, cutoff - 0.001));
+        const decoderFlushed = await flushDecoderReferences();
+        player.quotaKeyframeRecoveries += 1;
+        player.lastQuotaRecovery = `evicted-before:${cutoff.toFixed(2)}${decoderFlushed ? ":decoder-flushed" : ""}`;
+        return true;
+      };
+
+      const append = async (trackId, sourceBuffer, bytes, segmentEnd = true) => {
+        try {
+          await appendOnce(sourceBuffer, bytes);
+          player.parserComplete.set(trackId, segmentEnd);
+          return;
+        } catch (errorValue) {
+          if (!isQuotaExceeded(errorValue) || player.destroyed) throw errorValue;
+          player.quotaRetries += 1;
+        }
+
+        // 配额命中不是媒体损坏：当前分片尚未写入，可以让已缓冲内容继续播放，
+        // 收缩到约 4 秒后清掉旧数据并原样重试。清理仍保留完整当前 GOP，避免
+        // SourceBuffer 把依赖帧一并删到下一关键帧、制造微小空洞后再次错误预取。
+        // 这样不需要
+        // 重启 FFmpeg/Range 流；暂停状态则等用户继续播放后自然恢复。
+        const retryAheadSeconds = Math.max(2, Math.min(4, initialBufferTarget));
+        while (!player.destroyed && bufferAhead() >= retryAheadSeconds) {
+          await waitForDemand(retryAheadSeconds);
+        }
+        if (player.destroyed) throw rpcError("ABORTED", "播放器已经关闭");
+        await evictBackBuffer();
+        try {
+          await appendOnce(sourceBuffer, bytes);
+        } catch (retryError) {
+          if (!isQuotaExceeded(retryError) || !await recoverQuotaAtKeyframe()) throw retryError;
+          await appendOnce(sourceBuffer, bytes);
+        }
+        player.parserComplete.set(trackId, segmentEnd);
       };
 
       const fail = (errorValue) => {
         const errorObject = toRpcError(errorValue);
         if (player.destroyed || isStopping() || ["ABORTED", "CANCELLED"].includes(errorObject.code)) return;
+        lastMseDiagnostics = {
+          keyframeCount: player.keyframeTimes.length,
+          quotaRetries: player.quotaRetries,
+          quotaKeyframeRecoveries: player.quotaKeyframeRecoveries,
+          quotaRestarts: player.quotaRestarts,
+          lastQuotaRecovery: player.lastQuotaRecovery
+        };
+        if (isQuotaExceeded(errorValue) && typeof onQuotaExceeded === "function" && !player.recoveringQuota) {
+          player.recoveringQuota = true;
+          const recoveryState = {
+            currentTime: Math.max(0, Number(embyVideo.currentTime) || 0),
+            paused: embyVideo.paused,
+            volume: embyVideo.volume,
+            muted: embyVideo.muted
+          };
+          player.destroy();
+          clearActivePlayer(player);
+          void Promise.resolve(onQuotaExceeded(recoveryState)).catch((recoveryError) => {
+            onFailure(toRpcError(recoveryError));
+          });
+          return;
+        }
         onFailure(errorObject);
       };
 
       const pump = async (generation) => {
         while (!player.destroyed && generation === player.generation) {
-          if (bufferAhead() >= 30) {
+          if (bufferAhead() >= maxForwardBufferSeconds) {
             await waitForDemand();
             continue;
           }
@@ -4709,24 +5024,30 @@ function codexCompanionBootstrap(config) {
             if (player.controller === controller) player.controller = null;
           }
           if (player.destroyed || generation !== player.generation) return;
+          await evictBackBuffer();
           const grouped = new Map();
           for (const segment of result?.segments || []) {
             const list = grouped.get(segment.trackId) || [];
-            list.push(decodeBase64(segment.data));
+            list.push({
+              bytes: decodeBase64(segment.data),
+              // 兼容旧 daemon：旧响应没有字段时，每个响应项本来就是完整分片。
+              segmentEnd: segment.segmentEnd !== false
+            });
             grouped.set(segment.trackId, list);
           }
           await Promise.all([...grouped.entries()].map(async ([trackId, segments]) => {
             const sourceBuffer = player.sourceBuffers.get(trackId);
             if (!sourceBuffer) throw rpcError("MSE_TRACK_MISSING", `找不到媒体轨道 ${trackId}`);
-            for (const bytes of segments) {
+            for (const segment of segments) {
               if (player.destroyed || generation !== player.generation) return;
-              await append(sourceBuffer, bytes);
+              await append(trackId, sourceBuffer, segment.bytes, segment.segmentEnd);
             }
           }));
           if (player.destroyed || generation !== player.generation) return;
           await evictBackBuffer();
-          if (!player.started && (bufferAhead() > 0.5 || result?.end)) {
+          if (!player.started && (bufferAhead() >= initialBufferTarget || result?.end)) {
             player.started = true;
+            resolveInitialBuffer();
           }
           if (result?.end) {
             if (mediaSource.readyState === "open" && [...player.sourceBuffers.values()].every((buffer) => !buffer.updating)) {
@@ -4738,31 +5059,115 @@ function codexCompanionBootstrap(config) {
         }
       };
 
-      const seek = (time) => {
-        if (player.destroyed || isBuffered(time)) return;
+      const schedulePendingSeek = (delay = 120) => {
         clearTimeout(player.seekTimer);
+        if (
+          player.destroyed
+          || player.pointerActive
+          || player.seekInFlight
+          || !Number.isFinite(player.pendingSeekTime)
+        ) return;
         player.seekTimer = setTimeout(() => {
-          if (player.destroyed) return;
+          player.seekTimer = null;
+          if (player.destroyed || player.seekInFlight || !Number.isFinite(player.pendingSeekTime)) return;
+          const time = player.pendingSeekTime;
+          player.pendingSeekTime = null;
+          player.seekInFlight = true;
           player.generation += 1;
           const generation = player.generation;
           player.controller?.abort();
-          rpc(`${rpcPrefix}.seek`, {
-            playbackId: playback.playbackId,
-            timeSeconds: time
-          }, { timeoutMs: 45_000 }).then(async (result) => {
-            const timestampOffset = Number(result?.timestampOffsetSeconds);
-            if (Number.isFinite(timestampOffset)) {
-              for (const sourceBuffer of player.sourceBuffers.values()) {
-                if (sourceBuffer.updating) await waitForUpdateEnd(sourceBuffer, () => {});
-                sourceBuffer.timestampOffset = timestampOffset;
+          const controller = new AbortController();
+          player.seekController = controller;
+          void (async () => {
+            try {
+              const result = await rpc(`${rpcPrefix}.seek`, {
+                playbackId: playback.playbackId,
+                timeSeconds: time
+              }, { timeoutMs: 45_000, signal: controller.signal });
+              if (player.destroyed || generation !== player.generation) return;
+              // 拖动期间目标又变化了：后端已恢复 ready，但不要为过时位置启动 pump。
+              // finally 会在指针松开/防抖结束后串行提交最后一个目标。
+              if (Number.isFinite(player.pendingSeekTime)) return;
+              const timestampOffset = Number(result?.timestampOffsetSeconds);
+              if (Number.isFinite(timestampOffset)) {
+                for (const sourceBuffer of player.sourceBuffers.values()) {
+                  if (sourceBuffer.updating) await waitForUpdateEnd(sourceBuffer, () => {});
+                  sourceBuffer.timestampOffset = timestampOffset;
+                }
               }
+              if (player.destroyed || generation !== player.generation || Number.isFinite(player.pendingSeekTime)) return;
+              void pump(generation).catch((errorValue) => {
+                if (player.destroyed || generation !== player.generation) return;
+                fail(errorValue);
+              });
+            } catch (errorValue) {
+              const errorObject = toRpcError(errorValue);
+              if (
+                !player.destroyed
+                && generation === player.generation
+                && !isStopping()
+                && !["ABORTED", "CANCELLED"].includes(errorObject.code)
+              ) fail(errorObject);
+            } finally {
+              if (player.seekController === controller) player.seekController = null;
+              player.seekInFlight = false;
+              if (Number.isFinite(player.pendingSeekTime) && !player.pointerActive) schedulePendingSeek();
             }
-            return pump(generation);
-          }).catch(fail);
-        }, 120);
+          })();
+        }, delay);
       };
 
-      const onSeeking = () => seek(Number(embyVideo.currentTime) || 0);
+      const seek = (time) => {
+        if (player.destroyed) return;
+        const target = Math.max(0, Number(time) || 0);
+        clearTimeout(player.seekTimer);
+        player.seekTimer = null;
+        // 还没有后端 seek 时，落在已有缓冲里的原生跳转无需重启流；但若已有
+        // seek 在途，最终目标即使碰巧落在旧缓冲中也必须排队，以重新同步后端位置。
+        if (!player.seekInFlight && isBuffered(target)) {
+          player.pendingSeekTime = null;
+          return;
+        }
+        player.pendingSeekTime = target;
+        // 原生 controls 会在按住滑块期间持续触发 seeking。pointerup 前只记最新位置，
+        // 不启动 FFmpeg；键盘跳播没有 pointer 序列，仍由尾沿防抖提交。
+        if (!player.pointerActive && !player.seekInFlight) schedulePendingSeek();
+      };
+
+      const onPointerDown = () => {
+        player.pointerActive = true;
+        player.pointerSawSeek = false;
+        clearTimeout(player.seekTimer);
+        player.seekTimer = null;
+      };
+      const onPointerFinished = () => {
+        if (!player.pointerActive) return;
+        const pointerSawSeek = player.pointerSawSeek;
+        player.pointerActive = false;
+        player.pointerSawSeek = false;
+        // 浏览器在一次未完成的 seeking 状态中不保证为每次滑块位移都再次派发
+        // seeking；松手时直接读取 currentTime，确保提交的是最终位置而非第一次位置。
+        if (pointerSawSeek) seek(Number(embyVideo.currentTime) || 0);
+        else if (Number.isFinite(player.pendingSeekTime)) schedulePendingSeek(0);
+      };
+
+      const onSeeking = () => {
+        const time = Number(embyVideo.currentTime) || 0;
+        if (player.pointerActive) player.pointerSawSeek = true;
+        const initialSeekTarget = Number(player.initialSeekTarget);
+        if (
+          Number.isFinite(initialSeekTarget)
+          && Math.abs(time - initialSeekTarget) <= bufferEdgeToleranceSeconds
+        ) {
+          // initialize/配额重建已经让后端 MP4Box seek 到这个关键帧。给 video 对齐
+          // currentTime 会异步触发 seeking；若再次进入 RPC seek，就会 abort 刚启动的
+          // .next 请求，表现成新 MediaSource 写完 init 后立刻“请求已取消”。
+          player.initialSeekTarget = null;
+          return;
+        }
+        player.initialSeekTarget = null;
+        seek(time);
+      };
       const onVideoError = () => fail(rpcError("MEDIA_DECODE_ERROR", "视频解码失败，当前编码可能不受支持"));
       // 卡顿看护：直连 MP4 走自研 MSE 管线，没有 hls.js 那样的内建 gap/nudge。
       // 当 <video> 触发 waiting/stalled 时，若播放头正好卡在一个已缓冲区间「之前」的极小空洞，
@@ -4785,7 +5190,9 @@ function codexCompanionBootstrap(config) {
         clearTimeout(stallTimer);
         stallTimer = setTimeout(() => {
           if (player.destroyed || embyVideo.paused) return;
-          if (bufferAhead() < 0.5 && !player.controller) seek(Number(embyVideo.currentTime) || 0);
+          if (bufferAhead() < 0.5 && !player.controller && !player.seekInFlight) {
+            seek(Number(embyVideo.currentTime) || 0);
+          }
         }, 3_000);
       };
       const onPlaying = () => { clearTimeout(stallTimer); };
@@ -4795,8 +5202,17 @@ function codexCompanionBootstrap(config) {
         player.generation += 1;
         clearTimeout(player.seekTimer);
         clearTimeout(stallTimer);
+        clearTimeout(player.initialBufferTimer);
+        resolveInitialBuffer();
         player.controller?.abort();
+        player.seekController?.abort();
         embyVideo.removeEventListener("seeking", onSeeking);
+        embyVideo.removeEventListener("pointerdown", onPointerDown);
+        embyVideo.removeEventListener("pointerup", onPointerFinished);
+        embyVideo.removeEventListener("pointercancel", onPointerFinished);
+        embyVideo.removeEventListener("lostpointercapture", onPointerFinished);
+        window.removeEventListener("pointerup", onPointerFinished, true);
+        window.removeEventListener("pointercancel", onPointerFinished, true);
         embyVideo.removeEventListener("error", onVideoError);
         embyVideo.removeEventListener("waiting", onWaiting);
         embyVideo.removeEventListener("stalled", onWaiting);
@@ -4822,30 +5238,68 @@ function codexCompanionBootstrap(config) {
         }, { timeoutMs: 45_000, signal: initController.signal });
         if (player.controller === initController) player.controller = null;
         if (player.destroyed) return;
+        player.keyframeTimes = Array.isArray(initialization?.keyframeTimesSeconds)
+          ? initialization.keyframeTimesSeconds
+            .map(Number)
+            .filter((time) => Number.isFinite(time) && time >= 0)
+            .sort((left, right) => left - right)
+          : [];
+        tuneBufferForKeyframes(initialization?.keyframeIntervalSeconds);
         for (const track of initialization?.tracks || []) {
           if (!MediaSource.isTypeSupported(track.mime)) {
             throw rpcError("MEDIA_CODEC_UNSUPPORTED", `当前 Renderer 不支持 ${track.codec || track.mime} 编码`);
           }
           const sourceBuffer = mediaSource.addSourceBuffer(track.mime);
           player.sourceBuffers.set(track.id, sourceBuffer);
-          await append(sourceBuffer, decodeBase64(track.initData));
+          await append(track.id, sourceBuffer, decodeBase64(track.initData), true);
           const timestampOffset = Number(initialization?.timestampOffsetSeconds);
           if (Number.isFinite(timestampOffset)) sourceBuffer.timestampOffset = timestampOffset;
         }
         if (player.sourceBuffers.size === 0) throw rpcError("MSE_TRACK_MISSING", "媒体没有可播放的音视频轨道");
         const duration = Number(initialization?.durationSeconds);
         if (Number.isFinite(duration) && duration > 0) mediaSource.duration = duration;
+        const initializedStartTime = Number(initialization?.startTimeSeconds);
         const requestedStartTime = Number(playback.startPositionTicks || 0) / 10_000_000;
-        const startTime = Number.isFinite(requestedStartTime) && requestedStartTime > 0
-          ? requestedStartTime
-          : Number(initialization?.startTimeSeconds);
-        if (Number.isFinite(startTime) && startTime > 0) embyVideo.currentTime = startTime;
+        // MP4Box seek 会返回真实关键帧时间；优先采用它，不能把 video 强设回请求值
+        // 落在首个可解码帧之前，否则同样会形成“当前时间略早于 buffered.start”的假空洞。
+        const startTime = Number.isFinite(initializedStartTime) && initializedStartTime >= 0
+          ? initializedStartTime
+          : requestedStartTime;
+        if (Number.isFinite(startTime) && startTime > 0) {
+          player.initialSeekTarget = startTime;
+          embyVideo.currentTime = startTime;
+        }
         embyVideo.addEventListener("seeking", onSeeking);
+        embyVideo.addEventListener("pointerdown", onPointerDown);
+        embyVideo.addEventListener("pointerup", onPointerFinished);
+        embyVideo.addEventListener("pointercancel", onPointerFinished);
+        embyVideo.addEventListener("lostpointercapture", onPointerFinished);
+        // UA 原生进度条通常会捕获指针；全局捕获监听作为滑块拖出 video 边界后的
+        // 兜底，确保 pointerActive 不会卡死，播放器销毁时成对移除。
+        window.addEventListener("pointerup", onPointerFinished, true);
+        window.addEventListener("pointercancel", onPointerFinished, true);
         embyVideo.addEventListener("error", onVideoError);
         embyVideo.addEventListener("waiting", onWaiting);
         embyVideo.addEventListener("stalled", onWaiting);
         embyVideo.addEventListener("playing", onPlaying);
-        void pump(player.generation).catch(fail);
+        let configurationComplete = false;
+        void pump(player.generation).catch((errorValue) => {
+          player.initialBufferFailure = errorValue;
+          resolveInitialBuffer();
+          if (configurationComplete) fail(errorValue);
+        });
+        if (initialBufferTarget > 0.5) {
+          player.initialBufferTimer = setTimeout(resolveInitialBuffer, 20_000);
+          await initialBufferReady;
+          clearTimeout(player.initialBufferTimer);
+          player.initialBufferTimer = null;
+          if (player.destroyed) return;
+          if (player.initialBufferFailure) throw player.initialBufferFailure;
+          // 超时只表示链路暂时较慢，已有数据仍可播放；后续 pump 继续受动态
+          // 字节预算约束，不会因等待首播而无限积累。
+          player.started = true;
+        }
+        configurationComplete = true;
       } catch (errorValue) {
         player.destroy();
         // 只有自己仍是活动播放器时才清空：快速切换视频时新播放器已经挂上，
@@ -4858,14 +5312,37 @@ function codexCompanionBootstrap(config) {
 
     const configureDirectMp4 = (embyVideo, playback) => configureDirectMp4Stream(embyVideo, playback, {
       rpcPrefix: "playback.direct",
-      setActivePlayer: (player) => { activeDirectPlayer = player; },
+      setActivePlayer: (player) => {
+        lastMseDiagnostics = null;
+        activeDirectPlayer = player;
+      },
       clearActivePlayer: (player) => { if (activeDirectPlayer === player) activeDirectPlayer = null; },
       isStopping: () => playbackStopping || subtitleSwitching,
       onFailure: (errorObject) => showError(
         errorObject,
         () => beginPlayback(playback.item, true),
         embyState.previousRoute?.view || "home"
-      )
+      ),
+      onQuotaExceeded: async (recoveryState) => {
+        if (disposed || playbackStopping || embyState.playback !== playback || embyState.view !== "playback") return;
+        playback.mseQuotaRestarts = Math.max(0, Number(playback.mseQuotaRestarts) || 0) + 1;
+        playback.mediaReady = false;
+        setSubtitleStatus("正在释放媒体缓存并恢复播放…");
+        const seekResult = await rpc("playback.direct.seek", {
+          playbackId: playback.playbackId,
+          timeSeconds: recoveryState.currentTime
+        }, { timeoutMs: 45_000 });
+        if (disposed || playbackStopping || embyState.playback !== playback || embyState.view !== "playback") return;
+        const actualStart = Number(seekResult?.timeSeconds);
+        if (Number.isFinite(actualStart) && actualStart >= 0) {
+          playback.startPositionTicks = Math.round(actualStart * 10_000_000);
+        }
+        playback.restorePlaybackState = recoveryState;
+        await configureDirectMp4(embyVideo, playback);
+        if (disposed || playbackStopping || embyState.playback !== playback || embyState.view !== "playback") return;
+        activatePlaybackState(embyVideo, playback);
+        setSubtitleStatus("");
+      }
     });
 
     const episodeContextMatches = (item) => (
@@ -5076,12 +5553,24 @@ function codexCompanionBootstrap(config) {
       const view = makeElement("div", "emby-view emby-playback");
       view.dataset.view = "playback";
       view.tabIndex = 0;
-      const embyVideo = makeElement("video", "emby-video");
-      embyVideo.controls = true;
-      embyVideo.playsInline = true;
-      embyVideo.preload = "metadata";
-      // 与红果播放视图一致禁用画中画（Electron 下 PiP 行为未验证，两卡统一）。
-      embyVideo.disablePictureInPicture = true;
+      const playback = embyState.playback;
+      const directProxyUrl = playback?.streamMode === "direct-mp4"
+        ? requireLoopbackMediaUrl(playback.directProxyUrl)
+        : null;
+      let embyVideo = directProxyUrl ? null : makeElement("video", "emby-video");
+      let mediaElement = embyVideo;
+      if (embyVideo) {
+        embyVideo.controls = true;
+        embyVideo.playsInline = true;
+        embyVideo.preload = "metadata";
+        // 与红果播放视图一致禁用画中画（Electron 下 PiP 行为未验证，两卡统一）。
+        embyVideo.disablePictureInPicture = true;
+      } else {
+        const frame = makeElement("iframe", "emby-video-frame");
+        frame.title = "Emby 原生视频播放器";
+        frame.setAttribute("allow", "autoplay; fullscreen");
+        mediaElement = frame;
+      }
       const chrome = makeElement("div", "emby-playback-chrome");
       const back = makeIconButton("返回媒体列表", "back", () => stopPlayback(true));
       back.classList.add("emby-playback-back");
@@ -5198,6 +5687,7 @@ function codexCompanionBootstrap(config) {
       const replay = makeElement("button", "emby-button", "重播");
       replay.type = "button";
       replay.addEventListener("click", () => {
+        if (!embyVideo) return;
         ended.hidden = true;
         embyVideo.currentTime = 0;
         embyVideo.play().catch(() => {});
@@ -5208,45 +5698,50 @@ function codexCompanionBootstrap(config) {
       endedNext.hidden = true;
       endedNext.addEventListener("click", () => void playAdjacentEpisode(1));
       ended.append(endedNext);
-      // 暂停状态同步到 view.dataset.paused：CSS 据此常显 chrome（初始 paused 时
-      // 加载中也显示返回键/标题）。play/pause 覆盖全部状态翻转点。
-      const syncPausedState = () => { view.dataset.paused = String(embyVideo.paused); };
-      embyVideo.addEventListener("play", syncPausedState);
-      embyVideo.addEventListener("playing", syncPausedState);
-      embyVideo.addEventListener("pause", syncPausedState);
-      syncPausedState();
-      embyVideo.addEventListener("pause", () => reportProgress("pause"));
-      embyVideo.addEventListener("play", () => {
-        reportProgress("play");
-        // ended 时停掉了定时上报；重播（ended 界面按钮或拖回进度条）时恢复。
-        if (!progressTimer && !embyState.playback?.preview) {
-          progressTimer = setInterval(() => reportProgress("progress"), 10_000);
-        }
-      });
-      embyVideo.addEventListener("seeked", () => reportProgress("seek"));
-      embyVideo.addEventListener("volumechange", () => {
-        // 拖原生音量条时每帧都触发：500ms 尾沿节流，避免每帧一个 playback.progress RPC。
-        if (volumeReportTimer) return;
-        volumeReportTimer = setTimeout(() => {
-          volumeReportTimer = null;
-          reportProgress("volumechange");
-        }, 500);
-      });
-      embyVideo.addEventListener("ended", () => {
-        // 播完即停表：否则用户停在重播界面时，每 10s 的 progress 会让服务端
-        // 转码会话无限期保活。不发 playback.stop —— 重播复用同一 playSessionId，
-        // stop 会让服务端会话（含 HLS 转码）失效；离开播放页时 cleanupPlayback 统一 stop。
-        clearInterval(progressTimer);
-        progressTimer = null;
-        reportProgress("ended");
-        ended.hidden = false;
-      });
+      const wirePlaybackVideo = () => {
+        if (!embyVideo) return;
+        // 暂停状态同步到 view.dataset.paused：CSS 据此常显 chrome（初始 paused 时
+        // 加载中也显示返回键/标题）。play/pause 覆盖全部状态翻转点。
+        const syncPausedState = () => { view.dataset.paused = String(embyVideo.paused); };
+        embyVideo.addEventListener("play", syncPausedState);
+        embyVideo.addEventListener("playing", syncPausedState);
+        embyVideo.addEventListener("pause", syncPausedState);
+        syncPausedState();
+        embyVideo.addEventListener("pause", () => reportProgress("pause"));
+        embyVideo.addEventListener("play", () => {
+          reportProgress("play");
+          // ended 时停掉了定时上报；重播（ended 界面按钮或拖回进度条）时恢复。
+          if (!progressTimer && !embyState.playback?.preview) {
+            progressTimer = setInterval(() => reportProgress("progress"), 10_000);
+          }
+        });
+        embyVideo.addEventListener("seeked", () => reportProgress("seek"));
+        embyVideo.addEventListener("volumechange", () => {
+          // 拖原生音量条时每帧都触发：500ms 尾沿节流，避免每帧一个 playback.progress RPC。
+          if (volumeReportTimer) return;
+          volumeReportTimer = setTimeout(() => {
+            volumeReportTimer = null;
+            reportProgress("volumechange");
+          }, 500);
+        });
+        embyVideo.addEventListener("ended", () => {
+          // 播完即停表：否则用户停在重播界面时，每 10s 的 progress 会让服务端
+          // 转码会话无限期保活。不发 playback.stop —— 重播复用同一 playSessionId，
+          // stop 会让服务端会话（含 HLS 转码）失效；离开播放页时 cleanupPlayback 统一 stop。
+          clearInterval(progressTimer);
+          progressTimer = null;
+          reportProgress("ended");
+          ended.hidden = false;
+        });
+      };
+      wirePlaybackVideo();
       view.addEventListener("keydown", (event) => {
         // 空格/左右方向键转发给 video：仅当焦点在容器本身，避免劫持内部按钮的
         // 空格激活与字幕菜单/选集内的方向键导航。
         if (event.target === view && (event.key === " " || event.key === "ArrowLeft" || event.key === "ArrowRight")) {
           event.preventDefault();
           event.stopPropagation();
+          if (!embyVideo) return;
           if (event.key === " ") {
             if (embyVideo.paused) embyVideo.play().catch(() => {});
             else embyVideo.pause();
@@ -5287,7 +5782,7 @@ function codexCompanionBootstrap(config) {
           closePlaybackEpisodePicker(view);
         }
       });
-      view.append(embyVideo, chrome, episodeNav);
+      view.append(mediaElement, chrome, episodeNav);
       if (subtitleMenu) view.append(subtitleMenu);
       view.append(episodePicker, subtitleStatus, ended);
       setTimeout(() => {
@@ -5298,7 +5793,11 @@ function codexCompanionBootstrap(config) {
         if (!embyState.playback?.preview) {
           const playback = embyState.playback;
           const start = async () => {
-            if (["direct-mp4", "ffmpeg-fmp4"].includes(playback.streamMode)) {
+            if (directProxyUrl && mediaElement instanceof HTMLIFrameElement) {
+              embyVideo = await configureLoopbackVideoFrame(mediaElement, playback, directProxyUrl);
+              wirePlaybackVideo();
+              activatePlaybackState(embyVideo, playback);
+            } else if (["direct-mp4", "ffmpeg-fmp4"].includes(playback.streamMode)) {
               await configureDirectMp4(embyVideo, playback);
               // await 期间用户可能已退出或另开了新视频：迟到完成不能激活旧 playback，
               // 更不能覆盖新播放的 progressTimer 句柄（旧 interval 会永远清不掉，
@@ -5607,7 +6106,18 @@ function codexCompanionBootstrap(config) {
       imageCacheCount: imageCache.size,
       imageCacheBytes,
       activeImageLoads,
-      queuedImageLoads: imageLoadQueue.length
+      queuedImageLoads: imageLoadQueue.length,
+      mseDiagnostics: activeDirectPlayer ? {
+        keyframeCount: activeDirectPlayer.keyframeTimes.length,
+        quotaRetries: activeDirectPlayer.quotaRetries,
+        quotaKeyframeRecoveries: activeDirectPlayer.quotaKeyframeRecoveries,
+        quotaRestarts: activeDirectPlayer.quotaRestarts,
+        lastQuotaRecovery: activeDirectPlayer.lastQuotaRecovery,
+        seekInFlight: activeDirectPlayer.seekInFlight,
+        pendingSeekTime: activeDirectPlayer.pendingSeekTime,
+        pointerActive: activeDirectPlayer.pointerActive,
+        pointerSawSeek: activeDirectPlayer.pointerSawSeek
+      } : lastMseDiagnostics
     });
 
     const dispatchEmby = (actionValue, payload = {}) => {
@@ -5641,6 +6151,7 @@ function codexCompanionBootstrap(config) {
         embyState.seasons = actionPayload.seasons || [];
         embyState.selectedSeasonId = actionPayload.selectedSeasonId || embyState.seasons[0]?.id || null;
         embyState.episodes = actionPayload.episodes || [];
+        embyState.sourceOptions = actionPayload.sourceOptions || [];
         embyState.view = "series";
       } else if (actionName === "previewPlayback") {
         embyState.previousRoute = { view: embyState.view, scrollKey: null, scrollTop: 0 };

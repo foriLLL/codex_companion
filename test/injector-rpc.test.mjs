@@ -150,7 +150,6 @@ test("重叠扫描不会为同一 target 重复注入或泄漏连接", async () 
   assert.equal(addBindingCalls.length, 1, "同一 target 只应注册一次 RPC binding");
   const openSockets = AutoReplyWebSocket.instances.filter((socket) => socket.readyState === AutoReplyWebSocket.OPEN);
   assert.equal(openSockets.length, 1, "重叠扫描不应泄漏额外的打开连接");
-
   injector.stop();
 });
 

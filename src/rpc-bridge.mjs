@@ -8,6 +8,10 @@ export const DEFAULT_RPC_TIMEOUT_MS = 70_000;
 const DEFAULT_BRIDGE_KEY = "__CODEX_COMPANION__";
 const MAX_REQUEST_LENGTH = 1024 * 1024;
 const MAX_RESPONSE_LENGTH = 16 * 1024 * 1024;
+// app:// 的 CSP 禁止 Renderer 直连 loopback，媒体只能经 CDP 参数投递。V8 会把
+// 已消费的 Base64 留作可回收垃圾，但不会及时感知 CDP 外部字符串带来的系统内存
+// 压力；按已投递体积主动触发一次完整回收，把峰值从数 GB 收敛到数百 MB。
+const DEFAULT_RENDERER_GC_THRESHOLD_BYTES = 192 * 1024 * 1024;
 
 class RpcBridgeError extends Error {
   constructor(code, message, { retryable = false } = {}) {
@@ -67,7 +71,10 @@ function serializeResult(value) {
     throw error;
   }
 
-  return JSON.parse(serialized);
+  return {
+    value: JSON.parse(serialized),
+    serializedLength: serialized.length
+  };
 }
 
 function normalizeHandler(handler) {
@@ -145,6 +152,10 @@ export class CdpRpcBridge {
   #attached = false;
   #targetDisposed = false;
   #removeListeners = [];
+  #rendererGcThresholdBytes;
+  #rendererGarbageBytes = 0;
+  #rendererGcTimer = null;
+  #rendererGcInFlight = false;
 
   constructor(connection, {
     handler,
@@ -152,13 +163,17 @@ export class CdpRpcBridge {
     logger = console,
     timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
     bindingName = RPC_BINDING_NAME,
-    bridgeKey = DEFAULT_BRIDGE_KEY
+    bridgeKey = DEFAULT_BRIDGE_KEY,
+    rendererGcThresholdBytes = DEFAULT_RENDERER_GC_THRESHOLD_BYTES
   } = {}) {
     if (!connection || typeof connection.send !== "function" || typeof connection.on !== "function") {
       throw new TypeError("connection 必须支持 send() 和 on()");
     }
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new TypeError("RPC timeoutMs 必须是正数");
+    }
+    if (!Number.isSafeInteger(rendererGcThresholdBytes) || rendererGcThresholdBytes <= 0) {
+      throw new TypeError("rendererGcThresholdBytes 必须是正整数");
     }
 
     this.#connection = connection;
@@ -170,6 +185,7 @@ export class CdpRpcBridge {
     this.#timeoutMs = timeoutMs;
     this.#bindingName = bindingName;
     this.#bridgeKey = bridgeKey;
+    this.#rendererGcThresholdBytes = rendererGcThresholdBytes;
   }
 
   get isAttached() {
@@ -216,6 +232,9 @@ export class CdpRpcBridge {
   detach(reason = new RpcBridgeError("RPC_DISCONNECTED", "RPC bridge 已关闭", { retryable: true })) {
     if (!this.#attached && this.#pending.size === 0) return;
     this.#attached = false;
+    clearTimeout(this.#rendererGcTimer);
+    this.#rendererGcTimer = null;
+    this.#rendererGarbageBytes = 0;
     for (const remove of this.#removeListeners.splice(0)) remove();
     this.#abortAll(reason);
     this.#disposeTargetOnce();
@@ -280,11 +299,13 @@ export class CdpRpcBridge {
         aborted
       ]);
       if (entry.canReply && this.#attached) {
+        const serialized = serializeResult(result);
         await this.#sendResponse(executionContextId, {
           id: request.id,
           ok: true,
-          result: serializeResult(result)
+          result: serialized.value
         });
+        this.#recordRendererGarbage(serialized.serializedLength);
       }
     } catch (error) {
       if (error?.code === "RPC_RESPONSE_TOO_LARGE") {
@@ -366,5 +387,35 @@ export class CdpRpcBridge {
     if (evaluation?.exceptionDetails || evaluation?.result?.value !== true) {
       throw new RpcBridgeError("RPC_DELIVERY_FAILED", "RPC 响应无法投递到 Renderer", { retryable: true });
     }
+  }
+
+  #recordRendererGarbage(serializedLength) {
+    if (!Number.isSafeInteger(serializedLength) || serializedLength <= 0) return;
+    this.#rendererGarbageBytes += serializedLength;
+    this.#scheduleRendererGc();
+  }
+
+  #scheduleRendererGc() {
+    if (
+      this.#rendererGarbageBytes < this.#rendererGcThresholdBytes
+      || this.#rendererGcTimer !== null
+      || this.#rendererGcInFlight
+      || !this.#attached
+    ) return;
+    this.#rendererGarbageBytes = 0;
+    this.#rendererGcTimer = setTimeout(() => {
+      this.#rendererGcTimer = null;
+      if (!this.#attached || this.#rendererGcInFlight) return;
+      this.#rendererGcInFlight = true;
+      void this.#connection.send("HeapProfiler.collectGarbage").catch((error) => {
+        if (this.#attached) {
+          this.#logger.warn?.(`[codex-companion] Renderer 媒体内存回收失败：${sanitizeRpcError(error).message}`);
+        }
+      }).finally(() => {
+        this.#rendererGcInFlight = false;
+        this.#scheduleRendererGc();
+      });
+    }, 0);
+    this.#rendererGcTimer.unref?.();
   }
 }

@@ -160,6 +160,23 @@ test("RPC 响应作为 callFunctionOn 参数投递，不生成携带响应数据
   bridge.detach();
 });
 
+test("大体积 RPC 响应累计到阈值后主动回收 Renderer 媒体垃圾", async () => {
+  const connection = new FakeConnection();
+  const bridge = new CdpRpcBridge(connection, {
+    rendererGcThresholdBytes: 128,
+    handler: async () => ({ data: "A".repeat(256) })
+  });
+  await bridge.attach();
+
+  emitRequest(connection, { id: "media", method: "playback.direct.next", params: {} });
+  await waitFor(() => connection.calls.some(({ method }) => method === "HeapProfiler.collectGarbage"));
+
+  const deliveryIndex = connection.calls.findIndex(({ method }) => method === "Runtime.callFunctionOn");
+  const garbageIndex = connection.calls.findIndex(({ method }) => method === "HeapProfiler.collectGarbage");
+  assert.ok(deliveryIndex >= 0 && garbageIndex > deliveryIndex);
+  bridge.detach();
+});
+
 test("rpc.cancel 仅取消同 execution context 的目标请求", async () => {
   const connection = new FakeConnection();
   const signals = new Map();

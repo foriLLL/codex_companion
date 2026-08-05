@@ -3,9 +3,11 @@ import { assToWebVtt } from "./ass-to-vtt.mjs";
 import {
   DEFAULT_RESOURCE_LIMIT,
   DEFAULT_SUBTITLE_LIMIT,
+  EMBY_USER_AGENT,
   EmbyClient,
   EmbyError,
   assertLoginHostAllowed,
+  embyAuthorizationHeader,
   normalizeServerUrl,
   redactSensitive,
   sanitizeDirectStreamUrl,
@@ -14,11 +16,18 @@ import {
 } from "./emby-client.mjs";
 import { DirectMp4Session } from "./direct-mp4-session.mjs";
 import { EmbyStorage, embyServerKey } from "./emby-storage.mjs";
-import { FfmpegFmp4Session } from "./ffmpeg-fmp4-session.mjs";
+import {
+  FfmpegFmp4Session,
+  ffmpegStrategy,
+  mediaSourceExceedsDirectBitrate,
+  videoBitrateFor
+} from "./ffmpeg-fmp4-session.mjs";
+import { resolveFfmpegPath } from "./ffmpeg-path.mjs";
 import { HlsProxy } from "./hls-proxy.mjs";
 
 const DEFAULT_METADATA_TIMEOUT_MS = 12_000;
 const DEFAULT_METADATA_ATTEMPTS = 2;
+const DEFAULT_PLAYBACK_EVENT_TIMEOUT_MS = 3_000;
 const HOME_CACHE_FRESH_MS = 5 * 60 * 1000;
 const HOME_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BURN_IN_SUBTITLE_BYTES = 32 * 1024 * 1024;
@@ -171,8 +180,8 @@ function mediaSourceVideoStream(mediaSource) {
 
 // DirectMp4Session 会把媒体源内的全部音视频轨道写入同一个 MSE MIME。
 // Renderer 稳定支持的直连交集只有单路 H.264 + 至多单路 AAC；HEVC、EC-3、
-// 多音轨等必须先交给本机 FFmpeg 规整为 H.264/AAC，否则会在浏览器端才报
-// MEDIA_CODEC_UNSUPPORTED，既无法播放也来不及自动降级。
+// 多音轨以及超过本机 MSE/CDP 安全吞吐的超高码率源，必须先交给 FFmpeg
+// 规整/降码率，否则会在浏览器端失败或持续缓冲，且来不及自动降级。
 export function mediaSourceSupportsRendererFmp4(mediaSource) {
   const streams = Array.isArray(mediaSource?.MediaStreams) ? mediaSource.MediaStreams : [];
   const videos = streams.filter((stream) => String(stream?.Type ?? "").toLowerCase() === "video");
@@ -183,7 +192,8 @@ export function mediaSourceSupportsRendererFmp4(mediaSource) {
   const audioCodec = String(audios[0]?.Codec ?? "").toLowerCase();
   return ["h264", "avc", "avc1"].includes(videoCodec)
     && (!Number.isFinite(videoBitDepth) || videoBitDepth <= 8)
-    && (audios.length === 0 || ["aac", "mp4a"].includes(audioCodec));
+    && (audios.length === 0 || ["aac", "mp4a"].includes(audioCodec))
+    && !mediaSourceExceedsDirectBitrate(mediaSource);
 }
 
 function mediaSourceHasSubtitles(mediaSource) {
@@ -207,6 +217,57 @@ function mediaSourceBitrate(mediaSource) {
   const video = mediaSourceVideoStream(mediaSource);
   const bitrate = Number(video?.BitRate ?? mediaSource?.Bitrate);
   return Number.isFinite(bitrate) && bitrate > 0 ? bitrate : 0;
+}
+
+function mediaSourceResolutionRank(mediaSource) {
+  const height = mediaSourceHeight(mediaSource);
+  // 同一画质档里的轻微裁边（2160 / 2232）不应压过播放成本；用户看到的都是 4K。
+  if (height >= 2000) return 2160;
+  return height;
+}
+
+function mediaSourcePlaybackMode(mediaSource) {
+  if (
+    mediaSource?.SupportsTranscoding === true
+    || (typeof mediaSource?.TranscodingUrl === "string" && mediaSource.TranscodingUrl.length > 0)
+  ) return "hls";
+  const supportsDirect = mediaSource?.SupportsDirectPlay === true || mediaSource?.SupportsDirectStream === true;
+  const hasDirectUrl = typeof mediaSource?.DirectStreamUrl === "string" && mediaSource.DirectStreamUrl.length > 0;
+  if (!supportsDirect || !hasDirectUrl) return null;
+  const container = mediaSourceContainer(mediaSource);
+  return ["mp4", "m4v", "mov"].includes(container) && mediaSourceSupportsRendererFmp4(mediaSource)
+    ? "direct-mp4"
+    : "ffmpeg-fmp4";
+}
+
+function estimatedPlaybackCost(mediaSource, { localFfmpegAvailable = true } = {}) {
+  const mode = mediaSourcePlaybackMode(mediaSource);
+  if (!mode) return Number.POSITIVE_INFINITY;
+  // EmbyClient 的 HLS 请求上限固定为 8 Mbps；服务端转码不占本机输入 + 输出两条链路。
+  if (mode === "hls") return 8_000_000;
+
+  const inputBitrate = mediaSourceBitrate(mediaSource);
+  const knownInputBitrate = inputBitrate > 0 ? inputBitrate : 40_000_000;
+  if (mode === "direct-mp4") return knownInputBitrate;
+  if (!localFfmpegAvailable) return Number.MAX_SAFE_INTEGER;
+
+  // 本机 FFmpeg 路径同时搬运“服务器→FFmpeg”的输入和“FFmpeg→Renderer”的输出。
+  // copy 时二者近似同码率；重编码时输出按实际 VideoToolbox 档位估算。按总数据成本
+  // 排序能避开“35 Mbps 直放卡顿，却把同一 35 Mbps 再转一次而更慢”的错误决策。
+  const strategy = ffmpegStrategy(mediaSource);
+  const outputBitrate = strategy.copyVideo
+    ? knownInputBitrate
+    : Number(videoBitrateFor(mediaSource));
+  return knownInputBitrate + (Number.isFinite(outputBitrate) ? outputBitrate : knownInputBitrate);
+}
+
+function mseBitrateFor(mediaSource, streamMode, subtitle = null) {
+  const sourceBitrate = mediaSourceBitrate(mediaSource);
+  if (streamMode !== "ffmpeg-fmp4") return sourceBitrate || undefined;
+  const strategy = ffmpegStrategy(mediaSource, subtitle);
+  if (strategy.copyVideo) return sourceBitrate || undefined;
+  const encodedBitrate = Number(videoBitrateFor(mediaSource));
+  return Number.isFinite(encodedBitrate) && encodedBitrate > 0 ? encodedBitrate : undefined;
 }
 
 // 归一化的分辨率档（跨集稳定；码率数字会微调，这里丢弃）。
@@ -243,17 +304,26 @@ export function mapMediaSourceOption(mediaSource, ordinal = 0) {
   };
 }
 
-export function mapMediaSourceOptions(mediaSources) {
+export function mapMediaSourceOptions(mediaSources, { localFfmpegAvailable = true } = {}) {
   const list = Array.isArray(mediaSources) ? mediaSources : [];
-  return list.map((source, ordinal) => mapMediaSourceOption(source, ordinal));
+  const recommendedOrdinal = pickMediaSource(list, { localFfmpegAvailable }).ordinal;
+  return list.map((source, ordinal) => ({
+    ...mapMediaSourceOption(source, ordinal),
+    recommended: ordinal === recommendedOrdinal
+  }));
 }
 
 // 选源优先级：
 // 1. 传入的 preferredSourceKey 命中（跨集稳定键）→ 强制用它。
-// 2. 否则默认选「有字幕的最高画质源」（用户确认方向，默认修复字幕消失）。
-// 3. 没有任何带字幕源 → 回退旧的 transcoding → mp4-direct → ffmpeg 逻辑。
+// 2. 有字幕源时仍只在有字幕源中选，避免默认字幕消失。
+// 3. 先保留最高分辨率档；同档优先逐行源，再按端到端播放成本选择。
+//    这会在 35 Mbps H.264 直放与 11 Mbps HEVC 硬件转码之间选择后者，
+//    但在没有 FFmpeg 时回退可直放源；不再依赖 Emby 返回顺序或盲选最高码率。
 // 返回 { mediaSource, ordinal }。
-export function pickMediaSource(mediaSources, { preferredSourceKey = null } = {}) {
+export function pickMediaSource(mediaSources, {
+  preferredSourceKey = null,
+  localFfmpegAvailable = true
+} = {}) {
   const list = Array.isArray(mediaSources) ? mediaSources : [];
   if (list.length === 0) return { mediaSource: undefined, ordinal: -1 };
 
@@ -262,25 +332,28 @@ export function pickMediaSource(mediaSources, { preferredSourceKey = null } = {}
     if (ordinal >= 0) return { mediaSource: list[ordinal], ordinal };
   }
 
-  const playable = (source) => source?.SupportsDirectPlay === true
-    || source?.SupportsDirectStream === true
-    || source?.SupportsTranscoding === true
-    || (typeof source?.DirectStreamUrl === "string" && source.DirectStreamUrl.length > 0)
-    || (typeof source?.TranscodingUrl === "string" && source.TranscodingUrl.length > 0);
-
-  const subtitled = list
+  const playable = list
     .map((source, ordinal) => ({ source, ordinal }))
-    .filter(({ source }) => mediaSourceHasSubtitles(source) && playable(source));
-  if (subtitled.length > 0) {
-    subtitled.sort((a, b) => {
-      const byHeight = mediaSourceHeight(b.source) - mediaSourceHeight(a.source);
-      if (byHeight !== 0) return byHeight;
-      return mediaSourceBitrate(b.source) - mediaSourceBitrate(a.source);
-    });
-    return { mediaSource: subtitled[0].source, ordinal: subtitled[0].ordinal };
-  }
+    .filter(({ source }) => mediaSourcePlaybackMode(source));
+  if (playable.length === 0) return { mediaSource: undefined, ordinal: -1 };
 
-  return { mediaSource: undefined, ordinal: -1 };
+  const subtitled = playable.filter(({ source }) => mediaSourceHasSubtitles(source));
+  const candidates = subtitled.length > 0 ? subtitled : playable;
+  const highestResolution = Math.max(...candidates.map(({ source }) => mediaSourceResolutionRank(source)));
+  const highestQuality = candidates.filter(({ source }) => (
+    mediaSourceResolutionRank(source) === highestResolution
+  ));
+  highestQuality.sort((a, b) => {
+    const aInterlaced = mediaSourceVideoStream(a.source)?.IsInterlaced === true ? 1 : 0;
+    const bInterlaced = mediaSourceVideoStream(b.source)?.IsInterlaced === true ? 1 : 0;
+    if (aInterlaced !== bInterlaced) return aInterlaced - bInterlaced;
+    const byCost = estimatedPlaybackCost(a.source, { localFfmpegAvailable })
+      - estimatedPlaybackCost(b.source, { localFfmpegAvailable });
+    if (byCost !== 0) return byCost;
+    const byBitrate = mediaSourceBitrate(a.source) - mediaSourceBitrate(b.source);
+    return byBitrate || a.ordinal - b.ordinal;
+  });
+  return { mediaSource: highestQuality[0].source, ordinal: highestQuality[0].ordinal };
 }
 
 
@@ -324,6 +397,8 @@ export class EmbyService {
     resourceLimit = DEFAULT_RESOURCE_LIMIT,
     metadataTimeoutMs = DEFAULT_METADATA_TIMEOUT_MS,
     metadataAttempts = DEFAULT_METADATA_ATTEMPTS,
+    playbackEventTimeoutMs = DEFAULT_PLAYBACK_EVENT_TIMEOUT_MS,
+    ffmpegAvailable,
     loginHostGuard = assertLoginHostAllowed,
     now = Date.now
   } = {}) {
@@ -333,18 +408,25 @@ export class EmbyService {
     if (!Number.isSafeInteger(metadataAttempts) || metadataAttempts < 1) {
       throw new TypeError("metadataAttempts 必须是正整数");
     }
+    if (!Number.isFinite(playbackEventTimeoutMs) || playbackEventTimeoutMs <= 0) {
+      throw new TypeError("playbackEventTimeoutMs 必须是正数");
+    }
     this.storage = storage;
     this.fetchImpl = fetchImpl;
     this.clientFactory = clientFactory ?? ((options) => new EmbyClient({ ...options, fetchImpl: this.fetchImpl, resourceLimit }));
     this.directSessionFactory = directSessionFactory ?? ((options) => new DirectMp4Session(options));
     this.ffmpegSessionFactory = ffmpegSessionFactory ?? ((options) => new FfmpegFmp4Session(options));
-    // HLS 本地代理：让 renderer 的 hls.js 用默认 fetch loader 直连 127.0.0.1，
-    // 替代 RPC + base64 的分片通道。lazy start（首次 HLS 播放时启动）；
+    this.ffmpegAvailable = typeof ffmpegAvailable === "boolean"
+      ? ffmpegAvailable
+      : (typeof ffmpegSessionFactory === "function" || Boolean(resolveFfmpegPath()));
+    // Emby 本地媒体代理：HLS 在 CSP 允许的宿主可走 loopback；原生 MP4 则在
+    // blob 子文档中持续 Range 播放，避开主文档 CSP 与 RPC + Base64 分片通道。
+    // lazy start（首次代理播放时启动）；
     // 传 hlsProxyFactory: null 可整体关闭（测试用）。
     this.hlsProxy = hlsProxyFactory === null
       ? null
       : (hlsProxyFactory ?? ((options) => new HlsProxy(options)))({
-          upstream: (args) => this.#hlsUpstream(args),
+          upstream: (args) => this.#mediaUpstream(args),
           randomUUIDImpl
         });
     this.randomUUIDImpl = randomUUIDImpl;
@@ -360,6 +442,7 @@ export class EmbyService {
     this.itemPositions = new Map();
     this.metadataTimeoutMs = metadataTimeoutMs;
     this.metadataAttempts = metadataAttempts;
+    this.playbackEventTimeoutMs = playbackEventTimeoutMs;
     this.loginHostGuard = loginHostGuard;
     this.now = now;
     this.homeCache = null;
@@ -638,7 +721,9 @@ export class EmbyService {
       if (representativeEpisode?.id) {
         try {
           const playbackInfo = await client.getPlaybackInfo(representativeEpisode.id, config.userId, { signal });
-          sourceOptions = mapMediaSourceOptions(playbackInfo?.MediaSources);
+          sourceOptions = mapMediaSourceOptions(playbackInfo?.MediaSources, {
+            localFfmpegAvailable: this.ffmpegAvailable
+          });
         } catch (error) {
           this.#log("warn", "枚举 Emby 媒体源失败", { message: error?.message });
         }
@@ -667,9 +752,11 @@ export class EmbyService {
         ? params.preferredSourceKey
         : null;
 
-      // 优先按偏好键 / 默认「有字幕的最高画质源」选源；拿不到再回退旧逻辑
-      // （全源里 transcoding → mp4 直连 → ffmpeg）。
-      let { mediaSource } = pickMediaSource(mediaSources, { preferredSourceKey });
+      // 优先尊重用户偏好；默认在最高画质档内按真实播放成本选源。
+      let { mediaSource } = pickMediaSource(mediaSources, {
+        preferredSourceKey,
+        localFfmpegAvailable: this.ffmpegAvailable
+      });
       if (!mediaSource) {
         const fallbackTranscoding = mediaSources.find((source) => {
           return source?.SupportsTranscoding === true
@@ -773,7 +860,7 @@ export class EmbyService {
       // 旧会话的 ffmpeg 子进程会一直存活、服务端也一直显示 Playing，直到目标断开。
       // 停旧会话（至少一个网络 RTT）与下面的流搭建/烧录字幕下载互不依赖：并行启动，
       // 注册新会话前再 await，首帧少一个串行 RTT（内部 allSettled，不会 reject）。
-      const stopOldSessions = this.#stopSessionsForTarget(targetId, { signal });
+      const stopOldSessions = this.#stopSessionsForTarget(client, targetId, { signal });
       if (directSource || ffmpegSource) {
         const localSource = directSource ?? ffmpegSource;
         session.directStreamUrl = sanitizeDirectStreamUrl(client.baseUrl, localSource.DirectStreamUrl);
@@ -865,7 +952,7 @@ export class EmbyService {
       await stopOldSessions;
       this.playbacks.set(playbackId, session);
       try {
-        await client.reportPlaybackStarted(session, { signal });
+        await this.#reportPlaybackStartedBestEffort(client, session, { signal });
       } catch (error) {
         this.playbacks.delete(playbackId);
         session.directSession?.destroy();
@@ -888,9 +975,20 @@ export class EmbyService {
           ? computeSourceKey(mediaSource, mediaSources.indexOf(mediaSource))
           : null
       };
+      // Renderer 的 SourceBuffer 配额按字节而不是按时长计算。把实际送入 MSE
+      // 的估算视频码率传给前端，让相同的内存预算在 2 Mbps 与 40 Mbps 下都成立。
+      const mediaBitrate = mseBitrateFor(mediaSource, streamMode, selectedSubtitle);
+      if (mediaBitrate !== undefined) result.mediaBitrate = mediaBitrate;
+      if (streamMode === "direct-mp4" && session.directStreamUrl) {
+        const mediaProxySession = await this.#registerMediaProxySession(client, session.directStreamUrl);
+        if (mediaProxySession) {
+          session.hlsProxySession = mediaProxySession;
+          result.directProxyUrl = mediaProxySession.urlFor(session.directStreamUrl);
+        }
+      }
       if (transcodingSource) {
         result.hlsUrl = client.hlsUrl(itemId, session);
-        const hlsProxySession = await this.#registerHlsProxySession(client, result.hlsUrl);
+        const hlsProxySession = await this.#registerMediaProxySession(client, result.hlsUrl);
         if (hlsProxySession) {
           session.hlsProxySession = hlsProxySession;
           result.hlsProxyUrl = hlsProxySession.urlFor(result.hlsUrl);
@@ -1111,11 +1209,16 @@ export class EmbyService {
     return this.#directPlayback(params).directSession.next({ signal });
   }
 
-  seekDirectPlayback(params, { signal } = {}) {
+  async seekDirectPlayback(params, { signal } = {}) {
     const session = this.#directPlayback(params);
     const timeSeconds = Math.max(0, Number(params?.timeSeconds) || 0);
     session.positionTicks = secondsToTicks(timeSeconds);
-    return session.directSession.seek(timeSeconds, { signal });
+    const result = await session.directSession.seek(timeSeconds, { signal });
+    const actualTimeSeconds = Number(result?.timeSeconds);
+    session.startTimeTicks = secondsToTicks(
+      Number.isFinite(actualTimeSeconds) && actualTimeSeconds >= 0 ? actualTimeSeconds : timeSeconds
+    );
+    return result;
   }
 
   async progressPlayback(params, { signal } = {}) {
@@ -1336,6 +1439,42 @@ export class EmbyService {
     throw lastError;
   }
 
+  async #reportPlaybackStartedBestEffort(client, session, { signal } = {}) {
+    if (signal?.aborted) throw signal.reason ?? new EmbyError("CANCELLED", "Emby 请求已取消");
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort(signal.reason);
+    signal?.addEventListener("abort", forwardAbort, { once: true });
+    const timeoutError = new EmbyError(
+      "PLAYBACK_EVENT_TIMEOUT",
+      "Emby 播放状态上报超时",
+      { retryable: true }
+    );
+    const timeout = setTimeout(() => controller.abort(timeoutError), this.playbackEventTimeoutMs);
+    timeout.unref?.();
+    const aborted = new Promise((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => {
+        reject(controller.signal.reason ?? timeoutError);
+      }, { once: true });
+    });
+    try {
+      await Promise.race([
+        client.reportPlaybackStarted(session, { signal: controller.signal }),
+        aborted
+      ]);
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? error;
+      // Started 只是服务端状态/续播遥测，PlaybackInfo 与媒体 URL 已经成功。
+      // 服务器该端点异常时不能牺牲实际播放；后续 progress/stop 仍会继续尝试同步。
+      this.#log("warn", "Emby Started 上报失败，继续本地播放", {
+        code: error?.code,
+        message: error?.message
+      });
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", forwardAbort);
+    }
+  }
+
   async #stopOne(client, session, { signal } = {}) {
     const existing = this.stoppingPlaybacks.get(session.playbackId);
     if (existing) return existing;
@@ -1369,19 +1508,58 @@ export class EmbyService {
     if (failure) throw failure.reason;
   }
 
-  // 停掉某个渲染目标下的所有旧会话，为同目标的新播放让路。best-effort：
-  // 即使服务端上报失败也一定本地销毁 directSession 并从 map 移除，避免僵尸 ffmpeg
-  // 和无法回收的会话；上报失败只吞掉不抛出，因为新播放不应被旧服务器的故障阻塞。
-  async #stopSessionsForTarget(targetId, { signal } = {}) {
+  // 停掉某个渲染目标下的所有旧会话，为同目标的新播放让路。先同步回收本地媒体
+  // 资源，再给服务端 Stopped / stop encoding 一个有界的 best-effort 窗口。它们只是
+  // 远端状态同步，绝不能因为 Emby 端点挂起而阻断下一次实际起播。
+  async #stopSessionsForTarget(client, targetId, { signal } = {}) {
     if (targetId === null || targetId === undefined) return;
     const sessions = [...this.playbacks.values()].filter((session) => session.targetId === targetId);
     await Promise.allSettled(sessions.map(async (session) => {
+      session.stopped = true;
+      session.directSession?.destroy();
+      this.#releaseHlsProxySession(session);
+      this.playbacks.delete(session.playbackId);
+      if (!client) return;
+
+      const controller = new AbortController();
+      const timeoutError = new EmbyError(
+        "PLAYBACK_EVENT_TIMEOUT",
+        "Emby 停止状态上报超时",
+        { retryable: true }
+      );
+      const forwardAbort = () => controller.abort(signal.reason);
+      signal?.addEventListener("abort", forwardAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(timeoutError), this.playbackEventTimeoutMs);
+      timeout.unref?.();
+      const aborted = new Promise((_resolve, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(controller.signal.reason ?? timeoutError);
+        }, { once: true });
+      });
+      const operations = [
+        Promise.resolve().then(() => client.reportPlaybackStopped(session, { signal: controller.signal }))
+      ];
+      if (session.playMethod === "Transcode") {
+        operations.push(
+          Promise.resolve().then(() => client.stopActiveEncoding(session.playSessionId, { signal: controller.signal }))
+        );
+      }
       try {
-        if (this.client) await this.#stopOne(this.client, session, { signal });
+        const remoteStop = Promise.allSettled(operations).then((results) => {
+          const failure = results.find((result) => result.status === "rejected");
+          if (failure) throw failure.reason;
+        });
+        await Promise.race([remoteStop, aborted]);
+      } catch (error) {
+        if (!signal?.aborted) {
+          this.#log("warn", "旧播放会话停止上报失败，继续新播放", {
+            code: error?.code,
+            message: error?.message
+          });
+        }
       } finally {
-        session.directSession?.destroy();
-        this.#releaseHlsProxySession(session);
-        this.playbacks.delete(session.playbackId);
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", forwardAbort);
       }
     }));
   }
@@ -1495,7 +1673,7 @@ export class EmbyService {
       ? (options) => session.openRangeStream({ ...options, refreshPositionTicks: session.positionTicks })
       : null;
     if (session.streamMode === "direct-mp4") {
-      return this.directSessionFactory({ readRange });
+      return this.directSessionFactory({ readRange, openRangeStream });
     }
     return this.ffmpegSessionFactory({
       readRange,
@@ -1600,7 +1778,7 @@ export class EmbyService {
           responseType: "text",
           maxBytes: MAX_HLS_MANIFEST_BYTES
         }),
-        client.reportPlaybackStarted(candidate, { signal })
+        this.#reportPlaybackStartedBestEffort(client, candidate, { signal })
       ]);
     } catch (error) {
       await client.stopActiveEncoding(playSessionId).catch(() => {});
@@ -1620,6 +1798,12 @@ export class EmbyService {
       streamMode: session.streamMode,
       startPositionTicks: session.positionTicks
     };
+    const mediaBitrate = mseBitrateFor(
+      session.mediaSource,
+      session.streamMode,
+      session.subtitles.find((subtitle) => subtitle.index === session.subtitleStreamIndex) ?? null
+    );
+    if (mediaBitrate !== undefined) result.mediaBitrate = mediaBitrate;
     // 字幕切换可能换了媒体源（HLS 重新选源），画质标签同步更新。
     if (session.mediaSource) result.qualityLabel = mapMediaSourceOption(session.mediaSource).label;
     if (session.streamMode === "hls") {
@@ -1633,16 +1817,16 @@ export class EmbyService {
     return result;
   }
 
-  // 为一次 HLS 播放注册本地代理会话。pathPrefix 取 master.m3u8 所在目录
+  // 为一次 HLS 或原生 MP4 播放注册本地代理会话。pathPrefix 取媒体 URL 所在目录
   // （含 baseUrl 可能携带的子路径，如 /emby/Videos/<itemId>/），把可代理的
-  // 路径收口到该视频自己的 HLS 端点。Codex CSP 会阻止 renderer 访问 loopback，
-  // 因此代理不可用时允许回退到 RPC loader；RPC 响应已改为 callFunctionOn 参数，
-  // 不会再创建携带 Base64 的匿名脚本。
-  async #registerHlsProxySession(client, hlsUrl) {
+  // 路径收口到该视频自己的媒体端点。Codex 主文档 CSP 会阻止 loopback：HLS
+  // 回退到有界 RPC loader，原生 MP4 则由不继承该 CSP 的 blob 子文档访问；代理
+  // 不可用时再回退 MP4Box/MSE。RPC 响应使用 callFunctionOn 参数，不生成动态脚本。
+  async #registerMediaProxySession(client, mediaUrl) {
     if (!this.hlsProxy) return null;
     try {
       await this.hlsProxy.start();
-      const pathname = new URL(hlsUrl).pathname;
+      const pathname = new URL(mediaUrl).pathname;
       const pathPrefix = pathname.slice(0, pathname.lastIndexOf("/") + 1);
       return this.hlsProxy.register({
         token: client.token ?? this.token,
@@ -1650,7 +1834,7 @@ export class EmbyService {
         pathPrefix
       });
     } catch (error) {
-      this.#log("warn", "Emby HLS 本地代理不可用，回退到有界 RPC 加载通道", {
+      this.#log("warn", "Emby 本地媒体代理不可用，回退到有界 RPC 加载通道", {
         code: error?.code,
         message: error?.message
       });
@@ -1664,17 +1848,24 @@ export class EmbyService {
     if (hlsProxySession?.secret) this.hlsProxy?.unregister(hlsProxySession.secret);
   }
 
-  // HLS 代理的上游实现：同源走当前 client 的 fetch（附带同源流超时 dispatcher），
+  // 媒体代理的上游实现：同源走当前 client 的 fetch（附带同源流超时 dispatcher），
   // 跨源走带 DNS 校验的外网传输；重定向逐跳校验，token 绝不泄露到跨源。
-  async #hlsUpstream({ url, method = "GET", headers, signal }) {
+  async #mediaUpstream({ url, method = "GET", headers, signal }) {
     const client = this.client;
     if (!client) throw new EmbyError("NOT_CONNECTED", "请先连接 Emby 服务器");
     const baseOrigin = new URL(client.baseUrl).origin;
-    const requestHeaders = { ...headers };
+    const requestHeaders = {
+      ...headers,
+      "User-Agent": EMBY_USER_AGENT,
+      "X-Emby-Authorization": embyAuthorizationHeader(client.deviceId)
+    };
     let current = new URL(url);
     for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
       const external = current.origin !== baseOrigin;
-      if (external) delete requestHeaders["X-Emby-Token"];
+      if (external) {
+        delete requestHeaders["X-Emby-Token"];
+        delete requestHeaders["X-Emby-Authorization"];
+      }
       const requestImpl = external ? (client.directStreamFetchImpl ?? client.fetchImpl) : client.fetchImpl;
       const options = { method, headers: requestHeaders, signal, redirect: "manual" };
       // 与 openDirectRangeStream 一致：同源流附带带 bodyTimeout 的 dispatcher，
@@ -1688,14 +1879,14 @@ export class EmbyService {
       if (typeof response.body?.cancel === "function") await response.body.cancel().catch(() => {});
       else response.body?.destroy?.();
       if (!location || redirectCount === 3) {
-        throw new EmbyError("UNSAFE_MEDIA_REDIRECT", "HLS 资源重定向无效或次数过多");
+        throw new EmbyError("UNSAFE_MEDIA_REDIRECT", "媒体资源重定向无效或次数过多");
       }
       const next = new URL(location, current);
       current = next.origin === baseOrigin
         ? validateSameOriginResource(client.baseUrl, next)
         : await validateExternalMediaUrl(next, { dnsLookup: client.dnsLookup });
     }
-    throw new EmbyError("UNSAFE_MEDIA_REDIRECT", "HLS 资源重定向次数过多");
+    throw new EmbyError("UNSAFE_MEDIA_REDIRECT", "媒体资源重定向次数过多");
   }
 
   #directPlayback(params) {

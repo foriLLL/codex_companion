@@ -50,8 +50,8 @@ function stripRelativeSecretQuery(value) {
   return `${path}${query ? `?${query}` : ""}${hash}`;
 }
 
-// Emby HLS 的本地回路代理：hls.js 默认 fetch loader 直连 127.0.0.1 随机端口，
-// 由本代理代发 manifest / 分片 / key 请求，替代「RPC + base64 过 CDP」的高开销通道。
+// Emby 媒体的本地回路代理：既可代发 HLS manifest / 分片 / key，也可透传原生
+// MP4 的持续 Range。后者替代「RPC + Base64 过 CDP」的高开销通道。
 // 安全模型与 RangeProxy 一致：只绑 loopback + 随机端口 + randomUUID 秘密路径；
 // token 只出现在发往 Emby 的 header 里，绝不出现在 URL。
 export class HlsProxy {
@@ -127,7 +127,7 @@ export class HlsProxy {
   }
 
   // 注册一个播放会话的代理入口。pathPrefix 把可访问路径收口到该视频自己的
-  // HLS 目录（含 baseUrl 子路径，如 /emby/Videos/<itemId>/），防止越权访问
+  // 媒体目录（含 baseUrl 子路径，如 /emby/Videos/<itemId>/），防止越权访问
   // Emby 其它端点。返回的 urlFor 把同源目标 URL 映射为代理路径形式，跨源映射为 @ext 形式。
   register({ token, baseUrl, pathPrefix }) {
     if (!this.server || this.port === null) {

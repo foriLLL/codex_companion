@@ -32,6 +32,40 @@ test("mount 脚本保留完整红果体验并包含独立 Emby 微型应用", ()
   assert.doesNotMatch(source, /class HongguoHlsLoader/);
   assert.match(source, /configureHongguoDirectMp4/);
   assert.match(source, /configureDirectMp4Stream/);
+  assert.match(source, /playback\?\.streamMode === "ffmpeg-fmp4" \? 6 : 4/);
+  assert.match(source, /bufferAhead\(\) >= initialBufferTarget/);
+  assert.match(source, /40 \* 1024 \* 1024 \* 8/);
+  assert.match(source, /bufferBudgetSeconds - backBufferSeconds/);
+  assert.match(source, /const isQuotaExceeded/);
+  assert.match(source, /tuneBufferForKeyframes\(initialization\?\.keyframeIntervalSeconds\)/);
+  assert.match(source, /start - bufferEdgeToleranceSeconds/);
+  assert.match(source, /await evictBackBuffer\(\)/);
+  assert.match(source, /player\.parserComplete\.get\(trackId\) === true/);
+  assert.match(source, /sourceBuffer\.abort\(\)/);
+  assert.match(source, /sourceBuffer\.remove\(0, end\)/);
+  assert.match(source, /flushDecoderReferences/);
+  assert.match(source, /embyVideo\.currentTime = target/);
+  assert.match(source, /onQuotaExceeded/);
+  assert.match(source, /正在释放媒体缓存并恢复播放/);
+  assert.match(source, /player\.initialSeekTarget = startTime/);
+  assert.match(source, /Math\.abs\(time - initialSeekTarget\) <= bufferEdgeToleranceSeconds/);
+  assert.match(source, /player\.pendingSeekTime = target/);
+  assert.match(source, /player\.seekInFlight = true/);
+  assert.match(source, /player\.pointerActive/);
+  assert.match(source, /if \(pointerSawSeek\) seek\(Number\(embyVideo\.currentTime\) \|\| 0\)/);
+  assert.match(source, /addEventListener\("pointerdown", onPointerDown\)/);
+  assert.match(source, /addEventListener\("pointerup", onPointerFinished\)/);
+  assert.match(source, /window\.addEventListener\("pointerup", onPointerFinished, true\)/);
+  assert.match(source, /window\.removeEventListener\("pointerup", onPointerFinished, true\)/);
+  assert.match(source, /if \(Number\.isFinite\(player\.pendingSeekTime\)\) return/);
+  assert.match(source, /!player\.controller && !player\.seekInFlight/);
+  assert.ok(
+    source.indexOf("player.initialSeekTarget = startTime")
+      < source.indexOf("embyVideo.currentTime = startTime"),
+    "初始化关键帧对齐必须先标记内部 seek，避免 seeking 取消新媒体请求"
+  );
+  assert.match(source, /recoverQuotaAtKeyframe/);
+  assert.match(source, /initialization\?\.keyframeTimesSeconds/);
   assert.match(source, /hongguo\.home/);
   assert.match(source, /hongguo\.detail/);
   assert.match(source, /hongguo\.playback\.open/);
@@ -181,6 +215,15 @@ test("Emby 注入脚本包含完整状态、RPC 契约和受控媒体通道", ()
   assert.match(source, /rememberSourcePreference/);
   assert.match(source, /preferredSourceKey/);
   assert.match(source, /sourceOptions\.length > 1/);
+  assert.match(source, /option\.recommended/);
+
+  // 兼容 MP4 优先通过 blob 子文档中的原生 video 读取 loopback 持续 Range；
+  // 主文档 MSE 仍作为代理不可用时的后备路径。
+  assert.match(source, /playback\.directProxyUrl/);
+  assert.match(source, /configureLoopbackVideoFrame/);
+  assert.match(source, /emby-video-frame/);
+  assert.match(source, /currentEmbyVideo/);
+  assert.match(source, /URL\.createObjectURL\(new Blob/);
 
   assert.match(source, /class EmbyHlsLoader/);
   // Codex app:// 下直接使用受控 RPC loader；其他宿主可尝试 loopback，并在首个
@@ -199,8 +242,8 @@ test("Emby 注入脚本包含完整状态、RPC 契约和受控媒体通道", ()
   assert.match(source, /Number\(level\?\.height \|\| 0\) <= 720/);
   assert.match(source, /new MediaSource\(\)/);
   assert.match(source, /MediaSource\.isTypeSupported/);
-  assert.match(source, /bufferAhead\(\) >= 30/);
-  assert.match(source, /currentTime\) \|\| 0\) - 15/);
+  assert.match(source, /bufferAhead\(\) >= maxForwardBufferSeconds/);
+  assert.match(source, /currentTime\) \|\| 0\) - retainedSeconds/);
   assert.match(source, /object-fit: contain/);
   assert.match(source, /resourceType: "hls"/);
   assert.doesNotMatch(source, /\bfetch\s*\(/);

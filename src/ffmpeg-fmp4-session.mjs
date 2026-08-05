@@ -16,6 +16,10 @@ const RESUME_QUEUE_BYTES = 12 * 1024 * 1024;
 const NEXT_BATCH_BYTES = 6 * 1024 * 1024;
 const START_TIMEOUT_MS = 40_000;
 const MAX_STDERR_BYTES = 8 * 1024;
+// Renderer 侧 fMP4 仍需经过有界 Base64/CDP 通道。高于 40 Mbps 时即使编码兼容，
+// 直传也没有足够吞吐余量；转为 VideoToolbox H.264 后再交给同一 MSE 播放器。
+export const DIRECT_VIDEO_BITRATE_LIMIT = 40_000_000;
+export const FFMPEG_VIDEO_COPY_BITRATE_LIMIT = 40_000_000;
 
 function cancelled(cause) {
   return new EmbyError("CANCELLED", "FFmpeg 媒体处理已取消", { cause });
@@ -555,7 +559,9 @@ export function ffmpegStrategy(mediaSource, subtitleTrack = null) {
     videoCodec,
     audioCodec,
     hasAudio: Boolean(audio),
-    copyVideo: !subtitleTrack && (videoCodec === "h264" || videoCodec === "avc"),
+    copyVideo: !subtitleTrack
+      && !mediaSourceExceedsDirectBitrate(mediaSource, FFMPEG_VIDEO_COPY_BITRATE_LIMIT)
+      && (videoCodec === "h264" || videoCodec === "avc"),
     copyAudio: !audio || audioCodec === "aac"
   };
 }
@@ -563,6 +569,14 @@ export function ffmpegStrategy(mediaSource, subtitleTrack = null) {
 function videoStreamOf(mediaSource) {
   const streams = Array.isArray(mediaSource?.MediaStreams) ? mediaSource.MediaStreams : [];
   return streams.find((stream) => String(stream?.Type).toLowerCase() === "video") ?? null;
+}
+
+export function mediaSourceExceedsDirectBitrate(mediaSource, limit = DIRECT_VIDEO_BITRATE_LIMIT) {
+  const videoBitrate = Number(videoStreamOf(mediaSource)?.BitRate);
+  const totalBitrate = Number(mediaSource?.Bitrate ?? mediaSource?.BitRate);
+  const measured = [videoBitrate, totalBitrate]
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return measured.length > 0 && Math.max(...measured) > limit;
 }
 
 // 硬件编码器 h264_videotoolbox 不支持 libx264 的 CRF 恒定质量，必须给目标码率。
@@ -742,6 +756,7 @@ export class FfmpegFmp4Session {
     this.ended = false;
     this.destroyed = false;
     this.generation = 0;
+    this.restartPromise = null;
     this.initialization = null;
     this.stderr = "";
     this.failure = null;
@@ -752,7 +767,7 @@ export class FfmpegFmp4Session {
   async initialize({ startTimeSeconds = 0, signal } = {}) {
     this.#assertAlive();
     await this.#prepareSubtitleFile();
-    if (!this.ready) await this.#restart(Math.max(0, Number(startTimeSeconds) || 0), signal);
+    if (!this.ready) await this.#restartSerially(Math.max(0, Number(startTimeSeconds) || 0), signal);
     return this.#initializationDto(Math.max(0, Number(startTimeSeconds) || 0));
   }
 
@@ -771,7 +786,14 @@ export class FfmpegFmp4Session {
       const segment = this.queue.shift();
       this.queueBytes -= segment.byteLength;
       batchBytes += segment.byteLength;
-      segments.push({ trackId: 0, data: asBase64(segment), sampleNumber: 0, last: false });
+      segments.push({
+        trackId: 0,
+        data: asBase64(segment),
+        sampleNumber: 0,
+        segmentStart: true,
+        segmentEnd: true,
+        last: false
+      });
     }
     if (this.queueBytes <= RESUME_QUEUE_BYTES) this.child?.stdout?.resume();
     if (segments.length > 0) return { segments, end: false };
@@ -780,9 +802,12 @@ export class FfmpegFmp4Session {
   }
 
   async seek(seconds, { signal } = {}) {
-    this.#assertReady();
+    this.#assertAlive();
     const timeSeconds = Math.max(0, Number(seconds) || 0);
-    await this.#restart(timeSeconds, signal);
+    // 原生进度条拖动会在一次 FFmpeg 重启尚未产出 initialization 时继续发出
+    // seeking。这里必须串行化重启，而不能把正常的 ready=false 窗口暴露成
+    // FFMPEG_NOT_INITIALIZED；Renderer 会进一步合并中间目标，只保留最新位置。
+    await this.#restartSerially(timeSeconds, signal);
     return { timeSeconds, offset: 0, timestampOffsetSeconds: timeSeconds };
   }
 
@@ -912,6 +937,27 @@ export class FfmpegFmp4Session {
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  async #restartSerially(startTimeSeconds, signal) {
+    // while 而不是只 await 一次：多个调用可能同时等同一个重启；第一个等待者
+    // 接手下一次重启后，其余等待者必须继续排队，禁止再次并发进入 #restart。
+    while (this.restartPromise) {
+      const pendingRestart = this.restartPromise;
+      await pendingRestart;
+      // 正常由持有者的 finally 清空；这里也负责交接，避免一个已完成 Promise
+      // 在极端微任务顺序下仍占着槽位，导致等待者空转。
+      if (this.restartPromise === pendingRestart) this.restartPromise = null;
+      this.#assertAlive();
+      if (signal?.aborted) throw signal.reason ?? cancelled();
+    }
+    const restart = this.#restart(startTimeSeconds, signal);
+    this.restartPromise = restart;
+    try {
+      await restart;
+    } finally {
+      if (this.restartPromise === restart) this.restartPromise = null;
     }
   }
 

@@ -406,6 +406,50 @@ test("同一目标重新打开播放会先停掉旧会话，不留僵尸会话/�
   );
 });
 
+test("Started 遥测挂起不会阻断实际起播", async () => {
+  const config = { baseUrl: "https://emby.example", serverId: "server", userId: "user", username: "alice", deviceId: "device" };
+  const service = new EmbyService({
+    storage: new FakeStorage(config, "token"),
+    clientFactory: (settings) => ({
+      ...makeClient(settings, []),
+      reportPlaybackStarted() { return new Promise(() => {}); }
+    }),
+    playbackEventTimeoutMs: 5,
+    randomUUIDImpl: () => "started-timeout"
+  });
+
+  const opened = await service.handleRpc("playback.open", { itemId: "movie" });
+  assert.equal(opened.playbackId, "started-timeout");
+  assert.equal(opened.streamMode, "hls");
+});
+
+test("旧会话 Stopped 遥测挂起不会阻断同目标下一次起播", async () => {
+  const config = { baseUrl: "https://emby.example", serverId: "server", userId: "user", username: "alice", deviceId: "device" };
+  let nextId = 0;
+  const service = new EmbyService({
+    storage: new FakeStorage(config, "token"),
+    clientFactory: (settings) => ({
+      ...makeClient(settings, []),
+      reportPlaybackStopped() { return new Promise(() => {}); }
+    }),
+    hlsProxyFactory: null,
+    playbackEventTimeoutMs: 5,
+    randomUUIDImpl: () => `replacement-${++nextId}`
+  });
+
+  const first = await service.handleRpc("playback.open", { itemId: "movie" }, { targetId: "renderer-1" });
+  const second = await service.handleRpc("playback.open", { itemId: "movie" }, { targetId: "renderer-1" });
+  assert.notEqual(second.playbackId, first.playbackId);
+  await assert.rejects(
+    service.handleRpc("playback.progress", { playbackId: first.playbackId, positionTicks: 1000 }),
+    { code: "PLAYBACK_NOT_FOUND" }
+  );
+  assert.equal(
+    (await service.handleRpc("playback.progress", { playbackId: second.playbackId, positionTicks: 1000 })).positionTicks,
+    1000
+  );
+});
+
 test("不同目标的播放会话互不影响：重新打开只停自己目标的旧会话", async () => {
   const config = { baseUrl: "https://emby.example", serverId: "server", userId: "user", username: "alice", deviceId: "device" };
   const storage = new FakeStorage(config, "token");
@@ -744,7 +788,7 @@ test("HLS 本地代理启动失败时降级为纯 hlsUrl 并记 warn，播放生
   assert.equal(opened.hlsUrl, "https://emby.example/emby/Videos/movie/master.m3u8?MediaSourceId=media-source");
   assert.equal(opened.hlsProxyUrl, undefined);
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0].message, /HLS 本地代理不可用/);
+  assert.match(warnings[0].message, /本地媒体代理不可用/);
   assert.match(warnings[0].detail.message, /EADDRINUSE/);
 
   await service.handleRpc("playback.stop", { playbackId: opened.playbackId });
@@ -1283,7 +1327,7 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,私有 ASS 字幕`)
   assert.match(loaded.data, /私有 ASS 字幕/);
 });
 
-test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS 转码", async () => {
+test("仅支持直连的 MP4 优先返回本机 Range 代理并保留 MSE 会话，不调用 HLS 转码", async () => {
   const config = {
     baseUrl: "https://emby.example/emby",
     serverId: "server",
@@ -1294,10 +1338,25 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
   const calls = [];
   let destroyed = false;
   const directCalls = [];
+  const proxyRequests = [];
   const service = new EmbyService({
     storage: new FakeStorage(config, "token"),
     clientFactory: (settings) => {
       const client = makeClient(settings, calls);
+      client.token = settings.token;
+      client.deviceId = settings.deviceId;
+      client.fetchImpl = async (url, options) => {
+        proxyRequests.push({ url: String(url), options });
+        return new Response(Uint8Array.of(0x66, 0x74, 0x79, 0x70), {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": "4",
+            "Content-Range": "bytes 0-3/100",
+            "Accept-Ranges": "bytes"
+          }
+        });
+      };
       client.getPlaybackInfo = async () => ({
         PlaySessionId: "direct-session",
         MediaSources: [{
@@ -1323,9 +1382,20 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
         }
         return { bytes: Uint8Array.of(1), start: options.start, end: options.start, total: 1 };
       };
+      client.openDirectRangeStream = async (_url, options) => {
+        calls.push({ method: "directStream", options });
+        return {
+          body: (async function* () { yield Uint8Array.of(1); })(),
+          start: options.start,
+          end: options.start,
+          total: 1,
+          contentType: "video/mp4",
+          async cancel() {}
+        };
+      };
       return client;
     },
-    directSessionFactory: ({ readRange }) => ({
+    directSessionFactory: ({ readRange, openRangeStream }) => ({
       async initialize(options) {
         directCalls.push({ method: "init", options });
         await readRange({ start: 0, end: 0, signal: options.signal });
@@ -1335,7 +1405,12 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
           tracks: [{ id: 1, type: "video", codec: "avc1.64001f", mime: "video/mp4", initData: "AQ==" }]
         };
       },
-      async next(options) { directCalls.push({ method: "next", options }); return { segments: [], end: true }; },
+      async next(options) {
+        directCalls.push({ method: "next", options });
+        const stream = await openRangeStream({ start: 0, end: null, signal: options.signal });
+        for await (const _chunk of stream.body) break;
+        return { segments: [], end: true };
+      },
       seek(timeSeconds) { directCalls.push({ method: "seek", timeSeconds }); return { timeSeconds, offset: 10 }; },
       destroy() { destroyed = true; }
     }),
@@ -1343,7 +1418,8 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
   });
 
   const opened = await service.handleRpc("playback.open", { itemId: "movie" });
-  assert.deepEqual(opened, {
+  const { directProxyUrl, ...openedDto } = opened;
+  assert.deepEqual(openedDto, {
     playbackId: "direct-playback",
     itemId: "movie",
     mediaSourceId: "direct-source",
@@ -1356,8 +1432,19 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
     qualityLabel: "SD MP4 H264",
     sourceKey: "sd|mp4#0"
   });
+  const directProxy = new URL(directProxyUrl);
+  assert.equal(directProxy.hostname, "127.0.0.1");
+  assert.match(directProxy.pathname, /^\/hls\/direct-playback\/Videos\/movie\/stream\.mp4$/);
   assert.equal(calls.some((call) => call.method === "started"), true);
   assert.equal(calls.some((call) => call.method === "stopEncoding"), false);
+
+  const proxied = await fetch(directProxyUrl, { headers: { Range: "bytes=0-3" } });
+  assert.equal(proxied.status, 206);
+  assert.deepEqual(new Uint8Array(await proxied.arrayBuffer()), Uint8Array.of(0x66, 0x74, 0x79, 0x70));
+  assert.equal(proxyRequests.length, 1);
+  assert.equal(proxyRequests[0].options.headers.Range, "bytes=0-3");
+  assert.equal(proxyRequests[0].options.headers["X-Emby-Token"], "token");
+  assert.match(proxyRequests[0].options.headers["X-Emby-Authorization"], /DeviceId="device"/);
 
   const controller = new AbortController();
   const init = await service.handleRpc("playback.direct.init", { playbackId: "direct-playback" }, { signal: controller.signal });
@@ -1369,10 +1456,13 @@ test("仅支持直连的 MP4 使用独立 Range/MSE 会话，不会调用 HLS �
   assert.deepEqual(await service.handleRpc("playback.direct.next", {
     playbackId: "direct-playback"
   }, { signal: controller.signal }), { segments: [], end: true });
+  assert.equal(calls.find((call) => call.method === "directStream").options.signal, controller.signal);
   assert.deepEqual(await service.handleRpc("playback.direct.seek", {
     playbackId: "direct-playback",
     timeSeconds: 20
   }), { timeSeconds: 20, offset: 10 });
+  await service.handleRpc("playback.direct.init", { playbackId: "direct-playback" });
+  assert.equal(directCalls.filter((call) => call.method === "init").at(-1).options.startTimeSeconds, 20);
   await service.handleRpc("playback.stop", { playbackId: "direct-playback" });
   assert.equal(destroyed, true);
   assert.equal(calls.some((call) => call.method === "stopEncoding"), false);
@@ -1873,6 +1963,13 @@ test("MP4 只在单路 H.264/AAC 时直连 Renderer", () => {
       { Type: "Audio", Codec: "eac3" }
     ]
   }), false);
+  assert.equal(mediaSourceSupportsRendererFmp4({
+    Bitrate: 95_400_000,
+    MediaStreams: [
+      { Type: "Video", Codec: "h264", BitDepth: 8, BitRate: 94_998_420 },
+      { Type: "Audio", Codec: "aac", BitRate: 317_000 }
+    ]
+  }), false);
 });
 
 test("不兼容 MP4 在进入 Renderer 前自动切换到 FFmpeg", async () => {
@@ -1913,6 +2010,64 @@ test("不兼容 MP4 在进入 Renderer 前自动切换到 FFmpeg", async () => {
 
   const opened = await service.handleRpc("playback.open", { itemId: "movie" });
   assert.equal(opened.streamMode, "ffmpeg-fmp4");
+  await service.handleRpc("playback.stop", { playbackId: opened.playbackId });
+});
+
+test("95 Mbps H.264 MP4 自动交给本机 FFmpeg 降码率，不进入直连 MSE", async () => {
+  const config = {
+    baseUrl: "https://emby.example/emby",
+    serverId: "server",
+    userId: "user",
+    username: "alice",
+    deviceId: "device"
+  };
+  const calls = [];
+  let ffmpegOptions = null;
+  const service = new EmbyService({
+    storage: new FakeStorage(config, "token"),
+    clientFactory: (settings) => {
+      const client = makeClient(settings, calls);
+      client.getPlaybackInfo = async () => ({
+        PlaySessionId: "concert-session",
+        MediaSources: [{
+          Id: "concert-4k",
+          Name: "4K - 95 Mbps",
+          Container: "mp4",
+          Bitrate: 95_400_000,
+          RunTimeTicks: 90_229_300_000,
+          SupportsDirectPlay: true,
+          SupportsDirectStream: true,
+          SupportsTranscoding: false,
+          DirectStreamUrl: "/Videos/concert/stream.mp4",
+          MediaStreams: [
+            { Type: "Video", Index: 0, Codec: "h264", Height: 2160, BitDepth: 8, BitRate: 94_998_420 },
+            { Type: "Audio", Index: 1, Codec: "aac", BitRate: 317_000 }
+          ]
+        }]
+      });
+      client.openDirectRangeStream = async (_url, options) => ({
+        body: (async function* () { yield Uint8Array.of(1); })(),
+        start: options.start,
+        end: options.start,
+        total: 1,
+        contentType: "video/mp4",
+        async cancel() {}
+      });
+      return client;
+    },
+    directSessionFactory: () => { throw new Error("95 Mbps 源不应进入 DirectMp4Session"); },
+    ffmpegSessionFactory: (options) => {
+      ffmpegOptions = options;
+      return { destroy() {} };
+    },
+    randomUUIDImpl: () => "concert-playback"
+  });
+
+  const opened = await service.handleRpc("playback.open", { itemId: "concert" });
+  assert.equal(opened.streamMode, "ffmpeg-fmp4");
+  assert.equal(opened.mediaBitrate, 40_000_000);
+  assert.equal(ffmpegOptions.mediaSource.Id, "concert-4k");
+  assert.equal(typeof ffmpegOptions.openRangeStream, "function");
   await service.handleRpc("playback.stop", { playbackId: opened.playbackId });
 });
 
@@ -1967,10 +2122,57 @@ test("pickMediaSource：preferredSourceKey 命中时强制用指定源", () => {
   assert.equal(mediaSource.Id, "src-1080");
 });
 
-test("pickMediaSource：无带字幕源时返回空，交给旧回退逻辑", () => {
+test("pickMediaSource：无字幕时仍直接选出最高画质的可播放源", () => {
   const noSubs = [{ Id: "x", Container: "mp4", SupportsDirectStream: true, DirectStreamUrl: "/a.mp4", MediaStreams: [{ Type: "Video", Index: 0, Codec: "h264", Height: 720 }] }];
   const { mediaSource } = pickMediaSource(noSubs);
-  assert.equal(mediaSource, undefined);
+  assert.equal(mediaSource?.Id, "x");
+});
+
+test("pickMediaSource：同为 4K 时选择端到端成本更低的 HEVC 源", () => {
+  const sources = [
+    {
+      Id: "h264-high", Container: "mp4", SupportsDirectStream: true,
+      DirectStreamUrl: "/high.mp4", Bitrate: 35_600_000,
+      MediaStreams: [
+        { Type: "Video", Codec: "h264", Height: 2160, BitRate: 35_400_000, IsInterlaced: false },
+        { Type: "Audio", Codec: "aac" }
+      ]
+    },
+    {
+      Id: "hevc-efficient", Container: "mp4", SupportsDirectStream: true,
+      DirectStreamUrl: "/efficient.mp4", Bitrate: 10_500_000,
+      MediaStreams: [
+        { Type: "Video", Codec: "hevc", Height: 2232, BitRate: 10_300_000, IsInterlaced: false },
+        { Type: "Audio", Codec: "aac" }
+      ]
+    }
+  ];
+  assert.equal(pickMediaSource(sources).mediaSource?.Id, "hevc-efficient");
+  assert.equal(
+    pickMediaSource(sources, { localFfmpegAvailable: false }).mediaSource?.Id,
+    "h264-high",
+    "没有 FFmpeg 时必须保留可直放版本"
+  );
+  assert.deepEqual(
+    mapMediaSourceOptions(sources).map((option) => option.recommended),
+    [false, true]
+  );
+});
+
+test("pickMediaSource：同分辨率优先逐行源，避免仅按较低码率误选 1080i", () => {
+  const sources = [
+    {
+      Id: "progressive", Container: "mkv", SupportsDirectStream: true,
+      DirectStreamUrl: "/progressive.mkv", Bitrate: 31_500_000,
+      MediaStreams: [{ Type: "Video", Codec: "h264", Height: 1080, BitRate: 31_500_000, IsInterlaced: false }]
+    },
+    {
+      Id: "interlaced", Container: "mpegts", SupportsDirectStream: true,
+      DirectStreamUrl: "/interlaced.ts", Bitrate: 26_600_000,
+      MediaStreams: [{ Type: "Video", Codec: "h264", Height: 1080, BitRate: 26_600_000, IsInterlaced: true }]
+    }
+  ];
+  assert.equal(pickMediaSource(sources).mediaSource?.Id, "progressive");
 });
 
 test("mapMediaSourceOption：产出稳定 key、可读 label 和是否有字幕", () => {

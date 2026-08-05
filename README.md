@@ -26,8 +26,8 @@ Emby 卡片宽度为 300px，高度不超过 400px，并会在较矮窗口中自
 | 从源码运行 | Node.js 22+、npm；依赖安装会提供构建所需的 Bun |
 | 本机重封装/转码 | 可选的系统 FFmpeg；Release 安装器会优先通过现有 Homebrew 自动安装 |
 
-没有 FFmpeg 时，红果播放、Emby HLS 和兼容 MP4 直连仍可使用；只有 MKV、
-HEVC、EC-3、复杂多音轨或图形字幕烧录等本机处理路径不可用。也可以通过
+没有 FFmpeg 时，红果播放、Emby HLS 和常规码率的兼容 MP4 直连仍可使用；只有 MKV、
+HEVC、EC-3、复杂多音轨、超过 40 Mbps 的媒体或图形字幕烧录等本机处理路径不可用。也可以通过
 `CODEX_COMPANION_FFMPEG=/absolute/path/to/ffmpeg` 指定已有 FFmpeg。
 
 Codex 必须在启动时启用 CDP，无法对已经普通启动的进程事后开启。因此首次
@@ -102,17 +102,22 @@ npm run build:app -- --target darwin-x64
 文件只包含服务器地址和标识、UserId、用户名与 DeviceId。每个 AccessToken 独立
 存入 macOS Keychain，service 为 `codex-companion.emby`，密码不会落盘。
 
-播放路径按以下顺序选择：
+有多个媒体版本时，用户手动选择始终优先；默认先保留字幕与最高分辨率档，
+再优先逐行源并估算输入、转码输出和 Renderer 解码的数据成本。没有 FFmpeg 时，
+兼容的直放源会优先于需要本机处理的版本。具体播放路径为：
 
 1. 服务端允许转码时使用 H.264/AAC HLS。
-2. 单路 H.264 + 至多单路 AAC 的 MP4 直接增量转换为 fMP4。
-3. HEVC、EC-3、多音轨、其他容器或图形字幕烧录交给用户安装的 FFmpeg，输出 H.264/AAC fMP4。
+2. 不超过 40 Mbps、单路 H.264 + 至多单路 AAC 的 MP4 经带鉴权的本机
+   loopback Range 代理交给原生 `<video>` 持续播放，不经过 CDP Base64 分片。
+3. 原生代理不可用时，兼容 MP4 才回退到 MP4Box + 有界 MSE 流。
+4. 超高码率 MP4、HEVC、EC-3、多音轨、其他容器或图形字幕烧录交给用户安装的
+   FFmpeg，输出 H.264/AAC fMP4；macOS 优先使用 VideoToolbox。
 
 SRT、WebVTT、ASS 和 SSA 等文字字幕由播放器单独渲染；其中 ASS/SSA 会在本机
 转换为 WebVTT，不会仅为显示文字而重新编码整段 4K 视频。PGS、VobSub 和 DVB
 等图形字幕仍需要烧录。
 
-因此不兼容编码不会先交给 Renderer 再失败；需要第 3 条但系统没有 FFmpeg 时，
+因此不兼容编码不会先交给 Renderer 再失败；需要第 4 条但系统没有 FFmpeg 时，
 界面会明确提示安装或指定 FFmpeg。
 
 连接前可以运行只读探针：
@@ -129,7 +134,8 @@ npm run probe:emby -- --server https://emby.example.com --username alice --searc
 2. Renderer 通过 CDP binding 发送控制和元数据 RPC，响应通过静态
    `Runtime.callFunctionOn` 参数传递，媒体内容不会拼入动态脚本。
 3. Node 进程访问红果、Emby 和允许的媒体 CDN；Renderer 不直接接触凭证或远端。
-4. MP4 使用有限 Range 和 MP4Box 增量生成 fMP4；HLS 与 FFmpeg 流都有背压和缓冲上限。
+4. 兼容 MP4 通过秘密 loopback URL 持续 Range 播放；CSP 受限或代理不可用时，
+   MP4Box 才按关键帧生成可回收的 fMP4。HLS、MSE 与 FFmpeg 路径都有背压和缓冲上限。
 5. 返回、seek、切集、登出、Renderer 关闭或维护进程退出时，会取消请求、Blob URL、
    字幕文件、转码进程和服务端活跃播放会话。
 

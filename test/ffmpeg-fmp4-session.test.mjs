@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { promisify } from "node:util";
 import { EmbyError } from "../src/emby-client.mjs";
@@ -12,11 +14,20 @@ import {
   RangeProxy,
   buildFfmpegArguments,
   ffmpegStrategy,
+  mediaSourceExceedsDirectBitrate,
   videoBitrateFor
 } from "../src/ffmpeg-fmp4-session.mjs";
 
 const execFileAsync = promisify(execFile);
 const ffmpegPath = resolveFfmpegPath();
+
+function mp4Box(type, payload = Buffer.alloc(0)) {
+  const box = Buffer.alloc(8 + payload.length);
+  box.writeUInt32BE(box.length, 0);
+  box.write(type, 4, 4, "ascii");
+  payload.copy(box, 8);
+  return box;
+}
 
 async function ffmpegHasFilter(name) {
   if (!ffmpegPath) return false;
@@ -95,6 +106,28 @@ test("FFmpeg 策略优先重封装 H.264/AAC，仅为不兼容编码转码", () 
     copyVideo: false,
     copyAudio: false
   });
+  const highBitrate = {
+    Bitrate: 95_400_000,
+    MediaStreams: [
+      { Type: "Video", Codec: "h264", Height: 2160, BitRate: 94_998_420 },
+      { Type: "Audio", Codec: "aac" }
+    ]
+  };
+  assert.equal(mediaSourceExceedsDirectBitrate(highBitrate), true);
+  assert.equal(ffmpegStrategy(highBitrate).copyVideo, false);
+  assert.equal(mediaSourceExceedsDirectBitrate({
+    MediaStreams: [{ Type: "Video", Codec: "h264", BitRate: 19_000_000 }]
+  }), false);
+  const remuxOnly = {
+    MediaStreams: [{ Type: "Video", Codec: "h264", BitRate: 21_000_000 }]
+  };
+  assert.equal(mediaSourceExceedsDirectBitrate(remuxOnly), false);
+  assert.equal(ffmpegStrategy(remuxOnly).copyVideo, true);
+  const transcoded = {
+    MediaStreams: [{ Type: "Video", Codec: "h264", BitRate: 41_000_000 }]
+  };
+  assert.equal(mediaSourceExceedsDirectBitrate(transcoded), true);
+  assert.equal(ffmpegStrategy(transcoded).copyVideo, false);
 });
 
 test("FFmpeg 参数分别覆盖 ASS、PGS、VobSub 和 DVB 烧录", () => {
@@ -220,6 +253,45 @@ test("videoBitrateFor 按分辨率分档钳制源码率，未知则用档位默�
   assert.equal(videoBitrateFor({ MediaStreams: [{ Type: "Video", Height: 720 }] }), "4000000");
   assert.equal(videoBitrateFor({ MediaStreams: [{ Type: "Video", Height: 1440 }] }), "12000000");
   assert.equal(videoBitrateFor({ MediaStreams: [{ Type: "Video", Height: 2160 }] }), "20000000");
+});
+
+test("FFmpeg 会话串行处理初始化窗口内的并发 seek", async (t) => {
+  let spawnCount = 0;
+  const initialization = Buffer.concat([mp4Box("ftyp"), mp4Box("moov")]);
+  const spawnImpl = () => {
+    spawnCount += 1;
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = (signal = "SIGTERM") => {
+      if (child.exitCode !== null || child.signalCode !== null) return false;
+      child.signalCode = signal;
+      queueMicrotask(() => child.emit("exit", null, signal));
+      return true;
+    };
+    setTimeout(() => {
+      if (!child.stdout.destroyed) child.stdout.write(initialization);
+    }, 20);
+    return child;
+  };
+  const session = new FfmpegFmp4Session({
+    mediaSource: { MediaStreams: [{ Type: "Video", Codec: "h264" }] },
+    readRange: async () => ({ bytes: Buffer.alloc(0), start: 0, end: 0, total: 1 }),
+    ffmpegPathImpl: "/mock/ffmpeg",
+    spawnImpl,
+    platform: "linux"
+  });
+  t.after(() => session.destroy());
+
+  await session.initialize();
+  const results = await Promise.all([session.seek(10), session.seek(20)]);
+  assert.deepEqual(results, [
+    { timeSeconds: 10, offset: 0, timestampOffsetSeconds: 10 },
+    { timeSeconds: 20, offset: 0, timestampOffsetSeconds: 20 }
+  ]);
+  assert.equal(spawnCount, 3);
 });
 
 test("RangeProxy 首批字节立即转发，并在上游断流后从已收偏移续接", async (t) => {
@@ -358,8 +430,16 @@ test("FFmpeg 会把 MKV 按需重封装为可追加的 fragmented MP4，并支�
   assert.ok(first.segments.length >= 1); // next() 现在可打包多个分片
   assert.ok(Buffer.from(first.segments[0].data, "base64").includes(Buffer.from("moof")));
 
-  const seek = await session.seek(1, { signal: AbortSignal.timeout(10_000) });
-  assert.deepEqual(seek, { timeSeconds: 1, offset: 0, timestampOffsetSeconds: 1 });
+  // 原生进度条拖动会在前一次重启未初始化完成时继续发 seek；会话必须串行处理，
+  // 不能让第二次调用观察到内部 ready=false 并抛 FFMPEG_NOT_INITIALIZED。
+  const seeks = await Promise.all([
+    session.seek(0.5, { signal: AbortSignal.timeout(10_000) }),
+    session.seek(1, { signal: AbortSignal.timeout(10_000) })
+  ]);
+  assert.deepEqual(seeks, [
+    { timeSeconds: 0.5, offset: 0, timestampOffsetSeconds: 0.5 },
+    { timeSeconds: 1, offset: 0, timestampOffsetSeconds: 1 }
+  ]);
   const afterSeek = await session.next({ signal: AbortSignal.timeout(10_000) });
   assert.ok(afterSeek.segments.length >= 1);
   assert.ok(streamCalls.length >= 2);
