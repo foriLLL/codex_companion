@@ -309,3 +309,15 @@ test("Range 失效和签名过期返回可操作错误", async () => {
     /必须是 hongguoduanju\.com/
   );
 });
+
+
+test("新官网裸变量、频道目录、series_title 均可解析，跨频道去重", () => {
+  const series = {series_id:"123",series_title:"新版短剧",episode_cnt:12};
+  const html = `<script>_ROUTER_DATA = ${JSON.stringify({loaderData:{page:{homeSections:[{video_list:[series]},{video_list:[series,{series_id:"456",series_title:"第二部"}]}]}}})};</script>`;
+  const home = parseHomeData(html);
+  assert.deepEqual(home.items.map(({id,name})=>({id,name})),[{id:"123",name:"新版短剧"},{id:"456",name:"第二部"}]);
+  assert.equal(home.featured.length,2);
+  assert.equal(home.items[0].totalEpisodes,12);
+  assert.deepEqual(parseRouterData('<script>window . _ROUTER_DATA = {"loaderData":{}};</script>'),{loaderData:{}});
+  assert.throws(()=>parseRouterData('<script>FAKE_ROUTER_DATA = {};</script>'),{code:"PAGE_DATA_MISSING"});
+});

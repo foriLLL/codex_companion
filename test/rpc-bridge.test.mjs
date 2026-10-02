@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import vm from "node:vm";
+import { getEventListeners } from "node:events";
+import { CodexCompanionService } from "../src/codex-companion-service.mjs";
 import test from "node:test";
 import {
   CdpRpcBridge,
@@ -12,6 +14,8 @@ import {
 class FakeConnection {
   calls = [];
   responses = [];
+  sinkName = "runtime";
+  fallbackCalls = 0;
   #listeners = new Map();
 
   on(method, listener) {
@@ -37,7 +41,8 @@ class FakeConnection {
 
     const context = {
       __CODEX_COMPANION__: {
-        emby: {
+        emby: { receiveRpc: () => { this.fallbackCalls += 1; } },
+        [this.sinkName]: {
           receiveRpc: (response) => this.responses.push({
             contextId: params.executionContextId,
             response: JSON.parse(JSON.stringify(response))
@@ -267,4 +272,163 @@ test("sanitizeRpcError 丢弃未知 code 与内部字段", () => {
     message: "failed",
     retryable: true
   });
+});
+
+
+test("新桥优先公共 runtime.receiveRpc，仍兼容旧前端 sink", async () => {
+  for (const sinkName of ["runtime", "emby"]) {
+    const connection = new FakeConnection();
+    connection.sinkName = sinkName;
+    const bridge = new CdpRpcBridge(connection, { handler: async () => "ok" });
+    await bridge.attach();
+    emitRequest(connection, { id: "sink", method: "connection.status" });
+    await waitFor(() => connection.responses.length === 1);
+    assert.equal(connection.responses[0].response.result, "ok");
+    assert.equal(connection.fallbackCalls, 0);
+    bridge.detach();
+  }
+});
+
+test("新 RPC 元数据校验并使用 CDP target/context，拒绝 namespace/generation 伪造", async () => {
+  const connection = new FakeConnection();
+  const calls = [];
+  const bridge = new CdpRpcBridge(connection, { targetId: "trusted-target", handler: async (_method, _params, context) => { calls.push(context); return true; } });
+  await bridge.attach();
+  const invalid = [
+    { cardId: "emby", generation: -1 }, { cardId: "emby", generation: 0.5 },
+    { cardId: "emby", generation: Number.MAX_SAFE_INTEGER + 1 }, { cardId: "emby" },
+    { generation: 1 }, { cardId: "hongguo", generation: 1 }
+  ];
+  for (const [index, metadata] of invalid.entries()) emitRequest(connection, { id: `bad-${index}`, method: "emby.connection.status", ...metadata });
+  await waitFor(() => connection.responses.length === invalid.length);
+  assert.equal(calls.length, 0);
+  assert.ok(connection.responses.every(({ response }) => response.error.code === "RPC_INVALID_REQUEST"));
+  emitRequest(connection, { id: "good", method: "emby.connection.status", cardId: "emby", generation: 0, targetId: "forged", executionContextId: 999, params: { targetId: "forged" } }, 19);
+  await waitFor(() => calls.length === 1);
+  assert.equal(calls[0].targetId, "trusted-target");
+  assert.equal(calls[0].executionContextId, 19);
+  assert.equal(calls[0].cardId, "emby");
+  assert.equal(calls[0].generation, 0);
+  bridge.detach();
+});
+
+test("generation 升级只取消该卡该 context，旧 dispose 不会送到服务", async () => {
+  const connection = new FakeConnection();
+  const signals = new Map();
+  const bridge = new CdpRpcBridge(connection, { handler: async (_method, _params, context) => {
+    signals.set(context.requestId, context.signal);
+    if (context.requestId === "new") return true;
+    return new Promise(() => {});
+  } });
+  await bridge.attach();
+  emitRequest(connection, { id: "old", method: "emby.home.get", cardId: "emby", generation: 1 });
+  emitRequest(connection, { id: "other-card", method: "hongguo.home", cardId: "hongguo", generation: 1 });
+  emitRequest(connection, { id: "other-context", method: "emby.home.get", cardId: "emby", generation: 1 }, 8);
+  await waitFor(() => signals.size === 3);
+  emitRequest(connection, { id: "new", method: "emby.home.get", cardId: "emby", generation: 2 });
+  await waitFor(() => signals.size === 4);
+  assert.equal(signals.get("old").aborted, true);
+  assert.equal(signals.get("other-card").aborted, false);
+  assert.equal(signals.get("other-context").aborted, false);
+  emitRequest(connection, { id: "stale-dispose", method: "emby.lifecycle.dispose", cardId: "emby", generation: 1 });
+  await waitFor(() => connection.responses.some(({ response }) => response.id === "stale-dispose"));
+  assert.equal(connection.responses.find(({ response }) => response.id === "stale-dispose").response.error.code, "RPC_STALE_GENERATION");
+  assert.equal(signals.has("stale-dispose"), false);
+  bridge.detach();
+});
+
+test("取消必须同时匹配 card/generation/context；旧无元数据取消无法取消新请求", async () => {
+  const connection = new FakeConnection();
+  let signal;
+  const bridge = new CdpRpcBridge(connection, { handler: async (_method, _params, context) => { signal = context.signal; return new Promise(() => {}); } });
+  await bridge.attach();
+  emitRequest(connection, { id: "pending", method: "emby.home.get", cardId: "emby", generation: 2 });
+  await waitFor(() => signal);
+  emitRequest(connection, { id: "wrong-card", method: "rpc.cancel", cardId: "hongguo", generation: 2, params: { requestId: "pending" } });
+  emitRequest(connection, { id: "wrong-context", method: "rpc.cancel", cardId: "emby", generation: 2, params: { requestId: "pending" } }, 8);
+  emitRequest(connection, { id: "wrong-generation", method: "rpc.cancel", cardId: "emby", generation: 3, params: { requestId: "pending" } });
+  emitRequest(connection, { id: "legacy-cancel", method: "rpc.cancel", params: { requestId: "pending" } });
+  await waitFor(() => connection.responses.length === 4);
+  assert.equal(signal.aborted, false);
+  assert.ok(connection.responses.every(({ response }) => response.result.cancelled === false));
+  emitRequest(connection, { id: "correct", method: "rpc.cancel", cardId: "emby", generation: 2, params: { requestId: "pending" } });
+  await waitFor(() => signal.aborted);
+  bridge.detach();
+});
+
+test("context 清理涵盖已经完成请求的现代和旧前端会话，且不会清理其他 context", async () => {
+  const connection = new FakeConnection();
+  const disposed = [];
+  const bridge = new CdpRpcBridge(connection, { targetId: "real-target", handler: {
+    handleRpc: async () => true,
+    disposeContext: (target, contextId) => disposed.push([target, contextId])
+  } });
+  await bridge.attach();
+  emitRequest(connection, { id: "a", method: "emby.connection.status", cardId: "emby", generation: 1 }, 7);
+  emitRequest(connection, { id: "b", method: "connection.status" }, 8);
+  await waitFor(() => connection.responses.length === 2);
+  connection.emit("Runtime.executionContextDestroyed", { executionContextId: 7 });
+  await waitFor(() => disposed.length === 1);
+  assert.deepEqual(disposed, [["real-target", 7]]);
+  connection.emit("Runtime.executionContextsCleared");
+  await waitFor(() => disposed.length === 2);
+  assert.deepEqual(disposed, [["real-target", 7], ["real-target", 8]]);
+  bridge.detach();
+});
+
+
+test("公共 bridge 到真实 ServiceRegistry：禁用与旧 dispose 不影响另一张卡的进行中 RPC", async () => {
+  const connection = new FakeConnection();
+  const contexts = new Map();
+  const disposed = [];
+  let enabled = true;
+  const service = new CodexCompanionService({
+    configStore: { loadV2: async () => ({ enabled: true, cards: { emby: { enabled } } }) },
+    embyService: {
+      handleRpc(_method, _params, context) { contexts.set(`emby-${context.generation}`, context); return { connected: true }; },
+      disposeTarget(key) { disposed.push(["emby", key]); }
+    },
+    hongguoService: {
+      handleRpc(_method, _params, context) { contexts.set("hongguo", context); return new Promise(() => {}); },
+      disposeTarget(key) { disposed.push(["hongguo", key]); }
+    }
+  });
+  const bridge = new CdpRpcBridge(connection, { handler: service, targetId: "trusted-target" });
+  await bridge.attach();
+  emitRequest(connection, { id: "hongguo", method: "hongguo.home", cardId: "hongguo", generation: 1 });
+  emitRequest(connection, { id: "emby-1", method: "emby.connection.status", cardId: "emby", generation: 1 });
+  await waitFor(() => contexts.size === 2);
+  emitRequest(connection, { id: "emby-2", method: "emby.connection.status", cardId: "emby", generation: 2 });
+  await waitFor(() => contexts.size === 3);
+  const priorDisposals = disposed.length;
+  emitRequest(connection, { id: "old-dispose", method: "emby.lifecycle.dispose", cardId: "emby", generation: 1 });
+  await waitFor(() => connection.responses.some(({ response }) => response.id === "old-dispose"));
+  assert.equal(disposed.length, priorDisposals);
+  assert.equal(contexts.get("hongguo").signal.aborted, false);
+  enabled = false;
+  await service.applyConfig({ enabled: true, cards: { emby: { enabled: false } } });
+  assert.equal(contexts.get("emby-2").signal.aborted, true);
+  assert.equal(contexts.get("hongguo").signal.aborted, false);
+  emitRequest(connection, { id: "disabled", method: "emby.home.get", cardId: "emby", generation: 3 });
+  await waitFor(() => connection.responses.some(({ response }) => response.id === "disabled"));
+  assert.equal(connection.responses.find(({ response }) => response.id === "disabled").response.error.code, "CARD_DISABLED");
+  assert.equal(disposed.some(([id]) => id === "hongguo"), false);
+  bridge.detach();
+  await waitFor(() => contexts.get("hongguo").signal.aborted);
+});
+
+
+test("超时与取消结束后移除 bridge 的 abort 监听器，不保留每次 RPC 闭包", async () => {
+  const connection = new FakeConnection();
+  const signals = [];
+  const bridge = new CdpRpcBridge(connection, { timeoutMs: 10, handler: async (_method, _params, context) => {
+    signals.push(context.signal);
+    return new Promise(() => {});
+  } });
+  await bridge.attach();
+  for (let i = 0; i < 12; i += 1) emitRequest(connection, { id: `timeout-${i}`, method: "emby.home.get", cardId: "emby", generation: 1 });
+  await waitFor(() => connection.responses.length === 12);
+  assert.equal(signals.length, 12);
+  assert.ok(signals.every(signal => signal.aborted && getEventListeners(signal, "abort").length === 0));
+  bridge.detach();
 });

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "通过 CDP 向 Codex Desktop 注入短剧与 Emby 微型播放器卡片",
+  "description": "通过 CDP 为 Codex Desktop 提供可扩展卡片平台",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/foriLLL/codex_companion.git"
@@ -30,7 +30,16 @@
     "probe:emby": "node scripts/probe-emby.mjs",
     "generate:hls": "node scripts/generate-hls-embed.mjs",
     "build:app": "node scripts/build-app.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "generate:renderer": "node scripts/generate-renderer.mjs",
+    "prestart": "npm run generate:renderer",
+    "preattach": "npm run generate:renderer",
+    "preinject": "npm run generate:renderer",
+    "pretest": "npm run generate:renderer",
+    "smoke:platform": "node scripts/smoke-card-platform.mjs",
+    "card:create": "node scripts/create-card.mjs",
+    "smoke:backend": "node scripts/smoke-backend-platform.mjs",
+    "presmoke": "npm run generate:renderer"
   },
   "engines": {
     "node": ">=22"

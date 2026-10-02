@@ -2,23 +2,12 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-// 卡片目录：配置窗按此集合渲染，新增卡片只需在此登记。
-// 与 bun 侧 companion-config 的 CARD_IDS 对齐。
-struct CardDescriptor: Identifiable, Hashable {
+// 目录和配置都由后端 CLI 提供，新增内置卡片无需修改 Swift。
+struct CardDescriptor: Identifiable, Decodable {
     let id: String
     let title: String
+    let defaultEnabled: Bool
 }
-
-let cardCatalog: [CardDescriptor] = [
-    CardDescriptor(id: "hongguo", title: "红果短剧"),
-    CardDescriptor(id: "emby", title: "Emby 媒体")
-]
-
-func cardTitle(_ id: String) -> String {
-    cardCatalog.first(where: { $0.id == id })?.title ?? id
-}
-
-// MARK: - 数据模型（与 bun 侧 CLI 的 JSON 输出/配置文件 schema 对齐）
 
 struct CompanionStatus: Decodable {
     var statusError: Bool?
@@ -27,60 +16,24 @@ struct CompanionStatus: Decodable {
     var codexPids: [Int]
     var port: Int?
     var daemonPid: Int?
-    var cards: CardsConfig?
 }
 
-struct CardsConfig: Codable {
-    var hongguo: Bool
-    var emby: Bool
-
-    // 与 bun 侧 normalizeCards 对齐：缺字段回退默认（开），不因单字段缺失整体失败。
-    init(hongguo: Bool = true, emby: Bool = true) {
-        self.hongguo = hongguo
-        self.emby = emby
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        hongguo = (try? container.decode(Bool.self, forKey: .hongguo)) ?? true
-        emby = (try? container.decode(Bool.self, forKey: .emby)) ?? true
-    }
+struct CardConfig: Decodable {
+    var enabled: Bool
 }
 
-struct CompanionConfigFile: Codable {
+struct CompanionConfigFile: Decodable {
     var version: Int
+    var revision: Int
     var enabled: Bool
     var placement: String
-    var cards: CardsConfig
-    var cardOrder: [String]
+    var cards: [String: CardConfig]
+    var order: [String]
+}
 
-    init(version: Int = 1, enabled: Bool = true, placement: String = "standalone-button", cards: CardsConfig = CardsConfig(), cardOrder: [String] = ["hongguo", "emby"]) {
-        self.version = version
-        self.enabled = enabled
-        self.placement = placement
-        self.cards = cards
-        self.cardOrder = cardOrder
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        version = (try? container.decode(Int.self, forKey: .version)) ?? 1
-        // 注入总开关：缺省开（与 bun 侧 normalize 一致）。
-        enabled = (try? container.decode(Bool.self, forKey: .enabled)) ?? true
-        let raw = (try? container.decode(String.self, forKey: .placement)) ?? "standalone-button"
-        placement = (raw == "inline-in-summary") ? raw : "standalone-button"
-        cards = (try? container.decode(CardsConfig.self, forKey: .cards)) ?? CardsConfig()
-        // 与 bun 侧 normalizeCardOrder 对齐：白名单过滤 + 去重 + 缺失项补末尾。
-        let rawOrder = (try? container.decode([String].self, forKey: .cardOrder)) ?? []
-        var order: [String] = []
-        for id in rawOrder where ["hongguo", "emby"].contains(id) && !order.contains(id) {
-            order.append(id)
-        }
-        for id in ["hongguo", "emby"] where !order.contains(id) {
-            order.append(id)
-        }
-        cardOrder = order
-    }
+struct BackendFailure: Decodable {
+    struct Detail: Decodable { let code: String; let message: String }
+    let error: Detail
 }
 
 struct StopResult: Decodable {
@@ -93,11 +46,14 @@ struct StopResult: Decodable {
 enum BackendError: LocalizedError {
     case binaryMissing
     case commandFailed(String)
+    case conflict
 
     var errorDescription: String? {
         switch self {
         case .binaryMissing:
             return "找不到 codex-companion 后端，请重新安装。"
+        case .conflict:
+            return "配置已在其他窗口更新，正在刷新。"
         case .commandFailed(let message):
             return message
         }
@@ -106,9 +62,6 @@ enum BackendError: LocalizedError {
 
 final class CompanionBackend {
     static let shared = CompanionBackend()
-
-    let configURL: URL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/codex-companion/config.json")
 
     private var binaryURL: URL? {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("codex-companion"),
@@ -132,42 +85,65 @@ final class CompanionBackend {
         return environment
     }
 
-    /// 运行后端子命令并等待退出，返回 stdout。后端约定输出单行 JSON。
-    /// 并发读取 stdout/stderr 后再 waitUntilExit，避免管道缓冲写满导致的死锁。
-    private func run(_ arguments: [String]) throws -> Data {
+    /// 所有短命令在后台队列执行；共享输出管道避免 stdout/stderr 相互阻塞。
+    private func run(_ arguments: [String], input: Data? = nil) async throws -> Data {
         guard let binary = binaryURL else { throw BackendError.binaryMissing }
-        let process = Process()
-        process.executableURL = binary
-        process.arguments = arguments
-        process.environment = backendEnvironment()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        try process.run()
-        // 先读到 EOF（读操作会阻塞直到子进程关闭写端），再 wait，避免死锁。
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let message = String(data: stdoutData + stderrData, encoding: .utf8) ?? ""
-            throw BackendError.commandFailed("后端命令失败（\(arguments.joined(separator: " "))）：\(message)")
+        let environment = backendEnvironment()
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let process = Process()
+                    process.executableURL = binary
+                    process.arguments = arguments
+                    process.environment = environment
+                    let output = Pipe()
+                    let stdinPipe = Pipe()
+                    process.standardOutput = output
+                    process.standardError = output
+                    process.standardInput = stdinPipe
+                    try process.run()
+                    if let input { try stdinPipe.fileHandleForWriting.write(contentsOf: input) }
+                    try stdinPipe.fileHandleForWriting.close()
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    guard process.terminationStatus == 0 else {
+                        if let failure = try? JSONDecoder().decode(BackendFailure.self, from: data) {
+                            if failure.error.code == "CONFIG_CONFLICT" { throw BackendError.conflict }
+                            throw BackendError.commandFailed(failure.error.message)
+                        }
+                        throw BackendError.commandFailed(String(data: data, encoding: .utf8) ?? "后端命令失败")
+                    }
+                    continuation.resume(returning: data)
+                } catch { continuation.resume(throwing: error) }
+            }
         }
-        return stdoutData
     }
 
-    func status() throws -> CompanionStatus {
-        try JSONDecoder().decode(CompanionStatus.self, from: run(["status"]))
+    func status() async throws -> CompanionStatus {
+        try JSONDecoder().decode(CompanionStatus.self, from: await run(["status"]))
     }
 
-    func stopCodex() throws -> StopResult {
-        try JSONDecoder().decode(StopResult.self, from: run(["stop-codex"]))
+    func stopCodex() async throws -> StopResult {
+        try JSONDecoder().decode(StopResult.self, from: await run(["stop-codex"]))
+    }
+
+    func catalog() async throws -> [CardDescriptor] {
+        try JSONDecoder().decode([CardDescriptor].self, from: await run(["cards", "list"]))
+    }
+
+    func loadConfig() async throws -> CompanionConfigFile {
+        try JSONDecoder().decode(CompanionConfigFile.self, from: await run(["config", "get"]))
+    }
+
+    func patchConfig(_ patch: [String: Any], expectedRevision: Int) async throws -> CompanionConfigFile {
+        let data = try JSONSerialization.data(withJSONObject: ["expectedRevision": expectedRevision, "patch": patch])
+        return try JSONDecoder().decode(CompanionConfigFile.self, from: await run(["config", "patch"], input: data))
     }
 
     private(set) var launchedProcess: Process?
 
     /// 启动 Codex + 常驻注入维护。launch 是长驻进程，不等待退出；输出写入日志文件。
-    func launchDetached() throws {
+    func launchDetached(proxyPort: Int? = nil) throws {
         guard let binary = binaryURL else { throw BackendError.binaryMissing }
         let logDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/Codex Companion")
@@ -192,7 +168,7 @@ final class CompanionBackend {
 
         let process = Process()
         process.executableURL = binary
-        process.arguments = ["launch"]
+        process.arguments = ["launch"] + (proxyPort.map { ["--proxy-port", String($0)] } ?? [])
         process.environment = backendEnvironment()
         if let logHandle = try? FileHandle(forWritingTo: logURL) {
             logHandle.seekToEndOfFile()
@@ -204,29 +180,6 @@ final class CompanionBackend {
         launchedProcess = process
     }
 
-    /// 读配置：文件缺失/损坏回退默认（与 bun 侧 normalize 语义一致）。
-    func loadConfig() -> CompanionConfigFile {
-        guard let data = try? Data(contentsOf: configURL),
-              let parsed = try? JSONDecoder().decode(CompanionConfigFile.self, from: data) else {
-            return CompanionConfigFile()
-        }
-        return CompanionConfigFile(version: 1, placement: parsed.placement, cards: parsed.cards)
-    }
-
-    /// 写配置：0600 权限。bun 常驻进程 watch 该目录，写入后数秒内重注入生效。
-    func saveConfig(_ config: CompanionConfigFile) throws {
-        let directory = configURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        var data = try encoder.encode(config)
-        data.append(Data("\n".utf8))
-        let temporary = directory.appendingPathComponent(".config-swift-\(UUID().uuidString).tmp")
-        try data.write(to: temporary)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-        _ = try FileManager.default.replaceItemAt(configURL, withItemAt: temporary)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
-    }
 }
 
 // MARK: - 视图模型
@@ -235,7 +188,9 @@ final class CompanionBackend {
 final class CompanionViewModel: ObservableObject {
     @Published var injectionEnabled = true      // 注入总开关（mount/unmount）
     @Published var cardEnabled: [String: Bool] = [:]
-    @Published var cardOrder: [String] = cardCatalog.map(\.id)
+    @Published var cardOrder: [String] = []
+    @Published var cardCatalog: [CardDescriptor] = []
+    @Published var configReady = false
     @Published var draggingCardId: String?
     @Published var standalonePlacement = true   // true=独立按钮；false=随 Summary 显示
     @Published var codexRunning = false
@@ -247,20 +202,35 @@ final class CompanionViewModel: ObservableObject {
 
     private let backend = CompanionBackend.shared
     private var pollTimer: Timer?
+    private var config: CompanionConfigFile?
+    private var pendingPatches: [[String: Any]] = []
+    private var saving = false
+    private var refreshing = false
 
     func start() {
-        let config = backend.loadConfig()
-        injectionEnabled = config.enabled
-        cardEnabled = Dictionary(uniqueKeysWithValues: cardCatalog.map { ($0.id, true) })
-        cardEnabled["hongguo"] = config.cards.hongguo
-        cardEnabled["emby"] = config.cards.emby
-        cardOrder = config.cardOrder
-        standalonePlacement = config.placement != "inline-in-summary"
+        Task {
+            do {
+                cardCatalog = try await backend.catalog()
+                apply(try await backend.loadConfig())
+                configReady = true
+            } catch { errorMessage = error.localizedDescription }
+        }
         refreshStatus()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshStatus() }
         }
     }
+
+    private func apply(_ value: CompanionConfigFile) {
+        config = value
+        injectionEnabled = value.enabled
+        standalonePlacement = value.placement != "inline-in-summary"
+        cardEnabled = value.cards.mapValues { $0.enabled }
+        let ids = Set(cardCatalog.map(\.id))
+        cardOrder = value.order.filter { ids.contains($0) }
+    }
+
+    func cardTitle(_ id: String) -> String { cardCatalog.first { $0.id == id }?.title ?? id }
 
     func stop() {
         pollTimer?.invalidate()
@@ -268,9 +238,12 @@ final class CompanionViewModel: ObservableObject {
     }
 
     func refreshStatus() {
+        guard !refreshing else { return }
+        refreshing = true
         let backend = self.backend
-        Task.detached {
-            let status = try? backend.status()
+        Task {
+            defer { refreshing = false }
+            let status = try? await backend.status()
             await MainActor.run {
                 guard let status else {
                     // 连 status 命令都跑不起来：标记未知，不误判为「未运行」。
@@ -291,38 +264,78 @@ final class CompanionViewModel: ObservableObject {
     }
 
     func cardBinding(_ id: String) -> Binding<Bool> {
-        Binding(
-            get: { self.cardEnabled[id] ?? true },
-            set: { self.cardEnabled[id] = $0; self.persistConfig() }
-        )
+        Binding(get: { self.cardEnabled[id] ?? false }, set: { value in
+            self.cardEnabled[id] = value
+            self.enqueue(["cards": [id: ["enabled": value]]])
+        })
     }
 
-    func persistConfig() {
-        let config = CompanionConfigFile(
-            version: 1,
-            enabled: injectionEnabled,
-            placement: standalonePlacement ? "standalone-button" : "inline-in-summary",
-            cards: CardsConfig(
-                hongguo: cardEnabled["hongguo"] ?? true,
-                emby: cardEnabled["emby"] ?? true
-            ),
-            cardOrder: cardOrder
-        )
-        do {
-            try backend.saveConfig(config)
-            errorMessage = nil
-        } catch {
-            errorMessage = "保存配置失败：\(error.localizedDescription)"
+    var enabledBinding: Binding<Bool> {
+        Binding(get: { self.injectionEnabled }, set: { value in
+            self.injectionEnabled = value
+            self.enqueue(["enabled": value])
+        })
+    }
+
+    var placementBinding: Binding<Bool> {
+        Binding(get: { self.standalonePlacement }, set: { value in
+            self.standalonePlacement = value
+            self.enqueue(["placement": value ? "standalone-button" : "inline-in-summary"])
+        })
+    }
+
+    func persistOrder() {
+        let known = Set(cardCatalog.map(\.id))
+        enqueue(["order": cardOrder + (config?.order.filter { !known.contains($0) } ?? [])])
+    }
+
+    private func enqueue(_ patch: [String: Any]) {
+        guard configReady else { return }
+        pendingPatches.append(patch)
+        guard !saving else { return }
+        saving = true
+        Task {
+            defer { saving = false }
+            while !pendingPatches.isEmpty {
+                let next = pendingPatches.removeFirst()
+                do {
+                    guard let current = config else { break }
+                    let updated: CompanionConfigFile
+                    do {
+                        updated = try await backend.patchConfig(next, expectedRevision: current.revision)
+                    } catch BackendError.conflict {
+                        let latest = try await backend.loadConfig()
+                        config = latest
+                        updated = try await backend.patchConfig(next, expectedRevision: latest.revision)
+                    }
+                    config = updated
+                    if pendingPatches.isEmpty { apply(updated) }
+                    errorMessage = nil
+                } catch {
+                    pendingPatches.removeAll()
+                    if let latest = try? await backend.loadConfig() { apply(latest) }
+                    errorMessage = "保存配置失败：\(error.localizedDescription)"
+                }
+            }
         }
     }
 
-    func launchCodex() {
+    func launchCodex(proxyPort portText: String? = nil) {
+        var proxyPort: Int?
+        if let portText {
+            let trimmed = portText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let port = Int(trimmed), (1...65_535).contains(port) else {
+                errorMessage = "代理端口请输入 1–65535 的整数。"
+                return
+            }
+            proxyPort = port
+        }
         busy = true
         errorMessage = nil
         let backend = self.backend
         Task.detached {
             do {
-                try backend.launchDetached()
+                try backend.launchDetached(proxyPort: proxyPort)
             } catch {
                 await MainActor.run { self.errorMessage = error.localizedDescription }
             }
@@ -350,7 +363,7 @@ final class CompanionViewModel: ObservableObject {
         let backend = self.backend
         Task.detached {
             do {
-                _ = try backend.stopCodex()
+                _ = try await backend.stopCodex()
             } catch {
                 await MainActor.run { self.errorMessage = error.localizedDescription }
             }
@@ -366,6 +379,8 @@ final class CompanionViewModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = CompanionViewModel()
+    @AppStorage("launchThroughProxy") private var launchThroughProxy = false
+    @AppStorage("launchProxyPort") private var launchProxyPort = "7890"
 
     var body: some View {
         Form {
@@ -385,18 +400,33 @@ struct ContentView: View {
                     }
                 }
                 .padding(.vertical, 4)
+                HStack(spacing: 10) {
+                    Toggle("通过代理启动", isOn: $launchThroughProxy)
+                        .toggleStyle(.checkbox)
+                    if launchThroughProxy {
+                        Text("端口")
+                        TextField("7890", text: $launchProxyPort)
+                            .frame(width: 72)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("本机代理端口")
+                    }
+                }
+                .disabled(model.busy || model.codexRunning)
+                Text("代理仅对新启动的 Codex 生效；已运行时需先退出再启动。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             // 卡片区：总开关 + 可拖拽排序的卡片行（为以后更多卡片设计）
             Section {
-                Toggle("启用注入卡片", isOn: $model.injectionEnabled)
-                    .onChange(of: model.injectionEnabled) { _ in model.persistConfig() }
+                Toggle("启用注入卡片", isOn: model.enabledBinding)
+                    .disabled(!model.configReady)
 
                 ForEach(model.cardOrder, id: \.self) { cardId in
                     HStack(spacing: 10) {
                         Image(systemName: "line.3.horizontal")
                             .foregroundStyle(.tertiary)
-                        Text(cardTitle(cardId))
+                        Text(model.cardTitle(cardId))
                         Spacer()
                         Toggle("", isOn: model.cardBinding(cardId))
                             .labelsHidden()
@@ -411,30 +441,29 @@ struct ContentView: View {
                         target: cardId,
                         order: $model.cardOrder,
                         draggingId: $model.draggingCardId,
-                        persist: model.persistConfig
+                        persist: model.persistOrder
                     ))
                 }
-                .disabled(!model.injectionEnabled)
+                .disabled(!model.configReady || !model.injectionEnabled)
             } header: {
                 Text("卡片")
             } footer: {
-                Text("拖动 ≡ 调整卡片顺序；改动实时生效，无需重启 Codex。")
+                Text("拖动 ≡ 调整卡片顺序；改动实时生效，无需重启 Codex。升级后请关闭旧版设置窗口，再重新打开。")
             }
 
             // 显示方式
             Section {
-                Picker("显示方式", selection: $model.standalonePlacement) {
-                    Text("独立按钮").tag(true)
+                Picker("显示方式", selection: model.placementBinding) {
+                    Text("独立浮层").tag(true)
                     Text("随 Summary").tag(false)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .onChange(of: model.standalonePlacement) { _ in model.persistConfig() }
-                .disabled(!model.injectionEnabled)
+                .disabled(!model.configReady || !model.injectionEnabled)
             } header: {
                 Text("显示方式")
             } footer: {
-                Text("独立按钮与原生 Summary 并排、互斥；随 Summary 则嵌入原生面板。")
+                Text("独立浮层由顶栏播放图标打开，与 Summary 互斥；随 Summary 时由摘要开关统一控制，播放器按卡片顺序排在摘要下方。")
             }
 
             if let message = model.errorMessage {
@@ -462,7 +491,7 @@ struct ContentView: View {
             Button("停止 Codex") { model.confirmAndStopCodex() }
                 .disabled(model.busy)
         } else {
-            Button("启动 Codex") { model.launchCodex() }
+            Button("启动 Codex") { model.launchCodex(proxyPort: launchThroughProxy ? launchProxyPort : nil) }
                 .keyboardShortcut(.defaultAction)
                 .disabled(model.busy)
         }
@@ -528,12 +557,7 @@ struct CodexCompanionApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
-        // 首次打开即自动确保 Codex 以伴侣模式运行（保持“点开即用”的无感体验）。
-        // launch 幂等：已在运行且带 flag 时只是 attach，不会重复启动。
-        if let status = try? CompanionBackend.shared.status(),
-           !(status.codexRunning && status.hasCdpFlag && CompanionBackend.shared.launchedProcess != nil) {
-            try? CompanionBackend.shared.launchDetached()
-        }
+        // 等待用户选择是否使用代理，再由窗口按钮启动 Codex。
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

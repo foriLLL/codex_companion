@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { videoColorInfo, SDR_TONE_MAP_FILTER } from "./video-color.mjs";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -20,6 +22,23 @@ const MAX_STDERR_BYTES = 8 * 1024;
 // 直传也没有足够吞吐余量；转为 VideoToolbox H.264 后再交给同一 MSE 播放器。
 export const DIRECT_VIDEO_BITRATE_LIMIT = 40_000_000;
 export const FFMPEG_VIDEO_COPY_BITRATE_LIMIT = 40_000_000;
+
+const execFileAsync = promisify(execFile);
+const colorSupport = new Map();
+
+export async function requireToneMappingSupport(ffmpegPath, { execFileImpl = execFileAsync } = {}) {
+  if (!colorSupport.has(ffmpegPath)) {
+    const probe = execFileImpl(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i", "color=size=16x16:duration=0.04",
+      "-vf", SDR_TONE_MAP_FILTER, "-frames:v", "1", "-f", "null", "-"
+    ], { timeout: 15_000, maxBuffer: 32 * 1024 }).then(() => true).catch(() => {
+      colorSupport.delete(ffmpegPath);
+      throw new EmbyError("HDR_TONEMAPPING_UNAVAILABLE", "当前 FFmpeg 无法处理杜比视界/HDR 色彩；请安装 brew install ffmpeg-full molten-vk（含 libplacebo 与 macOS Vulkan 驱动），或通过 CODEX_COMPANION_FFMPEG 指定支持该滤镜的 FFmpeg");
+    });
+    colorSupport.set(ffmpegPath, probe);
+  }
+  return colorSupport.get(ffmpegPath);
+}
 
 function cancelled(cause) {
   return new EmbyError("CANCELLED", "FFmpeg 媒体处理已取消", { cause });
@@ -560,6 +579,7 @@ export function ffmpegStrategy(mediaSource, subtitleTrack = null) {
     audioCodec,
     hasAudio: Boolean(audio),
     copyVideo: !subtitleTrack
+      && !videoColorInfo(mediaSource).requiresToneMapping
       && !mediaSourceExceedsDirectBitrate(mediaSource, FFMPEG_VIDEO_COPY_BITRATE_LIMIT)
       && (videoCodec === "h264" || videoCodec === "avc"),
     copyAudio: !audio || audioCodec === "aac"
@@ -627,6 +647,8 @@ export function buildFfmpegArguments({
 }) {
   const args = ["-hide_banner", "-loglevel", "error", "-nostdin"];
   const hardwareEncode = hardwareVideo && !strategy.copyVideo;
+  const color = videoColorInfo(mediaSource);
+  const colorFilter = color.requiresToneMapping ? `${SDR_TONE_MAP_FILTER},` : "";
   const subtitleCodec = String(subtitleTrack?.codec ?? "").toLowerCase();
   const styledText = ["ass", "ssa"].includes(subtitleCodec);
   const needsDurationFix = ["dvb_subtitle", "dvbsub"].includes(subtitleCodec);
@@ -635,6 +657,8 @@ export function buildFfmpegArguments({
   // -hwaccel 是输入 0 的输入选项，必须在第一个 -i 之前；只 push 一次 → 不作用于外挂字幕的第二个 -i。
   // 刻意不加 -hwaccel_output_format：让解码帧下载回系统内存，subtitles/overlay filter 与
   // -pix_fmt yuv420p（含 10-bit→8-bit）才能继续工作。
+  // VideoToolbox 的 HEVC 解码仍由 FFmpeg 解析并附加 RPU；下载帧后保留 side data，
+  // libplacebo 可正常处理 P5/P7/P8，无需为 HDR 强制软件解码。
   if (hardwareEncode) args.push("-hwaccel", "videotoolbox");
   if (startTimeSeconds > 0) args.push("-ss", startTimeSeconds.toFixed(3));
   if (subtitleTrack && !subtitleTrack.isExternal && needsDurationFix) args.push("-fix_sub_duration");
@@ -662,26 +686,30 @@ export function buildFfmpegArguments({
       const unshift = startTimeSeconds > 0 ? `,setpts=PTS-${startTimeSeconds.toFixed(3)}/TB` : "";
       args.push(
         "-filter_complex",
-        `[0:v:0]${shift}subtitles=filename='${filterPath(subtitleInput)}'${streamOption}${unshift}[v]`,
+        `[0:v:0]${colorFilter}${shift}subtitles=filename='${filterPath(subtitleInput)}'${streamOption}${unshift}[v]`,
         "-map", "[v]"
       );
     } else {
       const subtitleInput = externalGraphicSubtitle ? "1:s:0" : `0:${subtitleTrack.index}`;
       args.push(
         "-filter_complex",
-        `[0:v:0][${subtitleInput}]overlay=eof_action=pass:shortest=0[v]`,
+        color.requiresToneMapping
+          ? `[0:v:0]${SDR_TONE_MAP_FILTER}[base];[base][${subtitleInput}]overlay=eof_action=pass:shortest=0[v]`
+          : `[0:v:0][${subtitleInput}]overlay=eof_action=pass:shortest=0[v]`,
         "-map", "[v]"
       );
     }
   } else {
     args.push("-map", "0:v:0");
+    if (color.requiresToneMapping) args.push("-vf", SDR_TONE_MAP_FILTER);
   }
   if (strategy.hasAudio) args.push("-map", "0:a:0");
-  args.push("-sn", "-dn");
+  // MP4 muxer 会把章节写成额外 text/data 轨；MSE 只应收到声明的音视频轨。
+  args.push("-sn", "-dn", "-map_chapters", "-1");
   if (strategy.copyVideo) {
     args.push("-c:v", "copy");
   } else if (hardwareEncode) {
-    // 硬件 H.264 编码：CPU 占用比 libx264 低约 24×，避免转码跑不满实时导致缓冲 underrun。
+    // macOS 优先硬件 H.264 编码，避免软件编码占满 CPU。
     // -allow_sw true：无硬件编码器时 VideoToolbox 自带软件兜底，仍产出合法 fMP4。
     args.push(
       "-c:v", "h264_videotoolbox",
@@ -692,6 +720,9 @@ export function buildFfmpegArguments({
     );
   } else {
     args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p");
+  }
+  if (color.requiresToneMapping) {
+    args.push("-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv");
   }
   if (!strategy.hasAudio) args.push("-an");
   else if (strategy.copyAudio) args.push("-c:a", "copy");
@@ -713,7 +744,8 @@ export class FfmpegFmp4Session {
     durationSeconds = null,
     subtitleTrack = null,
     subtitleData = null,
-    ffmpegPathImpl = resolveFfmpegPath(),
+    ffmpegPathImpl = resolveFfmpegPath({ preferFull: videoColorInfo(mediaSource).requiresToneMapping }),
+    toneMappingSupportImpl = requireToneMappingSupport,
     spawnImpl = spawn,
     randomUUIDImpl = randomUUID,
     platform = process.platform,
@@ -729,6 +761,8 @@ export class FfmpegFmp4Session {
       );
     }
     this.ffmpegPath = ffmpegPathImpl;
+    this.color = videoColorInfo(mediaSource);
+    this.toneMappingSupportImpl = toneMappingSupportImpl;
     this.spawnImpl = spawnImpl;
     this.mediaSource = mediaSource;
     this.subtitleTrack = subtitleTrack;
@@ -766,6 +800,9 @@ export class FfmpegFmp4Session {
 
   async initialize({ startTimeSeconds = 0, signal } = {}) {
     this.#assertAlive();
+    if (this.color.requiresToneMapping) await this.toneMappingSupportImpl(this.ffmpegPath);
+    this.#assertAlive();
+    if (signal?.aborted) throw signal.reason ?? cancelled();
     await this.#prepareSubtitleFile();
     if (!this.ready) await this.#restartSerially(Math.max(0, Number(startTimeSeconds) || 0), signal);
     return this.#initializationDto(Math.max(0, Number(startTimeSeconds) || 0));
@@ -898,6 +935,7 @@ export class FfmpegFmp4Session {
     else signal?.addEventListener("abort", abort, { once: true });
 
     child.stdout.on("data", (chunk) => {
+      if (generation !== this.generation || this.destroyed) return;
       try {
         parser.push(chunk);
       } catch (error) {
@@ -906,9 +944,11 @@ export class FfmpegFmp4Session {
       }
     });
     child.stderr.on("data", (chunk) => {
+      if (generation !== this.generation || this.destroyed) return;
       this.stderr = `${this.stderr}${String(chunk)}`.slice(-MAX_STDERR_BYTES);
     });
     child.once("error", (cause) => {
+      if (generation !== this.generation || this.destroyed) return;
       const error = new EmbyError("FFMPEG_START_FAILED", "无法启动 FFmpeg", { cause });
       rejectStart(error);
       this.#fail(error);
@@ -917,6 +957,7 @@ export class FfmpegFmp4Session {
       if (generation !== this.generation || this.destroyed) return;
       this.child = null;
       if (code === 0) {
+        if (!this.ready) rejectStart(new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 已退出但未产生可播放的视频"));
         this.ended = true;
         this.#resolveWaiters();
         return;

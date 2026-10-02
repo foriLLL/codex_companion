@@ -14,6 +14,7 @@ test("CLI 把本地 HLS prelude 和统一 RPC Service 交给 Injector", async ()
   const runtime = await createEmbyRuntime(56837, {
     InjectorClass: FakeInjector,
     loadRuntimeSource: async () => "/* local hls */",
+    loadConfig: async () => ({ enabled: true, placement: "standalone", cards: {} }),
     serviceFactory: () => service,
     logger: { info() {}, warn() {}, error() {} }
   });

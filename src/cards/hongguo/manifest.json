@@ -1,0 +1,11 @@
+{
+  "id": "hongguo",
+  "title": "红果短剧",
+  "version": 1,
+  "defaultEnabled": true,
+  "defaultOrder": 20,
+  "layout": { "height": "viewport", "minHeight": 320, "scroll": "inner" },
+  "lifecycle": { "hidden": "retain", "start": "first-visible" },
+  "state": { "scope": "target", "version": 1 },
+  "capabilities": ["rpc", "storage"]
+}

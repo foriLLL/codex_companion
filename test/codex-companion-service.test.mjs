@@ -14,7 +14,7 @@ test("统一 RPC Service 按命名空间隔离红果和 Emby", async () => {
     disposeTarget(target) { calls.push(["hongguo:disposeTarget", target]); },
     dispose() { calls.push(["hongguo:dispose"]); }
   };
-  const service = new CodexCompanionService({ embyService, hongguoService });
+  const service = new CodexCompanionService({ embyService, hongguoService, configStore: { loadV2: async () => ({ version: 2, enabled: true, cards: {} }) } });
   assert.equal(await service.handleRpc("hongguo.home", {}, {}), "hongguo");
   assert.equal(await service.handleRpc("connection.status", {}, {}), "emby");
   await service.disposeTarget("renderer");
@@ -27,4 +27,14 @@ test("统一 RPC Service 按命名空间隔离红果和 Emby", async () => {
     ["hongguo:dispose"],
     ["emby:dispose"]
   ]);
+});
+
+
+test("River Club 入口使用本机固定配置，忽略 renderer 传入的任意 URL", async () => {
+  const calls=[];
+  const service=new CodexCompanionService({embyService:{},hongguoService:{},
+    configStore:{load:async()=>({riverclubUrl:"https://riverclub.booocai.com/?invite=test"})},
+    openUrlImpl:async url=>calls.push(url)});
+  assert.deepEqual(await service.handleRpc("riverclub.open",{url:"file:///etc/passwd"}),{opened:true});
+  assert.deepEqual(calls,["https://riverclub.booocai.com/?invite=test"]);
 });

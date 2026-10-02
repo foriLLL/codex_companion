@@ -87,6 +87,9 @@ async function main() {
   const pkg = require("../package.json");
   const version = pkg.version ?? "0.0.0";
 
+  console.log("[build-app] 生成卡片目录与 renderer bundle…");
+  await execFileAsync(process.execPath, [join(here, "generate-renderer.mjs")]);
+
   // 1. 嵌入 hls.js
   console.log("[build-app] 生成 hls 嵌入模块…");
   await execFileAsync(process.execPath, [join(here, "generate-hls-embed.mjs")]);
@@ -98,6 +101,7 @@ async function main() {
   await rm(appRoot, { recursive: true, force: true });
   await mkdir(macos, { recursive: true });
   await mkdir(resources, { recursive: true });
+  await cp(join(repoRoot, "src", "cards", "card-catalog.json"), join(resources, "card-catalog.json"));
 
   // 2. 编译 Bun 单文件后端二进制 → Resources/codex-companion
   const bunBin = process.env.CODEX_COMPANION_BUN

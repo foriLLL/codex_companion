@@ -221,9 +221,9 @@ function waitForRetry(delayMs, signal) {
 
 function assignedJson(html, assignment) {
   const source = String(html);
-  const marker = source.indexOf(assignment);
-  if (marker < 0) return null;
-  const start = source.indexOf("{", marker + assignment.length);
+  const match = assignment.exec(source);
+  if (!match) return null;
+  const start = source.indexOf("{", match.index + match[0].length);
   if (start < 0) return null;
   let depth = 0;
   let quoted = false;
@@ -244,7 +244,7 @@ function assignedJson(html, assignment) {
 }
 
 export function parseRouterData(html) {
-  const json = assignedJson(html, "window._ROUTER_DATA");
+  const json = assignedJson(html, /\b(?:window\s*\.\s*)?_ROUTER_DATA\s*=\s*(?=\{)/);
   if (!json) throw new HongguoError("PAGE_DATA_MISSING", "红果官网页面没有返回可识别的数据", { retryable: true });
   try {
     return JSON.parse(json);
@@ -261,10 +261,11 @@ function episodeCount(item) {
 }
 
 function mapSeries(item) {
-  if (!item?.series_id || !item?.series_name) return null;
+  const name = item?.series_name || item?.series_title;
+  if (!item?.series_id || !name) return null;
   return {
     id: String(item.series_id),
-    name: String(item.series_name),
+    name: String(name),
     posterUrl: typeof item.series_cover === "string"
       ? item.series_cover
       : typeof item.background_cover === "string" ? item.background_cover : null,
@@ -283,8 +284,13 @@ function pageLoader(routerData, key) {
 
 export function parseHomeData(html) {
   const page = pageLoader(parseRouterData(html), "page");
-  const videoList = Array.isArray(page?.videoList) ? page.videoList : [];
-  const all = videoList.map(mapSeries).filter(Boolean);
+  // 新官网按频道返回 homeSections[].video_list；兼容旧版平铺目录。
+  const videoList = [
+    ...(Array.isArray(page?.videoList) ? page.videoList : []),
+    ...(Array.isArray(page?.homeSections) ? page.homeSections.flatMap((section) =>
+      Array.isArray(section?.video_list) ? section.video_list : []) : [])
+  ];
+  const all = [...new Map(videoList.map(mapSeries).filter(Boolean).map((item) => [item.id, item])).values()];
   const videoById = new Map(videoList.map((item) => [String(item?.series_id || ""), item]));
   const banners = Array.isArray(page?.mBannerList) && page.mBannerList.length > 0
     ? page.mBannerList

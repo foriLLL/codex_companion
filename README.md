@@ -2,17 +2,17 @@
 
 Codex Companion 是一个仅支持 macOS 的非官方桌面增强工具。它通过本机
 Chrome DevTools Protocol（CDP），在 Codex Desktop（`ChatGPT.app`）的右栏中
-加入红果短剧和 Emby 两张隔离的 Shadow DOM 卡片，不修改 `app.asar`、
+加入红果短剧、River Club 网页入口和 Emby 三张卡片，不修改 `app.asar`、
 `/Applications/ChatGPT.app` 或其应用签名。
 
 > 当前版本：`v0.0.1`，属于早期预览。Codex Desktop 的 DOM 更新可能导致注入
-> 暂时失效。最后验证环境为 ChatGPT/Codex `26.721.81911`、macOS `26.5.2`。
+> 暂时失效。最后验证环境为 ChatGPT/Codex `26.908.40834`、macOS `26.6.2`。
 
 ## 功能
 
 - 红果短剧：公开内容浏览、搜索、选集、播放和倒计时自动连播。
 - Emby：多服务器、媒体库、继续观看、最近添加、搜索、选季选集、字幕和进度上报。
-- 独立卡片按钮或跟随 Summary 显示；两张卡片可分别关闭并调整顺序。
+- 独立卡片按钮或跟随 Summary 显示；三张卡片可分别关闭并调整顺序。
 - 媒体按需流式传输并限制缓冲，不把整部视频下载成 Blob。
 - Emby Token 保存在 macOS Keychain；配置文件权限为 `0600`。
 
@@ -29,6 +29,16 @@ Emby 卡片宽度为 300px，高度不超过 400px，并会在较矮窗口中自
 没有 FFmpeg 时，红果播放、Emby HLS 和常规码率的兼容 MP4 直连仍可使用；只有 MKV、
 HEVC、EC-3、复杂多音轨、超过 40 Mbps 的媒体或图形字幕烧录等本机处理路径不可用。也可以通过
 `CODEX_COMPANION_FFMPEG=/absolute/path/to/ffmpeg` 指定已有 FFmpeg。
+
+杜比视界/HDR 本机播放需要 `brew install ffmpeg-full molten-vk`。色彩处理优先查找
+Homebrew 的 `ffmpeg-full`，保留显式环境变量覆盖；普通 SDR 继续使用常规 FFmpeg。
+播放前会实际运行滤镜检测驱动可用性，不具备能力时明确报错，避免输出紫绿偏色。
+macOS 本机转码启用 VideoToolbox 解码和编码；杜比 RPU 保留至 libplacebo 色彩映射，
+不再为 HDR 强制软件解码。
+
+杜比视界 P5/P8 应用 RPU 元数据后映射到 BT.709 SDR，P7 使用基础层与可用 RPU
+（不重建 FEL 增强层）；HDR10/HLG 也经过色调映射。界面显示源格式和“→ SDR”，
+这不是原生杜比视界 HDR 输出。实现依据 [FFmpeg libplacebo 文档](https://ffmpeg.org/ffmpeg-filters.html#libplacebo)。
 
 Codex 必须在启动时启用 CDP，无法对已经普通启动的进程事后开启。因此首次
 使用前需要从菜单完全退出 Codex。
@@ -81,6 +91,19 @@ npm run build:app -- --target darwin-x64
 公开 Release 工作流会在上传前强制签名和公证。构建产物不包含 FFmpeg。
 
 ## 使用
+
+### 启动时使用本机代理
+
+打开 Codex Companion 后，勾选「通过代理启动」、输入本机代理端口（默认 7890），
+再点击「启动 Codex」。这个选项只在启动新的 Codex 进程时生效；如果 Codex 已在运行，
+先从设置窗口停止 Codex，再按所需选项启动。勾选和端口会由本机设置记住。
+设置窗口打开时会等待你的选择，不会自动拉起 Codex。
+
+例如端口为 7890 时，Codex 子进程会收到
+`HTTP_PROXY=http://127.0.0.1:7890` 和
+`HTTPS_PROXY=http://127.0.0.1:7890`。不勾选时不向 Codex 传递 HTTP 代理环境变量。
+此功能不更改 macOS 的系统代理设置。命令行启动也可使用
+`node src/cli.mjs launch --proxy-port 7890`。
 
 ### 红果短剧
 
@@ -167,9 +190,12 @@ Token、服务器地址、日志原文或其他隐私信息。
 
 - 不支持 Windows、Linux、Emby Connect、服务器自动发现、Live TV、音频库和 DRM。
 - 不关闭 TLS 校验，不支持自签名 Emby HTTPS。
-- 不支持后台播放、Emby 自动连播、在线字幕搜索或字幕时间轴偏移。
+- 收起播放器或 Summary 会保留后台播放；禁用卡片或退出应用才释放会话。不支持 Emby 自动连播、在线字幕搜索或字幕时间轴偏移。
 - 红果仅支持公开播放页提供的 MP4 和当前 Renderer/FFmpeg 可处理的编码。
-- Codex Desktop 更新后，原生右栏定位规则可能需要同步更新。
+- 默认使用独立的“播放器”按钮与 Shadow DOM 浮层（优先以播放图标排在顶栏 Share 与 Summary 之间；无法定位时显示右上方悬浮按钮，点击开关，播放器内 Esc 关闭）。打开时给会话和输入框预留宽度，关闭/卸载恢复原生布局；页面重建时自动恢复。独立模式与 Summary 互斥：打开播放器会关闭原生 Summary，打开 Summary（含快捷键）会收起播放器。播放器开合采用淡入淡出及轻微缩放，支持中途反向切换；系统“减少动态效果”开启时直接切换。
+- 顶栏入口依次定位 Summary 前、Share 后的空间，支持多语言标签、嵌套容器和 `role="toolbar"`。挂载后检查实际可点击性；原生结构变化时保留悬浮入口。DOM 注入仍依赖 Codex 提供 CDP，不能承诺所有未来版本都兼容。
+- “随 Summary”把播放器卡片排在原生摘要卡片下方，保持 24px 间距、共同滚动与开合。Summary 关闭时卡片一起收起，不会切成独立浮层；兼容新版背景样式与多层动画容器。
+- 仍依赖 Codex 启动时启用 CDP、主窗口地址及浏览器标准 DOM。若 Codex 改变这些机制，仍需适配；无法保证未来所有更新都兼容。
 
 ## 卸载
 
@@ -192,3 +218,40 @@ rm -rf "$HOME/Applications/Codex Companion.app"
 项目源码采用 [MIT License](LICENSE)。Codex Companion 与 OpenAI、ChatGPT、
 Codex、字节跳动、红果短剧及 Emby 均无隶属、授权或背书关系；相关名称和商标
 归各自权利人所有。
+
+
+### 网页入口与后台播放
+
+独立模式点击“播放器”收起时，Emby 保留播放会话、媒体元素、进度和音量，继续后台播放；再次展开不会重新取源。返回媒体列表、明确停播、关闭注入或重启后台仍会释放播放。
+
+River Club 默认位于红果与 Emby 之间，可在设置中开关和排序。入口在系统浏览器打开原站，保留站点自己的飞书登录。原站返回 `X-Frame-Options: SAMEORIGIN`，不能直接嵌入 Codex 的 iframe；没有移除或绕过这一策略。邀请链接存本机 0600 的 `config-v2.json` 中 `cards.riverclub.settings.url`（旧 `riverclubUrl` 自动迁移），不会写进发布代码。
+
+红果新版官网的 `_ROUTER_DATA` 裸变量、`homeSections[].video_list` 和 `series_title` 已兼容，并保留旧结构支持。真实官网首页、详情及首集播放已验证，官网未开放的集数仍不能播放。
+
+### 摸鱼小游戏
+
+播放器中新增「摸鱼」卡片，默认排在最前；可在 Companion 设置中关闭或拖动排序。
+包含本地实现的 2048、9×9 扫雷（10 雷、首击安全）和经典单张翻牌接龙。
+不请求外部网站；三款游戏分别保存进度到当前 Codex 页面来源的 localStorage，
+收起、切换游戏和重新注入后可以继续。清除应用网页数据会清除存档。
+2048 的方向键只在游戏卡片获得焦点时接收；各游戏支持最多 30 步撤销（撤销历史不跨重挂载保存）。
+验证：`node --test test/games.test.mjs`、`node scripts/smoke-games.mjs`。
+
+## 新卡片接入
+
+平台统一管理外框与 24px 间距、独立 Shadow DOM、增量配置、生命周期、存档和 RPC。
+新增可信内置卡片只新增 `src/cards/<id>/` 目录，不修改公共卡片名单或 Swift 设置。
+
+```bash
+npm run card:create -- my-card --title 我的卡片
+npm run generate:renderer
+npm test
+npm run smoke
+npm run smoke:backend
+```
+
+新卡默认关闭；在设置中启用。带后端方法的卡片可在创建时增加 `--service`。
+
+设置统一通过后端 `config get/patch` 命令写入带 revision 的 v2 配置，支持字段补丁、
+冲突提示和未知卡片保留。首次运行保留旧配置并备份；迁移后请使用新版设置窗口，
+旧版本设置仍写旧文件，不会覆盖 v2。

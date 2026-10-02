@@ -1,0 +1,11 @@
+{
+  "id": "emby",
+  "title": "Emby",
+  "version": 1,
+  "defaultEnabled": true,
+  "defaultOrder": 40,
+  "layout": { "height": "viewport", "minHeight": 320, "scroll": "inner" },
+  "lifecycle": { "hidden": "retain", "start": "first-visible" },
+  "state": { "scope": "target", "version": 1 },
+  "capabilities": ["rpc", "storage"]
+}

@@ -81,20 +81,22 @@ function normalizeHandler(handler) {
   if (handler === undefined || handler === null) {
     return {
       dispatch: async () => {
-        throw new RpcBridgeError("RPC_UNAVAILABLE", "Emby 服务尚未初始化", { retryable: true });
+        throw new RpcBridgeError("RPC_UNAVAILABLE", "卡片服务尚未初始化", { retryable: true });
       },
-      disposeTarget: null
+      disposeTarget: null,
+      disposeContext: null
     };
   }
   if (typeof handler === "function") {
-    return { dispatch: handler, disposeTarget: null };
+    return { dispatch: handler, disposeTarget: null, disposeContext: null };
   }
   if (typeof handler?.handleRpc === "function") {
     return {
       dispatch: handler.handleRpc.bind(handler),
       disposeTarget: typeof handler.disposeTarget === "function"
         ? handler.disposeTarget.bind(handler)
-        : null
+        : null,
+      disposeContext: typeof handler.disposeContext === "function" ? handler.disposeContext.bind(handler) : null
     };
   }
   throw new TypeError("rpcHandler 必须是函数或实现 handleRpc(method, params, context) 的对象");
@@ -132,10 +134,20 @@ function parseRequest(payload) {
     throw error;
   }
 
+  const modern = Object.hasOwn(request, "cardId") || Object.hasOwn(request, "generation");
+  if (modern && (typeof request.cardId !== "string" || !/^[a-z][a-z0-9-]*$/.test(request.cardId)
+    || !Number.isSafeInteger(request.generation) || request.generation < 0
+    || (request.method !== RPC_CANCEL_METHOD && !request.method.startsWith(`${request.cardId}.`)))) {
+    const error = new RpcBridgeError("RPC_INVALID_REQUEST", "RPC 卡片命名空间或 generation 无效");
+    error.requestId = request.id;
+    throw error;
+  }
+
   return {
     id: request.id,
     method: request.method,
-    params: request.params ?? {}
+    params: request.params ?? {},
+    ...(modern ? { cardId: request.cardId, generation: request.generation } : {})
   };
 }
 
@@ -143,6 +155,9 @@ export class CdpRpcBridge {
   #connection;
   #handler;
   #disposeTarget;
+  #disposeContext;
+  #generations = new Map();
+  #contexts = new Set();
   #targetId;
   #logger;
   #timeoutMs;
@@ -180,6 +195,7 @@ export class CdpRpcBridge {
     const normalizedHandler = normalizeHandler(handler);
     this.#handler = normalizedHandler.dispatch;
     this.#disposeTarget = normalizedHandler.disposeTarget;
+    this.#disposeContext = normalizedHandler.disposeContext;
     this.#targetId = targetId;
     this.#logger = logger;
     this.#timeoutMs = timeoutMs;
@@ -205,7 +221,7 @@ export class CdpRpcBridge {
 
     subscribe("Runtime.bindingCalled", (params) => {
       void this.#handleBindingCalled(params).catch((error) => {
-        this.#logger.warn?.(`[codex-companion] RPC binding 处理失败：${sanitizeRpcError(error).message}`);
+        this.#warn(`[codex-companion] RPC binding 处理失败：${sanitizeRpcError(error).message}`);
       });
     });
     subscribe("Runtime.executionContextDestroyed", (params) => {
@@ -215,7 +231,7 @@ export class CdpRpcBridge {
       ));
     });
     subscribe("Runtime.executionContextsCleared", () => {
-      this.#abortAll(new RpcBridgeError("RPC_CONTEXT_DESTROYED", "Renderer 执行上下文已清空"));
+      for (const contextId of [...this.#contexts]) this.#abortContext(contextId, new RpcBridgeError("RPC_CONTEXT_DESTROYED", "Renderer 执行上下文已清空"));
     });
     subscribe("close", () => {
       this.detach(new RpcBridgeError("RPC_DISCONNECTED", "Renderer 已断开", { retryable: true }));
@@ -237,6 +253,8 @@ export class CdpRpcBridge {
     this.#rendererGarbageBytes = 0;
     for (const remove of this.#removeListeners.splice(0)) remove();
     this.#abortAll(reason);
+    this.#generations.clear();
+    this.#contexts.clear();
     this.#disposeTargetOnce();
   }
 
@@ -259,6 +277,13 @@ export class CdpRpcBridge {
       return;
     }
 
+    this.#contexts.add(executionContextId);
+    try { this.#acceptGeneration(executionContextId, request); }
+    catch (error) {
+      await this.#sendResponse(executionContextId, { id: request.id, ok: false, error: sanitizeRpcError(error) });
+      return;
+    }
+
     if (request.method === RPC_CANCEL_METHOD) {
       await this.#handleCancellation(executionContextId, request);
       return;
@@ -275,7 +300,7 @@ export class CdpRpcBridge {
     }
 
     const controller = new AbortController();
-    const entry = { controller, executionContextId, requestId: request.id, canReply: true };
+    const entry = { controller, executionContextId, requestId: request.id, cardId: request.cardId, generation: request.generation, canReply: true };
     this.#pending.set(key, entry);
 
     let rejectOnAbort;
@@ -294,7 +319,8 @@ export class CdpRpcBridge {
           signal: controller.signal,
           requestId: request.id,
           targetId: this.#targetId,
-          executionContextId
+          executionContextId,
+          ...(request.cardId === undefined ? {} : { cardId: request.cardId, generation: request.generation })
         })),
         aborted
       ]);
@@ -309,7 +335,7 @@ export class CdpRpcBridge {
       }
     } catch (error) {
       if (error?.code === "RPC_RESPONSE_TOO_LARGE") {
-        this.#logger.warn?.(
+        this.#warn(
           `[codex-companion] ${request.method} RPC 返回值超过大小限制：${error.responseLength} 字符`
         );
       }
@@ -327,13 +353,30 @@ export class CdpRpcBridge {
     }
   }
 
+  #acceptGeneration(executionContextId, request) {
+    if (request.cardId === undefined) return;
+    const key = JSON.stringify([executionContextId, request.cardId]);
+    const previous = this.#generations.get(key);
+    if (previous && request.generation < previous.generation) throw new RpcBridgeError("RPC_STALE_GENERATION", "卡片实例已过期");
+    if (request.method === RPC_CANCEL_METHOD) return;
+    this.#generations.set(key, { executionContextId, generation: request.generation });
+    const disposing = request.method === `${request.cardId}.lifecycle.dispose`;
+    if (!disposing && previous?.generation === request.generation) return;
+    for (const entry of this.#pending.values()) {
+      if (entry.executionContextId !== executionContextId || entry.cardId !== request.cardId) continue;
+      if (entry.generation < request.generation || (disposing && entry.generation === request.generation)) {
+        entry.controller.abort(new RpcBridgeError("RPC_CANCELLED", "卡片实例已替换或关闭"));
+      }
+    }
+  }
+
   async #handleCancellation(executionContextId, request) {
     const targetRequestId = request.params.requestId;
     let cancelled = false;
 
     if (isRequestId(targetRequestId)) {
       const entry = this.#pending.get(requestKey(executionContextId, targetRequestId));
-      if (entry && !entry.controller.signal.aborted) {
+      if (entry && entry.cardId === request.cardId && entry.generation === request.generation && !entry.controller.signal.aborted) {
         cancelled = true;
         entry.controller.abort(new RpcBridgeError("RPC_CANCELLED", "RPC 请求已取消"));
       }
@@ -353,6 +396,11 @@ export class CdpRpcBridge {
       entry.canReply = false;
       entry.controller.abort(reason);
     }
+    this.#contexts.delete(executionContextId);
+    for (const [key, value] of this.#generations) if (value.executionContextId === executionContextId) this.#generations.delete(key);
+    if (this.#disposeContext) Promise.resolve().then(() => this.#disposeContext(this.#targetId, executionContextId)).catch(error => {
+      this.#warn(`[codex-companion] 清理 renderer 上下文失败：${sanitizeRpcError(error).message}`);
+    });
   }
 
   #abortAll(reason) {
@@ -368,7 +416,7 @@ export class CdpRpcBridge {
     Promise.resolve()
       .then(() => this.#disposeTarget(this.#targetId))
       .catch((error) => {
-        this.#logger.warn?.(`[codex-companion] 清理 renderer ${this.#targetId} 失败：${sanitizeRpcError(error).message}`);
+        this.#warn(`[codex-companion] 清理 renderer ${this.#targetId} 失败：${sanitizeRpcError(error).message}`);
       });
   }
 
@@ -376,7 +424,7 @@ export class CdpRpcBridge {
     // 响应作为 CDP 调用参数传入，绝不拼进 JavaScript 源码。Runtime.evaluate 会让 V8
     // 为每个不同的大响应创建匿名脚本，视频 Base64 因此在 ScriptStore 中长期滞留。
     const evaluation = await this.#connection.send("Runtime.callFunctionOn", {
-      functionDeclaration: `function(response) { const emby = globalThis[${JSON.stringify(this.#bridgeKey)}]?.emby; if (typeof emby?.receiveRpc !== "function") return false; emby.receiveRpc(response); return true; }`,
+      functionDeclaration: `function(response) { const bridge = globalThis[${JSON.stringify(this.#bridgeKey)}]; const sink = typeof bridge?.runtime?.receiveRpc === "function" ? bridge.runtime : bridge?.emby; if (typeof sink?.receiveRpc !== "function") return false; sink.receiveRpc(response); return true; }`,
       executionContextId,
       arguments: [{ value: response }],
       awaitPromise: false,
@@ -387,6 +435,10 @@ export class CdpRpcBridge {
     if (evaluation?.exceptionDetails || evaluation?.result?.value !== true) {
       throw new RpcBridgeError("RPC_DELIVERY_FAILED", "RPC 响应无法投递到 Renderer", { retryable: true });
     }
+  }
+
+  #warn(message) {
+    Promise.resolve().then(() => this.#logger.warn?.(message)).catch(() => {});
   }
 
   #recordRendererGarbage(serializedLength) {
@@ -409,7 +461,7 @@ export class CdpRpcBridge {
       this.#rendererGcInFlight = true;
       void this.#connection.send("HeapProfiler.collectGarbage").catch((error) => {
         if (this.#attached) {
-          this.#logger.warn?.(`[codex-companion] Renderer 媒体内存回收失败：${sanitizeRpcError(error).message}`);
+          this.#warn(`[codex-companion] Renderer 媒体内存回收失败：${sanitizeRpcError(error).message}`);
         }
       }).finally(() => {
         this.#rendererGcInFlight = false;

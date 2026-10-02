@@ -1,6 +1,7 @@
 import { CdpConnection } from "./cdp-connection.mjs";
-import { buildInjectionSource, INJECTION_VERSION } from "./injection.mjs";
-import { normalizeCardOrder } from "./companion-config.mjs";
+import { buildInjectionSource, buildConfigUpdateSource, ARTIFACT_HASH, BRIDGE_KEY } from "./injection.mjs";
+import { CARD_MANIFESTS } from "./card-registry.mjs";
+import { normalizeRuntimeConfig } from "./platform/config/runtime-config.mjs";
 import { CdpRpcBridge, DEFAULT_RPC_TIMEOUT_MS } from "./rpc-bridge.mjs";
 import { filterCodexTargets, isCodexAppTarget, listCdpTargets, waitForCodexTargets } from "./targets.mjs";
 
@@ -27,6 +28,9 @@ export class CodexInjector {
     cards,
     placement,
     cardOrder,
+    order,
+    revision,
+    config,
     enabled
   } = {}) {
     if (rpcHandler !== undefined && embyService !== undefined && rpcHandler !== embyService) {
@@ -40,19 +44,7 @@ export class CodexInjector {
       throw new TypeError("runtimePrelude 必须是字符串");
     }
     this.#runtimePrelude = runtimePrelude;
-    this.#config = this.#normalizeConfig({ cards, placement, cardOrder, enabled });
-  }
-
-  #normalizeConfig({ cards, placement, cardOrder, enabled } = {}) {
-    return {
-      enabled: enabled !== false,
-      cards: {
-        hongguo: cards?.hongguo !== false,
-        emby: cards?.emby !== false
-      },
-      placement: placement === "inline-in-summary" ? "inline-in-summary" : "standalone-button",
-      cardOrder: normalizeCardOrder(cardOrder)
-    };
+    this.#config = normalizeRuntimeConfig(config ?? { cards, placement, cardOrder, order, revision, enabled }, CARD_MANIFESTS);
   }
 
   get enabled() {
@@ -60,7 +52,7 @@ export class CodexInjector {
   }
 
   get cards() {
-    return { ...this.#config.cards };
+    return Object.fromEntries(Object.entries(this.#config.cards).map(([id, value]) => [id, value.enabled]));
   }
 
   get placement() {
@@ -68,31 +60,62 @@ export class CodexInjector {
   }
 
   get cardOrder() {
-    return [...this.#config.cardOrder];
+    return [...this.#config.order];
   }
 
-  /**
-   * 运行时更新配置（总开关 / 卡片开关 / placement / 顺序）。下一轮扫描会发现
-   * cardsKey 不匹配（或总开关已关闭）并自动重注入/卸载，因此这里只需更新期望值。
-   */
-  setConfig({ cards, placement, cardOrder, enabled } = {}) {
-    this.#config = this.#normalizeConfig({
-      cards: cards ?? this.#config.cards,
+  get config() {
+    return normalizeRuntimeConfig(this.#config, CARD_MANIFESTS);
+  }
+
+  // 配置身份与构建身份独立：下一次扫描仅对当前 runtime 调用 applyConfig。
+  setConfig({ config, cards, placement, cardOrder, order, revision, enabled } = {}) {
+    const mergedCards = Object.assign(Object.create(null), this.#config.cards);
+    if (cards && typeof cards === "object" && !Array.isArray(cards)) {
+      for (const [id, value] of Object.entries(cards)) {
+        mergedCards[id] = typeof value === "boolean"
+          ? { ...mergedCards[id], enabled: value }
+          : { ...mergedCards[id], ...value };
+      }
+    }
+    const next = normalizeRuntimeConfig(config ?? {
+      cards: mergedCards,
       placement: placement ?? this.#config.placement,
-      cardOrder: cardOrder ?? this.#config.cardOrder,
-      enabled: enabled ?? this.#config.enabled
+      order: order ?? cardOrder ?? this.#config.order,
+      revision: revision ?? this.#config.revision,
+      enabled: enabled ?? this.#config.enabled,
+    }, CARD_MANIFESTS);
+    if (next.revision !== null && this.#config.revision !== null && next.revision < this.#config.revision) return false;
+    this.#config = next;
+    return true;
+  }
+
+  #buildMountSource(config = this.#config) {
+    const source = buildInjectionSource("mount", { config });
+    return this.#runtimePrelude ? `${this.#runtimePrelude}\n;${source}` : source;
+  }
+
+  async #registerNewDocument(connection, target, config, force = false) {
+    const configKey = JSON.stringify(config);
+    const previous = this.#newDocumentScripts.get(target.id);
+    if (!force && previous?.configKey === configKey) return;
+    if (previous?.identifier) {
+      // CDP 重连后旧注册可能已被浏览器撤销，允许此时重新登记。
+      await connection.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: previous.identifier }).catch(() => {});
+      this.#newDocumentScripts.delete(target.id);
+    }
+    // 仅替换导航脚本注册；当前文档不会执行 bundle。
+    const registered = await connection.send("Page.addScriptToEvaluateOnNewDocument", { source: this.#buildMountSource(config) });
+    if (registered?.identifier) this.#newDocumentScripts.set(target.id, { identifier: registered.identifier, configKey });
+  }
+
+  async #evaluate(connection, expression) {
+    const evaluation = await connection.send("Runtime.evaluate", {
+      expression, awaitPromise: true, returnByValue: true, userGesture: false,
     });
-  }
-
-  // 挂载身份：注入版本 + placement + 卡片开关 + 卡片顺序。renderer 侧 bridge 暴露
-  // 同样的 cardsKey，健康检查据此判断是否需要以新配置重注入。
-  #expectedCardsKey() {
-    const { cards, placement, cardOrder } = this.#config;
-    return `${INJECTION_VERSION}:${placement}:${cards.hongguo ? "1" : "0"}${cards.emby ? "1" : "0"}:${cardOrder.join(",")}`;
-  }
-
-  #buildMountSource() {
-    return buildInjectionSource("mount", this.#config);
+    if (evaluation.exceptionDetails) {
+      throw new Error(evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text ?? "未知 JavaScript 异常");
+    }
+    return evaluation;
   }
 
   async injectOnce(action = "mount") {
@@ -168,39 +191,29 @@ export class CodexInjector {
         session.rpcBridge?.detach();
         session.connection.close();
         this.#sessions.delete(targetId);
-        this.#newDocumentScripts.delete(targetId);
+        if (!liveIds.has(targetId)) this.#newDocumentScripts.delete(targetId);
         continue;
       }
-      // 确保绑定总是已注册（页面重载后绑定会丢失）；cardsKey 变化（配置更新）也会触发重注入
       try {
-        const check = await session.connection.send("Runtime.evaluate", {
-          expression: `window.__CODEX_COMPANION__?.cardsKey ?? null`,
-          returnByValue: true
-        });
-        if (!this.#config.enabled) {
-          // 注入总开关关闭：对已挂载的页面执行 unmount（含 rail/host/bridge），
-          // 会话保留——重新打开时经下方 cardsKey 健康检查自动重挂载，无需重启 Codex。
-          if (check.result?.value !== null && check.result?.value !== undefined) {
-            this.#logger.info(`[codex-companion] 总开关关闭，卸载页面卡片：${targetId}`);
-            await this.#apply(session.connection, session.target, "unmount", false);
+        const config = this.#config;
+        const check = await this.#evaluate(session.connection, `(() => {
+          const bridge = globalThis[${JSON.stringify(BRIDGE_KEY)}];
+          return { artifactHash: bridge?.artifactHash ?? null,
+            mounted: bridge?.runtime?.isMounted?.() === true,
+            config: bridge?.runtime?.getConfig?.() ?? null };
+        })()`);
+        if (this.#stopped) return;
+        await this.#registerNewDocument(session.connection, session.target, config);
+        if (this.#stopped) return;
+        const health = check.result?.value;
+        if (health?.artifactHash === ARTIFACT_HASH && health?.mounted === true) {
+          // 页面可能刚执行了旧导航脚本；不能仅相信 Node 侧上次推送的配置。
+          if (JSON.stringify(health.config) !== JSON.stringify(config)) {
+            await this.#evaluate(session.connection, buildConfigUpdateSource(config));
           }
-          continue;
-        }
-        if (check.result?.value !== this.#expectedCardsKey()) {
+        } else {
           this.#logger.info(`[codex-companion] 重新注入页面：${targetId}`);
-          const mountSource = this.#buildMountSource();
-          const expression = this.#runtimePrelude
-            ? `${this.#runtimePrelude}\n;${mountSource}`
-            : mountSource;
-          const evaluation = await session.connection.send("Runtime.evaluate", {
-            expression,
-            awaitPromise: true,
-            returnByValue: true,
-            userGesture: false
-          });
-          if (evaluation.exceptionDetails) {
-            throw new Error(evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text);
-          }
+          await this.#evaluate(session.connection, this.#buildMountSource(config));
         }
       } catch (error) {
         // 健康检查失败通常意味着这条连接已经不可用；记录下来便于诊断“卡片在但按钮无响应”，
@@ -224,6 +237,11 @@ export class CodexInjector {
           continue;
         }
         const { result, rpcBridge } = await this.#apply(connection, target, "mount", true);
+        if (this.#stopped) {
+          rpcBridge?.detach();
+          connection.close();
+          return;
+        }
         this.#sessions.set(target.id, { connection, target, rpcBridge });
         this.#logger.info(`[codex-companion] 已注入 ${target.title || target.url}：${result.status}`);
       } catch (error) {
@@ -264,12 +282,8 @@ export class CodexInjector {
   }
 
   async #apply(connection, target, action, installOnNewDocument) {
-    const injectionSource = action === "mount"
-      ? this.#buildMountSource()
-      : buildInjectionSource(action);
-    const expression = action === "mount" && this.#runtimePrelude
-      ? `${this.#runtimePrelude}\n;${injectionSource}`
-      : injectionSource;
+    const config = this.#config;
+    const expression = action === "mount" ? this.#buildMountSource(config) : buildInjectionSource(action);
     await connection.send("Page.enable");
     await connection.send("Runtime.enable");
 
@@ -286,30 +300,9 @@ export class CodexInjector {
 
     try {
       if (installOnNewDocument && action === "mount") {
-        // 同一 target 重连/重挂时先撤掉旧注册：否则每次重连都新注册一份，
-        // 导航后 mount 脚本会执行 N 遍（脚本本身幂等，但纯浪费）。
-        const previousScriptId = this.#newDocumentScripts.get(target.id);
-        if (previousScriptId) {
-          await connection.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: previousScriptId }).catch(() => {});
-          this.#newDocumentScripts.delete(target.id);
-        }
-        const registered = await connection.send("Page.addScriptToEvaluateOnNewDocument", { source: expression });
-        if (registered?.identifier) this.#newDocumentScripts.set(target.id, registered.identifier);
+        await this.#registerNewDocument(connection, target, config, true);
       }
-
-      const evaluation = await connection.send("Runtime.evaluate", {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-        userGesture: false
-      });
-
-      if (evaluation.exceptionDetails) {
-        const description = evaluation.exceptionDetails.exception?.description
-          ?? evaluation.exceptionDetails.text
-          ?? "未知 JavaScript 异常";
-        throw new Error(description);
-      }
+      const evaluation = await this.#evaluate(connection, expression);
 
       return {
         rpcBridge,

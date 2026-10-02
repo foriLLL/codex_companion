@@ -54,13 +54,32 @@ export async function findRunningCodex(executable = DEFAULT_CODEX_EXECUTABLE, op
   return processes.map((entry) => entry.pid);
 }
 
-export function launchCodex({ executable = DEFAULT_CODEX_EXECUTABLE, port }) {
-  const child = spawn(executable, [
+export function buildCodexLaunchEnvironment(proxyPort, baseEnvironment = process.env) {
+  const environment = { ...baseEnvironment };
+  // 代理是本次 Codex 启动的显式选择，避免继承 Companion 进程的旧代理值。
+  for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    delete environment[name];
+  }
+  if (proxyPort !== null && proxyPort !== undefined) {
+    if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65_535) {
+      throw new RangeError("代理端口必须是 1–65535 的整数");
+    }
+    const proxy = `http://127.0.0.1:${proxyPort}`;
+    environment.HTTP_PROXY = proxy;
+    environment.HTTPS_PROXY = proxy;
+  }
+  return environment;
+}
+
+export function launchCodex({ executable = DEFAULT_CODEX_EXECUTABLE, port, proxyPort = null, spawnImpl = spawn }) {
+  const environment = buildCodexLaunchEnvironment(proxyPort);
+  const child = spawnImpl(executable, [
     "--remote-debugging-address=127.0.0.1",
     `--remote-debugging-port=${port}`
   ], {
     detached: true,
-    stdio: "ignore"
+    stdio: "ignore",
+    env: environment
   });
   child.unref();
   return child.pid;

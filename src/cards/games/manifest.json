@@ -1,0 +1,11 @@
+{
+  "id": "games",
+  "title": "摸鱼",
+  "version": 1,
+  "defaultEnabled": true,
+  "defaultOrder": 10,
+  "layout": { "height": "content", "minHeight": 440, "scroll": "outer" },
+  "lifecycle": { "hidden": "retain", "start": "first-visible" },
+  "state": { "scope": "target", "version": 1 },
+  "capabilities": ["storage"]
+}

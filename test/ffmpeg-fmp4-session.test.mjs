@@ -649,3 +649,49 @@ test("next() 批量在超过字节上限时分批", async () => {
   assert.equal(first.segments.length, 1, "超过批量上限时不应把第二个塞进同一批");
   assert.equal(session.queue.length, 1);
 });
+
+test("seek 后旧 FFmpeg 的迟到 error 不得终止新进程", async (t) => {
+  const children = [];
+  const session = new FfmpegFmp4Session({
+    mediaSource: { MediaStreams: [{ Type: "Video", Codec: "h264" }] },
+    readRange: async () => ({ bytes: Buffer.alloc(0), total: 1 }),
+    ffmpegPathImpl: "/mock/retired-child",
+    platform: "linux",
+    spawnImpl: () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.exitCode = child.signalCode = null;
+      child.kill = (signal) => { child.signalCode = signal; return true; };
+      children.push(child);
+      queueMicrotask(() => child.stdout.write(Buffer.concat([mp4Box("ftyp"), mp4Box("moov"), mp4Box("moof"), mp4Box("mdat")])));
+      return child;
+    }
+  });
+  t.after(() => session.destroy());
+  await session.initialize();
+  await session.seek(20);
+  children[0].emit("error", new Error("retired child"));
+  assert.equal(children[1].signalCode, null);
+  assert.equal((await session.next()).segments.length, 1);
+});
+
+test("FFmpeg 正常退出却没有初始化数据时立即失败，不等 40 秒超时", { timeout: 3000 }, async (t) => {
+  const session = new FfmpegFmp4Session({
+    mediaSource: { MediaStreams: [{ Type: "Video", Codec: "h264" }] },
+    readRange: async () => ({ bytes: Buffer.alloc(0), total: 1 }),
+    ffmpegPathImpl: "/mock/empty-output",
+    platform: "linux",
+    spawnImpl: () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.exitCode = child.signalCode = null;
+      child.kill = () => true;
+      queueMicrotask(() => { child.exitCode = 0; child.emit("exit", 0, null); });
+      return child;
+    }
+  });
+  t.after(() => session.destroy());
+  await assert.rejects(session.initialize(), { code: "FFMPEG_OUTPUT_INVALID" });
+});

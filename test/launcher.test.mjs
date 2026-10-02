@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { inspectRunningCodex, findRunningCodex, DEFAULT_CODEX_EXECUTABLE } from "../src/launcher.mjs";
+import { inspectRunningCodex, findRunningCodex, DEFAULT_CODEX_EXECUTABLE, launchCodex, buildCodexLaunchEnvironment } from "../src/launcher.mjs";
 
 function fakePs(lines) {
   return async () => ({ stdout: lines.join("\n") });
@@ -38,4 +38,32 @@ test("无匹配进程返回空", async () => {
     execFileImpl: fakePs(["  300 /usr/bin/other", ""])
   });
   assert.deepEqual(processes, []);
+});
+
+test("Codex 启动仅给子进程设置勾选的本机代理并保留 CDP loopback", () => {
+  let captured;
+  let unrefCount = 0;
+  const spawnImpl = (executable, args, options) => {
+    captured = { executable, args, options };
+    return { pid: 42, unref() { unrefCount += 1; } };
+  };
+  const before = [process.env.HTTP_PROXY, process.env.HTTPS_PROXY, process.env.ALL_PROXY];
+  const pid = launchCodex({ executable: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", port: 53421,
+    proxyPort: 7890, spawnImpl });
+  assert.equal(pid, 42);
+  assert.equal(unrefCount, 1);
+  assert.deepEqual(captured.args, ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=53421"]);
+  assert.equal(captured.options.env.HTTP_PROXY, "http://127.0.0.1:7890");
+  assert.equal(captured.options.env.HTTPS_PROXY, "http://127.0.0.1:7890");
+  assert.deepEqual([process.env.HTTP_PROXY, process.env.HTTPS_PROXY, process.env.ALL_PROXY], before,
+    "Companion 本身的代理环境不得被修改");
+});
+
+test("未勾选代理时清理从父进程继承的代理值", () => {
+  const environment = buildCodexLaunchEnvironment(null, {
+    HTTP_PROXY: "http://old:1", https_proxy: "http://old:2", ALL_PROXY: "socks5://old:3", OTHER: "keep"
+  });
+  assert.deepEqual(environment, { OTHER: "keep" });
+  assert.throws(() => buildCodexLaunchEnvironment(0), RangeError);
+  assert.throws(() => buildCodexLaunchEnvironment(65536), RangeError);
 });

@@ -14,6 +14,25 @@ import {
   validateSameOriginResource
 } from "../src/emby-client.mjs";
 
+test("字幕下载不被占满的封面队列阻塞", async () => {
+  let releaseImage;
+  const imageBlocked = new Promise((resolve) => { releaseImage = resolve; });
+  const client = new EmbyClient({
+    baseUrl: "https://emby.example", deviceId: "test", resourceConcurrency: 1,
+    fetchImpl: async (url) => {
+      if (String(url).includes("poster")) await imageBlocked;
+      return new Response("WEBVTT\n\n", { status: 200 });
+    }
+  });
+  const image = client.loadResource("https://emby.example/poster");
+  try {
+    const result = await client.loadResource("https://emby.example/subtitle.vtt", {
+      resourceType: "subtitle", signal: AbortSignal.timeout(500)
+    });
+    assert.equal(new TextDecoder().decode(result.bytes), "WEBVTT\n\n");
+  } finally { releaseImage(); await image; client.close(); }
+});
+
 async function listen(handler) {
   const server = createServer(handler);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));

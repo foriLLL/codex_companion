@@ -904,6 +904,11 @@ test("文字字幕通过 VTT RPC 即时切换，字幕索引随播放状态上�
   assert.match(loaded.data, /^WEBVTT/);
   const originalLoadResource = subtitleClient.loadResource;
   subtitleClient.loadResource = async () => ({ bytes: Uint8Array.of(0xff, 0xfe) });
+  assert.equal((await service.handleRpc("playback.subtitle.load", {
+    playbackId: opened.playbackId, subtitleStreamIndex: 2
+  })).data, loaded.data, "同一播放会话重复选择应直接命中字幕缓存");
+  service.playbacks.get(opened.playbackId).subtitleLoader.cache.clear();
+  service.playbacks.get(opened.playbackId).subtitleFullLoader.cache.clear();
   await assert.rejects(
     service.handleRpc("playback.subtitle.load", {
       playbackId: opened.playbackId,
@@ -1320,7 +1325,6 @@ Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,私有 ASS 字幕`)
     subtitleStreamIndex: 2
   });
   assert.deepEqual(resourceUrls, [
-    "https://emby.example/emby/Videos/movie/direct-source/Subtitles/2/Stream.ass",
     "https://emby.example/emby/private/subtitle.ass"
   ]);
   assert.match(loaded.data, /^WEBVTT/);
@@ -2255,4 +2259,39 @@ test("playback.open 按 preferredSourceKey 切到 1080p mkv 源", async () => {
   assert.equal(opened.mediaSourceId, "src-1080");
   assert.equal(opened.sourceKey, "1080p|mkv#1");
   assert.equal(opened.subtitles.length, 1);
+});
+
+test("内嵌字幕先返回当前窗口，后台完整字幕完成后跳转直接复用", async () => {
+  const config = { baseUrl: "https://emby.example", serverId: "server", userId: "user", deviceId: "device" };
+  let finishFull;
+  const full = new Promise((resolve) => { finishFull = resolve; });
+  let windows = 0;
+  const service = new EmbyService({
+    storage: new FakeStorage(config, "token"),
+    clientFactory: (settings) => {
+      const client = makeClient(settings, []);
+      client.getPlaybackInfo = async () => ({ PlaySessionId: "play", MediaSources: [{
+        Id: "source", Container: "mkv", SupportsDirectStream: true, DirectStreamUrl: "/stream.mkv",
+        MediaStreams: [{ Type: "Video", Index: 0, Codec: "hevc" },
+          { Type: "Subtitle", Index: 2, Codec: "subrip", IsTextSubtitleStream: true }]
+      }] });
+      client.openDirectRangeStream = async () => { throw new Error("由测试窗口提取器接管"); };
+      client.loadResource = () => full;
+      return client;
+    },
+    ffmpegSessionFactory: () => ({ destroy() {} }),
+    subtitleWindowImpl: async () => { windows++; return { data: "WEBVTT\n\n00:01:11.000 --> 00:01:13.000\n当前窗口\n", window: { from: 60, until: 120 } }; }
+  });
+  try {
+    const opened = await service.openPlayback({ itemId: "item" });
+    const first = await service.loadSubtitle({ playbackId: opened.playbackId, subtitleStreamIndex: 2, positionTicks: 900000000 });
+    assert.deepEqual(first.window, { from: 60, until: 120 });
+    assert.equal(windows, 1);
+    finishFull({ bytes: new TextEncoder().encode("WEBVTT\n\n00:03:00.000 --> 00:03:03.000\n完整字幕\n") });
+    await service.playbacks.get(opened.playbackId).subtitleFullLoader.active.promise;
+    const next = await service.loadSubtitle({ playbackId: opened.playbackId, subtitleStreamIndex: 2, positionTicks: 1800000000 });
+    assert.equal(next.window, undefined);
+    assert.match(next.data, /完整字幕/);
+    assert.equal(windows, 1, "完整字幕完成后不应再提取媒体窗口");
+  } finally { finishFull({ bytes: new TextEncoder().encode("WEBVTT\n") }); await service.dispose(); }
 });

@@ -15,7 +15,8 @@ import { delimiter, dirname, join } from "node:path";
 export function resolveFfmpegPath({
   env = process.env,
   execPath = process.execPath,
-  fileExists = existsSync
+  fileExists = existsSync,
+  preferFull = false
 } = {}) {
   const override = env.CODEX_COMPANION_FFMPEG;
   if (typeof override === "string" && override.trim() !== "" && fileExists(override)) {
@@ -31,6 +32,7 @@ export function resolveFfmpegPath({
   const candidates = [
     join(execDir, "ffmpeg"),
     join(execDir, "..", "Resources", "ffmpeg"),
+    ...(preferFull ? ["/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "/usr/local/opt/ffmpeg-full/bin/ffmpeg"] : []),
     ...pathCandidates,
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",

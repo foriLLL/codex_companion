@@ -18,13 +18,14 @@ async function withTempDir(run) {
   }
 }
 
-test("normalize：默认两张卡片全开、placement 默认 standalone，未知字段丢弃，非法值回退默认", () => {
+test("normalize：默认四张卡片全开、placement 默认 standalone，未知字段丢弃，非法值回退默认", () => {
   assert.deepEqual(normalizeCompanionConfig(null), {
     version: 1,
     enabled: true,
     placement: "standalone-button",
-    cards: { hongguo: true, emby: true },
-    cardOrder: ["hongguo", "emby"]
+    cards: { games: true, hongguo: true, riverclub: true, emby: true },
+    cardOrder: ["games", "hongguo", "riverclub", "emby"],
+    riverclubUrl: "https://riverclub.booocai.com/"
   });
   assert.deepEqual(normalizeCompanionConfig({
     version: 99,
@@ -36,8 +37,9 @@ test("normalize：默认两张卡片全开、placement 默认 standalone，未�
     version: 1,
     enabled: true,
     placement: "standalone-button",
-    cards: { hongguo: false, emby: true },
-    cardOrder: ["hongguo", "emby"]
+    cards: { games: true, hongguo: false, riverclub: true, emby: true },
+    cardOrder: ["games", "hongguo", "riverclub", "emby"],
+    riverclubUrl: "https://riverclub.booocai.com/"
   });
   assert.equal(normalizeCompanionConfig({ enabled: false }).enabled, false);
   assert.equal(normalizeCompanionConfig({ placement: "inline-in-summary" }).placement, "inline-in-summary");
@@ -45,11 +47,11 @@ test("normalize：默认两张卡片全开、placement 默认 standalone，未�
 });
 
 test("normalize：cardOrder 白名单过滤、去重、缺失项补末尾", () => {
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "hongguo"] }).cardOrder, ["emby", "hongguo"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby"] }).cardOrder, ["emby", "hongguo"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "emby", "bogus"] }).cardOrder, ["emby", "hongguo"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: "emby" }).cardOrder, ["hongguo", "emby"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: [] }).cardOrder, ["hongguo", "emby"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "hongguo"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "emby", "bogus"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: "emby" }).cardOrder, ["games", "hongguo", "riverclub", "emby"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: [] }).cardOrder, ["games", "hongguo", "riverclub", "emby"]);
 });
 
 test("save 写入 0600 并可 load 回读", async () => {
@@ -66,8 +68,9 @@ test("save 写入 0600 并可 load 回读", async () => {
       version: 1,
       enabled: true,
       placement: "standalone-button",
-      cards: { hongguo: false, emby: true },
-      cardOrder: ["hongguo", "emby"]
+      cards: { games: true, hongguo: false, riverclub: true, emby: true },
+      cardOrder: ["games", "hongguo", "riverclub", "emby"],
+    riverclubUrl: "https://riverclub.booocai.com/"
     });
   });
 });
@@ -81,7 +84,8 @@ test("load：文件缺失或损坏时回退默认，不抛异常", async () => {
       enabled: true,
       placement: "standalone-button",
       cards: { ...DEFAULT_CARDS },
-      cardOrder: ["hongguo", "emby"]
+      cardOrder: ["games", "hongguo", "riverclub", "emby"],
+    riverclubUrl: "https://riverclub.booocai.com/"
     });
 
     await writeFile(path, "{ broken", "utf8");
@@ -90,7 +94,8 @@ test("load：文件缺失或损坏时回退默认，不抛异常", async () => {
       enabled: true,
       placement: "standalone-button",
       cards: { ...DEFAULT_CARDS },
-      cardOrder: ["hongguo", "emby"]
+      cardOrder: ["games", "hongguo", "riverclub", "emby"],
+    riverclubUrl: "https://riverclub.booocai.com/"
     });
   });
 });
@@ -104,4 +109,11 @@ test("save 失败时清理临时文件", async () => {
     await writeFile(join(dir, "missing-parent-as-file"), "occupied", "utf8");
     await assert.rejects(config.save({ cards: DEFAULT_CARDS }));
   });
+});
+
+
+test("River Club URL 限制来源，旧配置迁移到红果之后且保留既有顺序", () => {
+  assert.deepEqual(normalizeCompanionConfig({cardOrder:["hongguo","emby"]}).cardOrder,["games","hongguo","riverclub","emby"]);
+  assert.equal(normalizeCompanionConfig({riverclubUrl:"https://evil.test/"}).riverclubUrl,"https://riverclub.booocai.com/");
+  assert.equal(normalizeCompanionConfig({riverclubUrl:"https://riverclub.booocai.com/?invite=test"}).riverclubUrl,"https://riverclub.booocai.com/?invite=test");
 });

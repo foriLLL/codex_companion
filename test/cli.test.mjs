@@ -15,3 +15,11 @@ test("attach 允许省略 --port（改由运行时状态文件解析），inject
   assert.throws(() => parseArgs(["inject"]), /必须提供 --port/);
   assert.throws(() => parseArgs(["unmount"]), /必须提供 --port/);
 });
+
+test("代理端口只用于 launch，且启动前拒绝无效值", () => {
+  assert.equal(parseArgs(["launch", "--proxy-port", "7890"]).proxyPort, 7890);
+  for (const value of ["0", "65536", "12.5", "-1", "7890;echo bad", "", " 7890"]) {
+    assert.throws(() => parseArgs(["launch", "--proxy-port", value]), /代理端口/);
+  }
+  assert.throws(() => parseArgs(["attach", "--proxy-port", "7890"]), /只能用于 launch/);
+});

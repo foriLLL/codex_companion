@@ -1,4 +1,7 @@
+import { videoColorInfo } from "./video-color.mjs";
+import { SubtitleLoader, extractSubtitleWindow, SUBTITLE_WINDOW_SECONDS } from "./subtitle-loader.mjs";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { assToWebVtt } from "./ass-to-vtt.mjs";
 import {
   DEFAULT_RESOURCE_LIMIT,
@@ -190,7 +193,8 @@ export function mediaSourceSupportsRendererFmp4(mediaSource) {
   const videoCodec = String(videos[0]?.Codec ?? "").toLowerCase();
   const videoBitDepth = Number(videos[0]?.BitDepth);
   const audioCodec = String(audios[0]?.Codec ?? "").toLowerCase();
-  return ["h264", "avc", "avc1"].includes(videoCodec)
+  return !videoColorInfo(mediaSource).requiresToneMapping
+    && ["h264", "avc", "avc1"].includes(videoCodec)
     && (!Number.isFinite(videoBitDepth) || videoBitDepth <= 8)
     && (audios.length === 0 || ["aac", "mp4a"].includes(audioCodec))
     && !mediaSourceExceedsDirectBitrate(mediaSource);
@@ -221,6 +225,7 @@ function mediaSourceBitrate(mediaSource) {
 
 function mediaSourceResolutionRank(mediaSource) {
   const height = mediaSourceHeight(mediaSource);
+  if (Number(mediaSourceVideoStream(mediaSource)?.Width) >= 3800) return 2160;
   // 同一画质档里的轻微裁边（2160 / 2232）不应压过播放成本；用户看到的都是 4K。
   if (height >= 2000) return 2160;
   return height;
@@ -272,7 +277,7 @@ function mseBitrateFor(mediaSource, streamMode, subtitle = null) {
 
 // 归一化的分辨率档（跨集稳定；码率数字会微调，这里丢弃）。
 function resolutionLabel(mediaSource) {
-  const height = mediaSourceHeight(mediaSource);
+  const height = mediaSourceResolutionRank(mediaSource);
   if (height >= 2000) return "4K";
   if (height > 0) return `${height}p`;
   return "SD";
@@ -295,6 +300,8 @@ export function mapMediaSourceOption(mediaSource, ordinal = 0) {
   const hasSubtitles = mediaSourceHasSubtitles(mediaSource);
   const labelParts = [resolution, container.toUpperCase()];
   if (codec) labelParts.push(codec);
+  const color = videoColorInfo(mediaSource);
+  if (color.requiresToneMapping) labelParts.push(color.label);
   return {
     sourceKey: computeSourceKey(mediaSource, ordinal),
     label: labelParts.filter(Boolean).join(" "),
@@ -334,7 +341,10 @@ export function pickMediaSource(mediaSources, {
 
   const playable = list
     .map((source, ordinal) => ({ source, ordinal }))
-    .filter(({ source }) => mediaSourcePlaybackMode(source));
+    .filter(({ source }) => {
+      const mode = mediaSourcePlaybackMode(source);
+      return mode && (mode !== "ffmpeg-fmp4" || localFfmpegAvailable);
+    });
   if (playable.length === 0) return { mediaSource: undefined, ordinal: -1 };
 
   const subtitled = playable.filter(({ source }) => mediaSourceHasSubtitles(source));
@@ -391,6 +401,7 @@ export class EmbyService {
     clientFactory,
     directSessionFactory,
     ffmpegSessionFactory,
+    subtitleWindowImpl = extractSubtitleWindow,
     hlsProxyFactory,
     randomUUIDImpl = randomUUID,
     logger = null,
@@ -416,6 +427,7 @@ export class EmbyService {
     this.clientFactory = clientFactory ?? ((options) => new EmbyClient({ ...options, fetchImpl: this.fetchImpl, resourceLimit }));
     this.directSessionFactory = directSessionFactory ?? ((options) => new DirectMp4Session(options));
     this.ffmpegSessionFactory = ffmpegSessionFactory ?? ((options) => new FfmpegFmp4Session(options));
+    this.subtitleWindowImpl = subtitleWindowImpl;
     this.ffmpegAvailable = typeof ffmpegAvailable === "boolean"
       ? ffmpegAvailable
       : (typeof ffmpegSessionFactory === "function" || Boolean(resolveFfmpegPath()));
@@ -753,54 +765,18 @@ export class EmbyService {
         : null;
 
       // 优先尊重用户偏好；默认在最高画质档内按真实播放成本选源。
-      let { mediaSource } = pickMediaSource(mediaSources, {
+      const { mediaSource } = pickMediaSource(mediaSources, {
         preferredSourceKey,
         localFfmpegAvailable: this.ffmpegAvailable
       });
-      if (!mediaSource) {
-        const fallbackTranscoding = mediaSources.find((source) => {
-          return source?.SupportsTranscoding === true
-            || (typeof source?.TranscodingUrl === "string" && source.TranscodingUrl.length > 0);
-        });
-        const fallbackDirect = mediaSources.find((source) => {
-          const container = String(source?.Container ?? "").toLowerCase();
-          return !fallbackTranscoding
-            && (source?.SupportsDirectPlay === true || source?.SupportsDirectStream === true)
-            && ["mp4", "m4v", "mov"].includes(container)
-            && mediaSourceSupportsRendererFmp4(source)
-            && typeof source?.DirectStreamUrl === "string"
-            && source.DirectStreamUrl.length > 0;
-        });
-        const fallbackFfmpeg = mediaSources.find((source) => {
-          return !fallbackTranscoding
-            && !fallbackDirect
-            && (source?.SupportsDirectPlay === true || source?.SupportsDirectStream === true)
-            && typeof source?.DirectStreamUrl === "string"
-            && source.DirectStreamUrl.length > 0;
-        });
-        mediaSource = fallbackTranscoding ?? fallbackDirect ?? fallbackFfmpeg;
+      const selectedMode = mediaSourcePlaybackMode(mediaSource);
+      if (!selectedMode) throw new EmbyError("NOT_PLAYABLE", "Emby 未返回可播放的媒体源");
+      if (selectedMode === "ffmpeg-fmp4" && !this.ffmpegAvailable) {
+        throw new EmbyError("FFMPEG_UNAVAILABLE", "此片源需要系统 FFmpeg；请选择兼容片源或安装 FFmpeg");
       }
-
-      // 分类「已选中的源」以决定 streamMode 与流搭建方式（保持与原优先级一致：可转码→hls，
-      // 否则 mp4/m4v/mov 直连→direct-mp4，其它容器→ffmpeg-fmp4）。
-      const selectedContainer = String(mediaSource?.Container ?? "").toLowerCase();
-      const selectedSupportsDirect = mediaSource?.SupportsDirectPlay === true
-        || mediaSource?.SupportsDirectStream === true;
-      const selectedHasDirectUrl = typeof mediaSource?.DirectStreamUrl === "string"
-        && mediaSource.DirectStreamUrl.length > 0;
-      const selectedSupportsTranscoding = mediaSource?.SupportsTranscoding === true
-        || (typeof mediaSource?.TranscodingUrl === "string" && mediaSource.TranscodingUrl.length > 0);
-      const transcodingSource = selectedSupportsTranscoding ? mediaSource : null;
-      const directSource = !transcodingSource
-        && selectedSupportsDirect
-        && selectedHasDirectUrl
-        && ["mp4", "m4v", "mov"].includes(selectedContainer)
-        && mediaSourceSupportsRendererFmp4(mediaSource)
-        ? mediaSource
-        : null;
-      const ffmpegSource = !transcodingSource && !directSource && selectedSupportsDirect && selectedHasDirectUrl
-        ? mediaSource
-        : null;
+      const transcodingSource = selectedMode === "hls" ? mediaSource : null;
+      const directSource = selectedMode === "direct-mp4" ? mediaSource : null;
+      const ffmpegSource = selectedMode === "ffmpeg-fmp4" ? mediaSource : null;
       const mediaSourceId = mediaSource?.Id;
       const playSessionId = playbackInfo?.PlaySessionId;
       if (!mediaSourceId || !playSessionId) {
@@ -808,7 +784,7 @@ export class EmbyService {
       }
 
       const playbackId = this.randomUUIDImpl();
-      const baseStreamMode = transcodingSource ? "hls" : (directSource ? "direct-mp4" : "ffmpeg-fmp4");
+      const baseStreamMode = selectedMode;
       const subtitles = mapSubtitleStreams(mediaSource);
       const preferredSubtitle = preferredSubtitleIndexFromPreference(subtitles, params?.subtitlePreference);
       const selectedSubtitleStreamIndex = preferredSubtitle !== undefined
@@ -955,6 +931,8 @@ export class EmbyService {
         await this.#reportPlaybackStartedBestEffort(client, session, { signal });
       } catch (error) {
         this.playbacks.delete(playbackId);
+        session.subtitleLoader?.dispose();
+        session.subtitleFullLoader?.dispose();
         session.directSession?.destroy();
         if (transcodingSource) await client.stopActiveEncoding(playSessionId).catch(() => {});
         throw error;
@@ -970,7 +948,7 @@ export class EmbyService {
         selectedSubtitleIndex: selectedSubtitleStreamIndex,
         subtitleMode,
         // 播放界面 chrome 透出的画质标签（与选源 chips 同源：分辨率档 + 容器 + 编码）
-        qualityLabel: mapMediaSourceOption(mediaSource).label,
+        qualityLabel: mapMediaSourceOption(mediaSource).label + (streamMode === "ffmpeg-fmp4" && videoColorInfo(mediaSource).requiresToneMapping ? " → SDR" : ""),
         sourceKey: mediaSourceId
           ? computeSourceKey(mediaSource, mediaSources.indexOf(mediaSource))
           : null
@@ -1006,50 +984,85 @@ export class EmbyService {
     if (subtitle.mode !== "external-vtt") {
       throw new EmbyError("SUBTITLE_REQUIRES_BURN_IN", "该字幕必须通过视频转码显示");
     }
+    signal?.throwIfAborted();
     return this.#withSession(async (client) => {
-      const styledText = STYLED_SUBTITLE_CODECS.has(subtitle.codec);
-      const standardUrl = client.subtitleUrl(session.itemId, session.mediaSourceId, subtitle.index, {
-        format: styledText ? "ass" : "vtt",
-        startPositionTicks: 0
+      const positionSeconds = Math.max(0, Number(params.positionTicks ?? session.positionTicks) || 0) / 10_000_000;
+      const local = !subtitle.isExternal && session.readRange && this.ffmpegAvailable
+        && typeof client.openDirectRangeStream === "function" && this.subtitleWindowImpl;
+      session.subtitleLoader ??= new SubtitleLoader();
+      session.subtitleFullLoader ??= new SubtitleLoader();
+      const fullKey = `${session.mediaSourceId}:${subtitle.index}:full`;
+      const fullReady = session.subtitleFullLoader.cache.has(fullKey);
+      const key = `${session.mediaSourceId}:${subtitle.index}:${local && !fullReady ? Math.floor(positionSeconds / SUBTITLE_WINDOW_SECONDS) : "full"}`;
+      return session.subtitleLoader.load(key, async (loadSignal) => {
+        // 当前片段先显示；同时准备完整字幕。一旦完整结果可用，之后不再逐段请求媒体。
+        const full = session.subtitleFullLoader.load(fullKey, (fullSignal) => this.#fetchSubtitle(client, session, subtitle, fullSignal));
+        let result;
+        if (local && !fullReady) {
+          const controller = new AbortController();
+          const abort = () => controller.abort(loadSignal.reason);
+          loadSignal.addEventListener("abort", abort, { once: true });
+          if (loadSignal.aborted) abort();
+          // 服务端已缓存的字幕通常瞬间返回；给它短暂先手，避免无谓启动 FFmpeg。
+          const window = delay(300, undefined, { signal: controller.signal }).then(() => this.subtitleWindowImpl({
+              readRange: session.readRange, openRangeStream: session.openRangeStream,
+              index: subtitle.index, positionSeconds, signal: controller.signal
+            }));
+          try {
+            result = await Promise.any([window, full]);
+          } catch (error) {
+            if (loadSignal.aborted) throw error;
+            throw error.errors?.at(-1) ?? error;
+          } finally {
+            loadSignal.removeEventListener("abort", abort);
+            controller.abort();
+          }
+        } else result = await full;
+        return { ...result, encoding: "utf8", contentType: "text/vtt", subtitleStreamIndex: subtitle.index };
       });
-      const source = session.subtitleSources?.get(subtitle.index);
-      const urls = [standardUrl];
-      if (styledText && subtitle.isExternal && source?.DeliveryUrl) {
-        urls.push(new URL(source.DeliveryUrl, `${client.baseUrl}/`).href);
-      }
-      let result = null;
-      let lastError = null;
-      for (const url of [...new Set(urls)]) {
-        try {
-          result = await client.loadResource(url, {
-            signal,
-            responseType: "bytes",
-            maxBytes: DEFAULT_SUBTITLE_LIMIT
-          });
-          break;
-        } catch (error) {
-          if (signal?.aborted || error?.code === "CANCELLED") throw error;
-          lastError = error;
-        }
-      }
-      if (!result) throw lastError;
-      let text;
-      try {
-        text = new TextDecoder("utf-8", { fatal: true }).decode(result.bytes).replace(/^\uFEFF/, "");
-      } catch (cause) {
-        throw new EmbyError("INVALID_SUBTITLE_ENCODING", "Emby 字幕不是有效 UTF-8 文本", { cause });
-      }
-      if (styledText) text = assToWebVtt(text);
-      if (!/^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)/.test(text)) {
-        throw new EmbyError("INVALID_SUBTITLE_RESPONSE", "Emby 返回的字幕不是有效 WebVTT");
-      }
-      return {
-        data: text,
-        encoding: "utf8",
-        contentType: "text/vtt",
-        subtitleStreamIndex: subtitle.index
-      };
     });
+  }
+
+  async #fetchSubtitle(client, session, subtitle, signal) {
+    const styledText = STYLED_SUBTITLE_CODECS.has(subtitle.codec);
+    const standardUrl = client.subtitleUrl(session.itemId, session.mediaSourceId, subtitle.index, {
+      format: styledText ? "ass" : "vtt",
+      startPositionTicks: 0
+    });
+    const source = session.subtitleSources?.get(subtitle.index);
+    const urls = [];
+    if (subtitle.isExternal && source?.DeliveryUrl && (styledText || /\.vtt(?:\?|$)/i.test(source.DeliveryUrl))) {
+      urls.push(new URL(source.DeliveryUrl, `${client.baseUrl}/`).href);
+    }
+    urls.push(standardUrl);
+    let result = null;
+    let lastError = null;
+    for (const url of [...new Set(urls)]) {
+      try {
+        result = await client.loadResource(url, {
+          signal,
+          responseType: "bytes",
+          resourceType: "subtitle",
+          maxBytes: DEFAULT_SUBTITLE_LIMIT
+        });
+        break;
+      } catch (error) {
+        if (signal?.aborted || error?.code === "CANCELLED") throw error;
+        lastError = error;
+      }
+    }
+    if (!result) throw lastError;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(result.bytes).replace(/^\uFEFF/, "");
+    } catch (cause) {
+      throw new EmbyError("INVALID_SUBTITLE_ENCODING", "Emby 字幕不是有效 UTF-8 文本", { cause });
+    }
+    if (styledText) text = assToWebVtt(text);
+    if (!/^WEBVTT(?:[ \t][^\r\n]*)?(?:\r?\n|$)/.test(text)) {
+      throw new EmbyError("INVALID_SUBTITLE_RESPONSE", "Emby 返回的字幕不是有效 WebVTT");
+    }
+    return { data: text };
   }
 
   async selectSubtitle(params, { signal } = {}) {
@@ -1072,6 +1085,10 @@ export class EmbyService {
       : Math.max(0, Math.round(Number(params.positionTicks) || 0));
 
     if (!restartRequired) {
+      if (subtitleStreamIndex === null) {
+        session.subtitleLoader?.cancel();
+        session.subtitleFullLoader?.cancel();
+      }
       session.subtitleStreamIndex = subtitleStreamIndex;
       session.subtitleMode = nextMode;
       session.positionTicks = positionTicks;
@@ -1476,6 +1493,8 @@ export class EmbyService {
   }
 
   async #stopOne(client, session, { signal } = {}) {
+    session.subtitleLoader?.dispose();
+    session.subtitleFullLoader?.dispose();
     const existing = this.stoppingPlaybacks.get(session.playbackId);
     if (existing) return existing;
     const stopping = (async () => {

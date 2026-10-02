@@ -603,6 +603,7 @@ export class EmbyClient {
       : sameOriginStreamDispatcher;
     this.ownsStreamResources = ownsExternalStreamTransport || ownsSameOriginDispatcher;
     this.resourceSemaphore = new Semaphore(resourceConcurrency);
+    this.subtitleSemaphore = new Semaphore(2);
     // 外部媒体 URL 校验（DNS 解析）按 href 短 TTL 缓存：direct-mp4 每 1MB 一个 Range，
     // 每个 Range 都重新解析一次 CDN 域名是纯浪费。安全性不受影响——真正发连接时
     // externalStreamTransport 的 connect() 仍会逐连接做 resolveExternalMediaAddress。
@@ -952,10 +953,11 @@ export class EmbyClient {
     });
   }
 
-  async loadResource(input, { signal, responseType = "bytes", maxBytes = this.resourceLimit } = {}) {
+  async loadResource(input, { signal, responseType = "bytes", maxBytes = this.resourceLimit, resourceType } = {}) {
     const url = validateSameOriginResource(this.baseUrl, input);
     try {
-      return await this.resourceSemaphore.use(signal, async () => {
+      const semaphore = resourceType === "subtitle" ? this.subtitleSemaphore : this.resourceSemaphore;
+      return await semaphore.use(signal, async () => {
         const result = await this.request(url, { responseType, maxBytes, signal });
         if (responseType === "text" && (/mpegurl/i.test(result.contentType) || /\.m3u8(?:$|\?)/i.test(result.url))) {
           result.text = sanitizeHlsManifest(result.text, result.url, this.baseUrl);

@@ -3,7 +3,6 @@
 import { access } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { CodexCompanionService } from "./codex-companion-service.mjs";
-import { loadHlsRuntimeSource } from "./hls-runtime.mjs";
 import { CodexInjector } from "./injector.mjs";
 import {
   DEFAULT_CODEX_EXECUTABLE,
@@ -13,6 +12,8 @@ import {
 } from "./launcher.mjs";
 import { listCdpTargets } from "./targets.mjs";
 import { RuntimeState, pidIsAlive } from "./runtime-state.mjs";
+import { CARD_MANIFESTS } from "./card-registry.mjs";
+import { watchCompanionConfig } from "./platform/config/watcher.mjs";
 import { CompanionConfig } from "./companion-config.mjs";
 import { startCodexWatchdog } from "./daemon.mjs";
 
@@ -21,15 +22,18 @@ function printHelp() {
 Codex Companion — CDP DOM 注入器
 
 用法：
-  node src/cli.mjs launch [--port <端口>] [--app <可执行文件>] [--once]
+  node src/cli.mjs launch [--port <CDP端口>] [--proxy-port <代理端口>] [--app <可执行文件>] [--once]
   node src/cli.mjs attach [--port <端口>]
   node src/cli.mjs inject --port <端口>
   node src/cli.mjs unmount --port <端口>
   node src/cli.mjs status
   node src/cli.mjs stop-codex
+  node src/cli.mjs cards list
+  node src/cli.mjs config get [--config-path <路径>]
+  node src/cli.mjs config patch [--config-path <路径>]  # stdin: {expectedRevision,patch}
 
 命令：
-  launch      启动带本机随机 CDP 端口的 Codex，并常驻维护注入（默认）；端口写入 0600 运行时状态文件
+  launch      启动带本机随机 CDP 端口的 Codex，并常驻维护注入（默认）；可选本机 HTTP/HTTPS 代理
   attach      连接已以 CDP 模式启动的 Codex 并常驻维护；未传 --port 时从运行时状态文件读取
   inject      单次注入后退出
   unmount     移除注入卡片后退出
@@ -42,34 +46,56 @@ export function parseArgs(argv) {
   const options = {
     command: "launch",
     port: null,
+    proxyPort: null,
     executable: process.env.CODEX_COMPANION_CODEX_EXECUTABLE
       || process.env.CODEX_HG_CODEX_EXECUTABLE
       || DEFAULT_CODEX_EXECUTABLE,
     once: false,
-    help: false
+    help: false,
+    configPath: process.env.CODEX_COMPANION_CONFIG_PATH,
+    subcommand: null
   };
 
   const args = [...argv];
   if (args[0] && !args[0].startsWith("-")) options.command = args.shift();
+
+  if (["cards", "config"].includes(options.command)) options.subcommand = args.shift();
 
   while (args.length > 0) {
     const arg = args.shift();
     if (arg === "--once") options.once = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else if (arg === "--port") options.port = Number(args.shift());
+    else if (arg === "--proxy-port") {
+      const value = args.shift();
+      if (!value || !/^[0-9]{1,5}$/.test(value)) throw new Error("代理端口必须是 1–65535 的整数");
+      options.proxyPort = Number(value);
+    }
+    else if (arg === "--config-path") {
+      options.configPath = args.shift();
+      if (!options.configPath || options.configPath.startsWith("--")) throw new Error("--config-path 必须提供路径");
+    }
     else if (arg === "--app") options.executable = args.shift();
     else throw new Error(`未知参数：${arg}`);
   }
 
-  if (!["launch", "attach", "inject", "unmount", "status", "stop-codex"].includes(options.command)) {
+  if (!["launch", "attach", "inject", "unmount", "status", "stop-codex", "cards", "config"].includes(options.command)) {
     throw new Error(`未知命令：${options.command}`);
   }
   if (options.port !== null && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65_535)) {
     throw new Error(`无效端口：${options.port}`);
   }
+  if (options.proxyPort !== null && (options.proxyPort < 1 || options.proxyPort > 65_535)) {
+    throw new Error("代理端口必须是 1–65535 的整数");
+  }
+  if (options.proxyPort !== null && options.command !== "launch") {
+    throw new Error("--proxy-port 只能用于 launch");
+  }
   if (["inject", "unmount"].includes(options.command) && options.port === null) {
     throw new Error(`${options.command} 命令必须提供 --port`);
   }
+  if (options.command === "cards" && options.subcommand !== "list") throw new Error("cards 仅支持 list");
+  if (options.command === "config" && !["get", "patch"].includes(options.subcommand)) throw new Error("config 仅支持 get / patch");
   return options;
 }
 
@@ -84,16 +110,18 @@ async function endpointIsAvailable(port) {
 
 export async function createEmbyRuntime(port, {
   InjectorClass = CodexInjector,
-  loadRuntimeSource = loadHlsRuntimeSource,
-  serviceFactory = ({ logger }) => new CodexCompanionService({ logger }),
-  loadConfig = () => new CompanionConfig().load(),
+  loadRuntimeSource = async () => "",
+  configStore = new CompanionConfig(),
+  serviceFactory = ({ logger, configStore }) => new CodexCompanionService({ logger, configStore }),
+  loadConfig = () => configStore.loadV2(),
   logger = console
 } = {}) {
   const [runtimePrelude, config] = await Promise.all([loadRuntimeSource(), loadConfig()]);
-  const service = serviceFactory({ logger });
+  const service = serviceFactory({ logger, configStore });
   const injector = new InjectorClass(port, {
     rpcHandler: service,
     runtimePrelude,
+    config,
     cards: config.cards,
     placement: config.placement,
     cardOrder: config.cardOrder,
@@ -147,6 +175,26 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
+  const companionConfig = new CompanionConfig({ path: options.configPath });
+  if (options.command === "cards") {
+    console.log(JSON.stringify(CARD_MANIFESTS));
+    return;
+  }
+  if (options.command === "config") {
+    if (options.subcommand === "get") console.log(JSON.stringify(await companionConfig.loadV2({ strict: true })));
+    else {
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        input += chunk;
+        if (Buffer.byteLength(input) > 1024 * 1024) throw new Error("配置补丁超过 1 MiB");
+      }
+      const request = JSON.parse(input);
+      console.log(JSON.stringify(await companionConfig.patch(request.patch, { expectedRevision: request.expectedRevision })));
+    }
+    return;
+  }
+
   let port = options.port;
   const runtimeState = new RuntimeState();
   let launchedCodexPid = null;
@@ -156,7 +204,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     const status = await collectStatus({
       executable: options.executable,
       loadRuntimeState: () => runtimeState.load(),
-      loadConfig: () => new CompanionConfig().load()
+      loadConfig: () => companionConfig.load()
     });
     console.log(JSON.stringify(status));
     return;
@@ -183,6 +231,9 @@ export async function runCli(argv = process.argv.slice(2)) {
         && pidIsAlive(saved.daemonPid)
         && saved.port
         && (await endpointIsAvailable(saved.port))) {
+        if (options.proxyPort !== null) {
+          throw new Error("Codex 已在运行；代理只在启动新进程时生效。请先退出 Codex 和旧维护进程，再重新启动。");
+        }
         console.log(`[codex-companion] 已有守护实例在运行（PID ${saved.daemonPid}，CDP 端口 ${saved.port}），本次不重复启动。`);
         return;
       }
@@ -192,6 +243,9 @@ export async function runCli(argv = process.argv.slice(2)) {
     if (options.port === null) {
       const saved = await runtimeState.load();
       if (saved?.port && (await endpointIsAvailable(saved.port))) {
+        if (options.proxyPort !== null) {
+          throw new Error("Codex 已在运行；代理只在启动新进程时生效。请先退出 Codex，再重新启动。");
+        }
         port = saved.port;
         console.log(`[codex-companion] 复用已在运行的 Codex（CDP 端口 ${port}）`);
       }
@@ -201,7 +255,11 @@ export async function runCli(argv = process.argv.slice(2)) {
       port = await reserveLoopbackPort();
     }
 
-    if (!(await endpointIsAvailable(port))) {
+    const portAvailable = await endpointIsAvailable(port);
+    if (portAvailable && options.proxyPort !== null) {
+      throw new Error("Codex 已在运行；代理只在启动新进程时生效。请先退出 Codex，再重新启动。");
+    }
+    if (!portAvailable) {
       const running = await findRunningCodex(options.executable);
       if (running.length > 0) {
         throw new Error(
@@ -210,7 +268,7 @@ export async function runCli(argv = process.argv.slice(2)) {
         );
       }
 
-      const pid = launchCodex({ executable: options.executable, port });
+      const pid = launchCodex({ executable: options.executable, port, proxyPort: options.proxyPort });
       launchedCodexPid = pid;
       console.log(`[codex-companion] 已启动 Codex（PID ${pid}，CDP 127.0.0.1:${port}）`);
     }
@@ -235,7 +293,7 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const { injector, embyService } = await createEmbyRuntime(port);
+  const { injector, embyService } = await createEmbyRuntime(port, { configStore: companionConfig });
 
   if (options.command === "inject" || options.once) {
     try {
@@ -268,61 +326,29 @@ export async function runCli(argv = process.argv.slice(2)) {
     console.error(`[codex-companion] 运行时状态写入失败：${error.message}`);
   });
 
-  // 监听配置文件变更（Swift 配置窗写入后无需重启即生效）。
-  // watch 目录而非文件：原子写 rename 会使文件级 watcher 失效。
-  const companionConfig = new CompanionConfig();
-  let configWatcher = null;
-  let reloadTimer = null;
-  let stopped = false;
-  try {
-    const { watch } = await import("node:fs");
-    const { mkdir } = await import("node:fs/promises");
-    const { dirname, basename } = await import("node:path");
-    // 目录可能尚不存在（首次运行、Swift 侧还没写过配置）；watch 一个不存在的目录会抛。
-    await mkdir(dirname(companionConfig.path), { recursive: true });
-    configWatcher = watch(dirname(companionConfig.path), (_eventType, filename) => {
-      if (stopped) return;
-      if (filename && filename !== basename(companionConfig.path)) return;
-      clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(async () => {
-        const next = await companionConfig.load();
-        if (stopped) return; // 关停竞态：load 期间可能已 shutdown
-        const current = injector.cards;
-        const enabledSame = next.enabled === injector.enabled;
-        const cardsSame = next.cards.hongguo === current.hongguo && next.cards.emby === current.emby;
-        const placementSame = next.placement === injector.placement;
-        const orderSame = next.cardOrder.join(",") === injector.cardOrder.join(",");
-        if (enabledSame && cardsSame && placementSame && orderSame) return;
-        injector.setConfig({
-          cards: next.cards,
-          placement: next.placement,
-          cardOrder: next.cardOrder,
-          enabled: next.enabled
-        });
-        console.log(`[codex-companion] 配置已更新：总开关=${next.enabled ? "开" : "关"}，红果=${next.cards.hongguo ? "开" : "关"}，Emby=${next.cards.emby ? "开" : "关"}，布局=${next.placement}，顺序=${next.cardOrder.join("→")}`);
-      }, 200);
-      reloadTimer.unref?.();
-    });
-    configWatcher.unref?.();
-  } catch (error) {
-    console.error(`[codex-companion] 配置监听不可用（改动需重启生效）：${error.message}`);
-  }
+  // 服务先关停被禁用卡片的后台会话，再让 renderer 应用同一 revision。
+  const configWatcher = await watchCompanionConfig({
+    config: companionConfig,
+    onChange: async (next) => {
+      try { await embyService.applyConfig(next); }
+      finally { injector.setConfig({ config: next }); }
+      console.log(`[codex-companion] 配置已更新，revision=${next.revision}`);
+    },
+    onError: error => console.error(`[codex-companion] 保留上次有效配置：${error.message}`)
+  });
 
   // 守护：Codex 退出则清状态并停止维护；Codex 无 flag 运行则发通知引导重启（不 kill）。
   const watchdog = startCodexWatchdog({
     executable: options.executable,
     onGone: async () => {
       console.log("[codex-companion] Codex 已退出，停止维护。");
-      await runtimeState.clear().catch(() => {});
-      await shutdown("codex-gone");
+      await shutdownAll("codex-gone");
     }
   });
 
   const shutdownAll = async (signal) => {
-    stopped = true;
     watchdog.stop();
-    configWatcher?.close();
-    clearTimeout(reloadTimer);
+    await configWatcher.close();
     await runtimeState.clear().catch(() => {});
     await shutdown(signal);
   };
@@ -342,9 +368,10 @@ export async function runCli(argv = process.argv.slice(2)) {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Bun 编译时多个模块共用入口 URL；import.meta.main 才能区分被导入与直接执行。
+if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)) {
   runCli().catch((error) => {
-    console.error(`[codex-companion] ${error.message}`);
+    console.error(JSON.stringify({ error: { code: error.code ?? "CLI_ERROR", message: error.message, ...(error.revision === undefined ? {} : { revision: error.revision }) } }));
     process.exitCode = 1;
   });
 }
