@@ -1,4 +1,4 @@
-import { chmod, link, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { CARD_MANIFESTS } from "./card-registry.mjs";
 import { completeCardOrder } from "./platform/config/runtime-config.mjs";
@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { companionDataDir } from "./platform/paths.mjs";
+import { replaceFile } from "./platform/replace-file.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -294,7 +295,7 @@ export class CompanionConfig {
     try {
       const file = await open(temporary, "wx", 0o600);
       try { await file.writeFile(value); await file.sync(); } finally { await file.close(); }
-      await rename(temporary, path);
+      await replaceFile(temporary, path);
       await chmod(path, 0o600);
     } finally { await unlink(temporary).catch(() => {}); }
   }

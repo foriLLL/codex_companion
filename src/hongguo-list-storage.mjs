@@ -1,8 +1,9 @@
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { companionDataDir } from "./platform/paths.mjs";
+import { replaceFile } from "./platform/replace-file.mjs";
 
 const LIST_FILE_LIMIT = 1 * 1024 * 1024;
 const MAX_ENTRIES = 200;
@@ -72,7 +73,7 @@ export class HongguoListStorage {
     const temporary = join(directory, `.hongguo-list-${process.pid}-${this.randomUUIDImpl()}.tmp`);
     try {
       await writeFile(temporary, serialized, { mode: 0o600, flag: "wx" });
-      await rename(temporary, this.path);
+      await replaceFile(temporary, this.path);
       await chmod(this.path, 0o600);
     } catch (error) {
       await unlink(temporary).catch(() => {});

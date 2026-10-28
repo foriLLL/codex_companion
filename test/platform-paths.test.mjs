@@ -9,6 +9,11 @@ test("数据目录遵循各平台约定，且只接受绝对路径的环境变�
   assert.equal(companionDataDir("/home/a", { platform: "linux", env: {} }), "/home/a/.config/codex-companion");
   assert.equal(companionDataDir("/home/a", { platform: "linux", env: { XDG_CONFIG_HOME: "/xdg" } }), "/xdg/codex-companion");
   assert.equal(companionDataDir("/home/a", { platform: "linux", env: { XDG_CONFIG_HOME: "relative" } }), "/home/a/.config/codex-companion");
+  // 未传 env 时，隔离 home 不受当前进程 XDG_CONFIG_HOME 影响
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = "/real-xdg";
+  try { assert.equal(companionDataDir("/isolated/home", { platform: "linux" }), "/isolated/home/.config/codex-companion"); }
+  finally { if (previous === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previous; }
 });
 
 test("isPathInside 只认严格子路径，不被同前缀目录或 .. 开头的名字误导", () => {

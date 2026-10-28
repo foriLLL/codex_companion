@@ -1,8 +1,9 @@
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { companionDataDir, legacyCompanionDataDir } from "./platform/paths.mjs";
+import { replaceFile } from "./platform/replace-file.mjs";
 
 const CACHE_FILE_LIMIT = 4 * 1024 * 1024;
 
@@ -78,7 +79,7 @@ export class HongguoCatalogStorage {
     const temporary = join(directory, `.hongguo-${process.pid}-${this.randomUUIDImpl()}.tmp`);
     try {
       await writeFile(temporary, serialized, { mode: 0o600, flag: "wx" });
-      await rename(temporary, this.cachePath);
+      await replaceFile(temporary, this.cachePath);
       await chmod(this.cachePath, 0o600);
     } catch (error) {
       await unlink(temporary).catch(() => {});

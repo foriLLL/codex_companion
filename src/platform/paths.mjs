@@ -8,8 +8,11 @@ const pathsFor = (platform) => (platform === "win32" ? path.win32 : path.posix);
 // - macOS：~/Library/Application Support/codex-companion（与早期版本一致）
 // - Windows：%APPDATA%\codex-companion
 // - Linux 等：$XDG_CONFIG_HOME/codex-companion，未设置时 ~/.config/codex-companion
-export function companionDataDir(home = homedir(), { platform = process.platform, env = process.env, name = "codex-companion" } = {}) {
+// 未显式传 env 时，只有真实用户目录才读取 APPDATA / XDG_CONFIG_HOME：测试或隔离用的
+// home 不能被当前进程的环境变量带回真实数据目录。
+export function companionDataDir(home = homedir(), { platform = process.platform, env, name = "codex-companion" } = {}) {
   const { isAbsolute, join } = pathsFor(platform);
+  env ??= home === homedir() ? process.env : {};
   if (platform === "darwin") return join(home, "Library", "Application Support", name);
   if (platform === "win32") {
     const appData = env.APPDATA && isAbsolute(env.APPDATA) ? env.APPDATA : join(home, "AppData", "Roaming");

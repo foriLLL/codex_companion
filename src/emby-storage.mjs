@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { EmbyError } from "./emby-client.mjs";
 import { companionDataDir, legacyCompanionDataDir } from "./platform/paths.mjs";
 import { createSecretStore } from "./platform/secret-store.mjs";
+import { replaceFile } from "./platform/replace-file.mjs";
 
 const execFileAsync = promisify(execFile);
 export const KEYCHAIN_SERVICE = "codex-companion.emby";
@@ -167,7 +168,7 @@ export class EmbyStorage {
     const temporary = join(directory, `.emby-${process.pid}-${this.randomUUIDImpl()}.tmp`);
     try {
       await writeFile(temporary, `${JSON.stringify(safe, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-      await rename(temporary, this.configPath);
+      await replaceFile(temporary, this.configPath);
       await chmod(this.configPath, 0o600);
     } catch (cause) {
       await unlink(temporary).catch(() => {});
@@ -230,7 +231,7 @@ export class EmbyStorage {
     const temporary = join(directory, `.emby-home-${process.pid}-${this.randomUUIDImpl()}.tmp`);
     try {
       await writeFile(temporary, serialized, { mode: 0o600, flag: "wx" });
-      await rename(temporary, this.homeCachePath);
+      await replaceFile(temporary, this.homeCachePath);
       await chmod(this.homeCachePath, 0o600);
     } catch (cause) {
       await unlink(temporary).catch(() => {});

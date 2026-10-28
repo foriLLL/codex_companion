@@ -1,8 +1,9 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { replaceFile } from "./replace-file.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -53,7 +54,7 @@ async function writePrivateFile(path, contents) {
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     await writeFile(temporary, contents, { mode: 0o600, flag: "wx" });
-    await rename(temporary, path);
+    await replaceFile(temporary, path);
     await chmod(path, 0o600);
   } finally {
     await unlink(temporary).catch(() => {});
