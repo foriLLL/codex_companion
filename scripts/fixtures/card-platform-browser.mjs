@@ -1,5 +1,6 @@
 import { createCardRuntime } from "/src/renderer/runtime/card-runtime.mjs";
 import { createCardShell } from "/src/renderer/shell/card-shell.mjs";
+import { createSettingsPanel } from "/src/renderer/shell/settings-panel.mjs";
 import { createRpcClient } from "/src/renderer/platform/rpc-client.mjs";
 import { CARD_MANIFESTS } from "/src/card-registry.mjs";
 
@@ -17,12 +18,13 @@ function memory() {
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const permutations = values => values.length ? values.flatMap((value, index) => permutations(values.filter((_, i) => i !== index)).map(rest => [value, ...rest])) : [[]];
 
-function fixture({ manifests = CARD_MANIFESTS, config, renderers, nativeAdapter = false, mediaCard, initialOpen = true } = {}) {
+function fixture({ manifests = CARD_MANIFESTS, config, renderers, nativeAdapter = false, mediaCard, initialOpen = true, platformCall } = {}) {
   const contexts = [], sent = [], errors = [], behavior = new Map();
   const localBackend = memory(), sessionBackend = memory();
   let instanceSequence = 0, shell, adapter;
   const rpcClient = createRpcClient({ timeoutMs: 3000, binding: () => raw => {
     const request = JSON.parse(raw); sent.push(request);
+    if (request.cardId === "companion" && platformCall) return platformCall(request.method, request.params);
     if (request.method === "rpc.cancel" || request.method.endsWith(".hold")) return undefined;
     return Promise.resolve({ method: request.method, cardId: request.cardId, generation: request.generation });
   } });
@@ -60,19 +62,19 @@ function fixture({ manifests = CARD_MANIFESTS, config, renderers, nativeAdapter 
       dispose() { instance.disposeCalls++; if (mode.disposeError) throw Error(`dispose-${id}`); ctx.root.replaceChildren(); }
     };
   };
-  const fakeAdapter = ({ host, placement, onVisibilityChange }) => {
+  const fakeAdapter = ({ host, placement, onVisibilityChange, hasSettings }) => {
     const container = document.createElement("div"); container.style.cssText = "width:332px;position:relative";
     container.dataset.fixtureAdapter = "true";
     let hasCards = false, open = initialOpen, disposed = false;
     const sync = () => {
-      if (hasCards && !disposed) { if (!container.isConnected) document.body.append(container); if (host.parentNode !== container) container.append(host); }
+      if ((hasCards || hasSettings) && !disposed) { if (!container.isConnected) document.body.append(container); if (host.parentNode !== container) container.append(host); }
       else container.remove();
       host.hidden = !open;
-      onVisibilityChange({ visible: hasCards && open && !disposed, placement, reason: "fixture" });
+      onVisibilityChange({ visible: (hasCards || hasSettings) && open && !disposed, placement, reason: "fixture" });
     };
     adapter = {
       setPlacement(value) { placement = value; sync(); }, setHasCards(value) { hasCards = value; sync(); },
-      setOpen(value) { open = value; sync(); }, isPlaced: () => hasCards && open && !disposed,
+      setOpen(value) { open = value; sync(); }, isPlaced: () => (hasCards || hasSettings) && open && !disposed,
       getDiagnostics: () => ({ mode: open ? placement : "hidden", placement, hasCards, disposed }),
       dispose() { disposed = true; sync(); }
     };
@@ -98,13 +100,13 @@ function unchanged(f, previous, ids, label) {
 const cardConfig = (ids, enabled = ids) => Object.fromEntries(ids.map(id => [id, { enabled: enabled.includes(id), settings: {} }]));
 
 export async function matrix() {
-  assert(CARD_MANIFESTS.length === 4, "矩阵必须使用四张实际 manifest");
+  assert(CARD_MANIFESTS.length >= 4, "矩阵必须使用全部实际 manifest");
   const ids = CARD_MANIFESTS.map(card => card.id), orders = permutations(ids);
   const f = fixture({ config: { cards: cardConfig(ids, []) } });
   let cases = 0, gapChecks = 0;
   try {
     for (const placement of ["standalone-button", "inline-in-summary"]) {
-      for (let mask = 0; mask < 16; mask++) {
+      for (let mask = 0; mask < 2 ** ids.length; mask++) {
         const enabled = ids.filter((_, index) => mask & (1 << index));
         for (const order of orders) {
           const previous = snapshot(f), beforeIds = Object.keys(previous);
@@ -120,12 +122,12 @@ export async function matrix() {
             const gap = slots[index].getBoundingClientRect().top - slots[index - 1].getBoundingClientRect().bottom;
             assert(Math.abs(gap - 24) <= 1, `gap ${gap}, mask=${mask}, placement=${placement}, order=${order}`); gapChecks++;
           }
-          if (!enabled.length) assert(!f.shell.host.isConnected && !document.querySelector("[data-fixture-adapter]"), "空集合残留占位");
+          if (!enabled.length) assert(f.shell.host.isConnected && f.shell.root.querySelector('[aria-label="Companion 设置"]'), "空集合丢失设置入口");
           cases++;
         }
       }
     }
-    equal(cases, 768, "完整矩阵数量");
+    equal(cases, 2 * 2 ** ids.length * orders.length, "完整矩阵数量");
   } finally { await f.runtime.dispose(); }
   assert(f.contexts.every(instance => instance.ctx.effects.diagnostics().active === 0 && instance.disposeCalls === 1), "矩阵卸载资源泄漏或重复 dispose");
   assert(f.rpcClient.diagnostics().pending === 0, "矩阵 RPC 泄漏");
@@ -410,4 +412,171 @@ export async function viewportScroll() {
   } finally { await f.runtime.dispose(); }
 }
 
-export const scenarios = { matrix, incremental, failures, lateMount, rpcIsolation, discoveredCard, nativeIntegration, storageContracts, suspendPolicy, viewportScroll };
+export async function settingsEntrypoints() {
+  const native = document.createElement("div");
+  native.innerHTML = '<button aria-label="Toggle pinned summary" aria-pressed="false">Summary</button><div class="thread-floating-content-top-inset right-0" style="position:absolute;top:48px;right:0;height:600px;width:316px"><div class="origin-top-right" style="width:316px;height:100%;opacity:0"><div style="width:300px;height:140px;background:white;border-radius:24px">Summary</div></div></div>';
+  document.body.append(native);
+  const toggle = native.querySelector("button"), column = native.querySelector(".origin-top-right");
+  toggle.onclick = () => {
+    const open = toggle.getAttribute("aria-pressed") !== "true";
+    toggle.setAttribute("aria-pressed", String(open));
+    column.style.opacity = open ? "1" : "0";
+  };
+  let checked = 0;
+  try {
+    for (const placement of ["standalone-button", "inline-in-summary"]) {
+      let config = {
+        version: 2, revision: 4, enabled: false, placement,
+        cards: cardConfig(CARD_MANIFESTS.map(card => card.id)), order: CARD_MANIFESTS.map(card => card.id),
+        launch: { proxy: { enabled: false, port: 7890 } }, agent: { autoRelaunch: true }
+      };
+      const f = fixture({ nativeAdapter: true, config, platformCall(method, params) {
+        if (method === "companion.settings.get") return Promise.resolve({ config: structuredClone(config), catalog: CARD_MANIFESTS, agent: null });
+        if (method === "companion.agent.status") return Promise.resolve({ available: false });
+        if (method === "companion.settings.patch") {
+          equal(params.expectedRevision, config.revision, "保存 revision");
+          config = { ...config, ...params.patch, revision: config.revision + 1 };
+          return Promise.resolve({ config: structuredClone(config) });
+        }
+        throw Error(`unexpected ${method}`);
+      } });
+      try {
+        await tick();
+        if (placement === "standalone-button") {
+          const outer = document.getElementById("codex-companion-root-shell");
+          outer.shadowRoot.querySelector('button[aria-label="Companion 卡片"]').click();
+        } else toggle.click();
+        await until(() => f.runtime.isPlaced(), `${placement} 入口打开`);
+        const gear = f.shell.root.querySelector('[aria-label="Companion 设置"]');
+        assert(gear.getBoundingClientRect().width > 0, `${placement} 齿轮不可见`);
+        assert(f.shell.root.querySelector(".platform-bar").textContent.includes("卡片已关闭"), "禁用提示缺失");
+        equal(f.contexts.length, 0, "disabled 不能启动业务卡片");
+        gear.focus(); gear.click();
+        const panel = f.shell.root.querySelector(".cc-settings");
+        await until(() => panel.getAttribute("aria-busy") === "false", "设置加载完成");
+        assert(panel.textContent.includes("后台服务未运行"), "未运行状态缺失");
+        equal(f.shell.root.activeElement.getAttribute("aria-label"), "关闭 Companion 设置", "打开后的焦点");
+        for (const next of [placement === "standalone-button" ? "inline-in-summary" : "standalone-button", placement]) {
+          panel.querySelector(`input[value="${next}"]`).click();
+          await until(() => panel.getAttribute("aria-busy") === "false", "显示方式已保存");
+          await f.runtime.applyConfig(config);
+          await until(() => f.runtime.getPlacement() === (next === "standalone-button" ? "standalone" : "animated-summary"), "显示方式切换后设置仍打开");
+          assert(panel.isConnected && !panel.hidden, "显示方式切换丢失设置页");
+        }
+        const enabled = panel.querySelector('[data-setting="enabled"]');
+        enabled.focus(); enabled.click();
+        await until(() => panel.getAttribute("aria-busy") === "false", "开启已保存");
+        assert(f.shell.root.activeElement === enabled, "保存完成后键盘焦点丢失");
+        equal(f.contexts.length, 0, "设置页不能直接开启运行时");
+        await f.runtime.applyConfig(config);
+        await settled(f, CARD_MANIFESTS.map(card => card.id));
+        enabled.focus(); enabled.click();
+        await until(() => panel.getAttribute("aria-busy") === "false", "关闭已保存");
+        await f.runtime.applyConfig(config);
+        equal(f.runtime.getDiagnostics().shell.count, 0, "关闭后业务外框残留");
+        assert(panel.isConnected && !panel.hidden && gear.isConnected && f.runtime.isPlaced(), "关闭后设置入口被拆除");
+        panel.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, composed: true, cancelable: true }));
+        assert(panel.hidden && f.shell.root.activeElement === gear, "Esc 未恢复齿轮焦点");
+        assert(f.runtime.isPlaced(), "设置 Escape 误关整个卡片区域");
+        checked++;
+      } finally { await f.runtime.dispose(); }
+      if (toggle.getAttribute("aria-pressed") === "true") toggle.click();
+    }
+    return { placements: checked, disabledEntry: true, watcherOnly: true, focusRestored: true, openPlacementSwitches: checked * 2 };
+  } finally { native.remove(); }
+}
+
+export async function settingsWithoutSummary() {
+  const f = fixture({ nativeAdapter: true, config: { enabled: false, placement: "inline-in-summary" } });
+  const native = document.createElement("div");
+  try {
+    f.runtime.setOpen(true);
+    await until(() => f.runtime.isPlaced(), "无 Summary 时的独立入口兜底");
+    assert(f.runtime.getDiagnostics().adapter.inlineEntryFallback, "未记录缺少 Summary 的兜底");
+    assert(f.shell.root.querySelector('[aria-label="Companion 设置"]').getBoundingClientRect().width > 0, "兜底齿轮不可见");
+    native.innerHTML = '<button aria-label="Toggle pinned summary" aria-pressed="true">Summary</button><div class="thread-floating-content-top-inset right-0" style="position:absolute;top:48px;right:0;height:600px;width:316px"><div class="origin-top-right" style="width:316px;height:100%;opacity:1"><div style="width:300px;height:140px;background:white;border-radius:24px">Summary</div></div></div>';
+    document.body.append(native);
+    await until(() => f.runtime.getPlacement() === "animated-summary", "Summary 出现后恢复 inline");
+    native.remove();
+    await until(() => f.runtime.getPlacement() === "standalone", "Summary 消失后恢复独立入口");
+    assert(f.shell.root.querySelector('[aria-label="Companion 设置"]').getBoundingClientRect().width > 0, "恢复兜底后抽屉仍被隐藏");
+    return { configuredPlacement: f.runtime.getConfig().placement, actualPlacement: f.runtime.getPlacement(), disabledEntry: true, summaryTransitions: 2 };
+  } finally { await f.runtime.dispose(); native.remove(); }
+}
+
+export async function settingsLayout() {
+  const host = document.createElement("div");
+  host.style.cssText = "width:320px;color-scheme:light dark";
+  const shadow = host.attachShadow({ mode: "open" });
+  document.body.append(host);
+  const calls = [];
+  let config = { version: 2, revision: 0, enabled: true, cards: {}, order: ["long-title"], placement: "standalone-button", launch: { proxy: { enabled: false, port: 7890 } }, agent: { autoRelaunch: true } };
+  const panel = createSettingsPanel({ document, call: async (method, params) => {
+    calls.push({ method, params });
+    if (method === "companion.settings.get") return { config, catalog: [{ id: "long-title", title: "LongUnbrokenCardTitle".repeat(5), defaultEnabled: true, defaultOrder: 0 }] };
+    if (method === "companion.agent.status") return { available: false };
+    if (method === "companion.codex.restart") return { accepted: true };
+    config = { ...config, ...params.patch, revision: config.revision + 1 };
+    return { config };
+  } });
+  shadow.append(panel.element);
+  try {
+    await panel.open();
+    for (const [scheme, background, foreground] of [["light", "rgb(255, 255, 255)", "rgb(26, 28, 31)"], ["dark", "rgb(37, 37, 37)", "rgb(236, 236, 236)"]]) {
+      host.style.colorScheme = scheme;
+      host.style.setProperty("--cc-card-bg", background);
+      host.style.setProperty("--cc-card-fg", foreground);
+      equal(getComputedStyle(panel.element).backgroundColor, background, `${scheme} 背景 token`);
+      equal(getComputedStyle(panel.element).color, foreground, `${scheme} 文字 token`);
+      assert(panel.element.scrollWidth <= panel.element.clientWidth, `${scheme} 320px 设置页横向滚动`);
+      for (const input of panel.element.querySelectorAll("input")) assert(input.labels?.length, "表单缺少可访问 label");
+    }
+    const buttons = [...panel.element.querySelectorAll("button")];
+    buttons.find(button => button.textContent === "立即重启 Codex").click();
+    equal(calls.filter(call => call.method.endsWith("restart")).length, 0, "显示确认前就发重启");
+    equal(shadow.activeElement.textContent, "取消", "重启默认焦点应为取消");
+    buttons.find(button => button.textContent === "确认重启").click();
+    await tick();
+    equal(calls.filter(call => call.method.endsWith("restart")).length, 1, "确认后只发一次重启");
+    return { width: 320, themes: 2, overflow: false, labelledInputs: panel.element.querySelectorAll("input").length, confirmedRestart: true };
+  } finally { panel.destroy(); host.remove(); }
+}
+
+export async function settingsBundle() {
+  const { RENDERER_SOURCE, RENDERER_ARTIFACT_HASH } = await import("/src/renderer-embedded.generated.mjs");
+  const config = { version: 2, revision: 3, enabled: false, placement: "standalone-button", cards: {}, order: [], launch: { proxy: { enabled: false, port: 7890 } }, agent: { autoRelaunch: true } };
+  const sent = [];
+  const previousBinding = globalThis.__CODEX_COMPANION_RPC__;
+  globalThis.__CODEX_COMPANION_RPC__ = raw => {
+    const request = JSON.parse(raw);
+    sent.push(request);
+    if (request.method === "companion.settings.get") return Promise.resolve({ config, catalog: CARD_MANIFESTS, agent: null });
+    if (request.method === "companion.agent.status") return Promise.resolve({ available: false });
+    throw Error(`unexpected ${request.method}`);
+  };
+  try {
+    (0, eval)(RENDERER_SOURCE);
+    const renderer = globalThis.__CODEX_COMPANION_RENDERER__;
+    const result = renderer.bootstrap({ config, artifactHash: RENDERER_ARTIFACT_HASH, version: "fixture" });
+    equal(result.status, "cards-disabled", "bundle disabled 状态");
+    const bridge = globalThis.__CODEX_COMPANION__;
+    bridge.setOpen(true);
+    await until(() => bridge.isPlaced(), "bundle 设置入口打开");
+    const root = document.getElementById("codex-companion-root-shell").shadowRoot.querySelector("#codex-companion-root").shadowRoot;
+    root.querySelector('[aria-label="Companion 设置"]').click();
+    await until(() => root.querySelector(".cc-settings").getAttribute("aria-busy") === "false", "bundle 设置读取");
+    equal(sent.map(item => item.method), ["companion.settings.get", "companion.agent.status"], "bundle 平台 RPC");
+    assert(sent.every(item => item.cardId === "companion" && Number.isInteger(item.generation)), "bundle 平台 scope");
+    equal(renderer.bootstrap({ config: { ...config, revision: 4 }, artifactHash: RENDERER_ARTIFACT_HASH }).status, "already-mounted", "重复 bundle 不重建入口");
+    assert(globalThis.__CODEX_COMPANION__ === bridge, "重复注入替换了 runtime");
+    return { artifact: RENDERER_ARTIFACT_HASH.slice(0, 16), disabledMount: true, scopedRpc: sent.length, reusedRuntime: true };
+  } finally {
+    globalThis.__CODEX_COMPANION_RENDERER__?.bootstrap({ action: "unmount" });
+    delete globalThis.__CODEX_COMPANION_RENDERER__;
+    if (previousBinding === undefined) delete globalThis.__CODEX_COMPANION_RPC__;
+    else globalThis.__CODEX_COMPANION_RPC__ = previousBinding;
+    assert(!document.getElementById("codex-companion-root-shell"), "bundle 卸载残留平台外框");
+  }
+}
+
+export const scenarios = { matrix, incremental, failures, lateMount, rpcIsolation, discoveredCard, nativeIntegration, storageContracts, suspendPolicy, viewportScroll, settingsEntrypoints, settingsWithoutSummary, settingsLayout, settingsBundle };

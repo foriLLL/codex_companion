@@ -22,20 +22,20 @@ function fixture() {
   });
   const service = new CodexCompanionService({
     embyService: engine("emby"), hongguoService: engine("hongguo"),
-    configStore: { loadV2: async () => config }, openUrlImpl: async url => calls.push({ url })
+    configStore: { loadV2: async () => config }
   });
   return { service, calls, setConfig: next => { config = next; } };
 }
 
 test("生成服务目录用于真实路由；Emby 仅接受有限全名和旧别名", async () => {
-  assert.deepEqual(Object.keys(SERVICE_REGISTRY), ["hongguo", "riverclub", "emby"]);
+  assert.deepEqual(Object.keys(SERVICE_REGISTRY), ["proxy", "hongguo", "emby"]);
   const { service, calls } = fixture();
   for (const method of EMBY_OPERATIONS.filter(value => !value.startsWith("playback."))) {
     await service.handleRpc(method, {}, { targetId: "legacy" });
     await service.handleRpc(`emby.${method}`, {}, ctx("emby"));
   }
   const before = calls.length;
-  for (const method of ["totally.unknown", "emby.admin.delete", "hongguo.unknown", "riverclub.shell", "games.fetch", "constructor"]) {
+  for (const method of ["totally.unknown", "emby.admin.delete", "hongguo.unknown", "games.fetch", "constructor"]) {
     await assert.rejects(service.handleRpc(method), { code: "RPC_METHOD_NOT_FOUND" });
   }
   assert.equal(calls.length, before);
@@ -128,15 +128,6 @@ test("迟到打开会话在旧 scope 再次清理；新 generation 与其他卡�
   await service.handleRpc("emby.playback.direct.next", { playbackId: "new-playback" }, ctx("emby", 2));
 });
 
-test("River Club 使用 v2 本机设置并再次校验来源，不接受调用者 URL", async () => {
-  const { service, calls, setConfig } = fixture();
-  setConfig({ enabled: true, cards: { riverclub: { enabled: true, settings: { url: "https://riverclub.booocai.com/?invite=local" } } } });
-  await service.handleRpc("riverclub.open", { url: "file:///etc/passwd" }, ctx("riverclub"));
-  assert.equal(calls.at(-1).url, "https://riverclub.booocai.com/?invite=local");
-  setConfig({ enabled: true, cards: { riverclub: { enabled: true, settings: { url: "https://evil.example/" } } } });
-  await service.handleRpc("riverclub.open", {}, ctx("riverclub"));
-  assert.equal(calls.at(-1).url, "https://riverclub.booocai.com/");
-});
 
 
 test("迟到资源在慢清理期间产生时必须再清理一轮，旧 generation 墓碑不复活", async () => {

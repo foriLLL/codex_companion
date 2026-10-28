@@ -84,6 +84,9 @@ export function validateManifest(input) {
   if (typeof input.id !== "string" || !ID_PATTERN.test(input.id)) {
     fail("INVALID_VALUE", "id", `id 必须匹配 ${ID_PATTERN}，实际为 ${JSON.stringify(input.id)}`);
   }
+  if (input.id === "companion") {
+    fail("RESERVED_ID", "id", "companion 为平台保留 id，不能注册为卡片");
+  }
   if (typeof input.title !== "string" || input.title.length === 0) {
     fail("INVALID_VALUE", "title", "title 必须是非空字符串");
   }

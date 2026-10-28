@@ -2,7 +2,6 @@
 
 import { access } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { CodexCompanionService } from "./codex-companion-service.mjs";
 import { CodexInjector } from "./injector.mjs";
 import {
   DEFAULT_CODEX_EXECUTABLE,
@@ -16,6 +15,9 @@ import { CARD_MANIFESTS } from "./card-registry.mjs";
 import { watchCompanionConfig } from "./platform/config/watcher.mjs";
 import { CompanionConfig } from "./companion-config.mjs";
 import { startCodexWatchdog } from "./daemon.mjs";
+import { createCodexSession, createEmbyRuntime } from "./agent/session.mjs";
+import { runAgentCommand } from "./agent/launch-agent.mjs";
+export { createEmbyRuntime, createRuntimeShutdown } from "./agent/session.mjs";
 
 function printHelp() {
   console.log(`
@@ -31,6 +33,8 @@ Codex Companion — CDP DOM 注入器
   node src/cli.mjs cards list
   node src/cli.mjs config get [--config-path <路径>]
   node src/cli.mjs config patch [--config-path <路径>]  # stdin: {expectedRevision,patch}
+  node src/cli.mjs agent [--log-dir <目录>]
+  node src/cli.mjs agent <install|uninstall|status|restart-codex> [--plist-dir <目录>] [--label <label>]
 
 命令：
   launch      启动带本机随机 CDP 端口的 Codex，并常驻维护注入（默认）；可选本机 HTTP/HTTPS 代理
@@ -39,6 +43,7 @@ Codex Companion — CDP DOM 注入器
   unmount     移除注入卡片后退出
   status      输出单行 JSON 状态（Codex 是否运行、CDP 端口、卡片配置），供配置界面调用
   stop-codex  温和退出 Codex（SIGTERM，绝不强杀），输出单行 JSON 结果
+  agent       常驻监听 Codex；install/uninstall 管理后台服务，status 查询，restart-codex 正常重启一次
 `);
 }
 
@@ -59,7 +64,7 @@ export function parseArgs(argv) {
   const args = [...argv];
   if (args[0] && !args[0].startsWith("-")) options.command = args.shift();
 
-  if (["cards", "config"].includes(options.command)) options.subcommand = args.shift();
+  if (["cards", "config", "agent"].includes(options.command) && args[0] && !args[0].startsWith("-")) options.subcommand = args.shift();
 
   while (args.length > 0) {
     const arg = args.shift();
@@ -76,10 +81,22 @@ export function parseArgs(argv) {
       if (!options.configPath || options.configPath.startsWith("--")) throw new Error("--config-path 必须提供路径");
     }
     else if (arg === "--app") options.executable = args.shift();
+    else if (arg === "--log-dir") {
+      const value = args.shift();
+      if (!value || value.startsWith("--")) throw new Error("--log-dir 必须提供路径");
+      if (options.command !== "agent" || options.subcommand !== null) throw new Error("--log-dir 只能用于 agent 常驻命令");
+      options.logDir = value;
+    }
+    else if (["--plist-dir", "--label"].includes(arg)) {
+      const value = args.shift();
+      if (!value || value.startsWith("--")) throw new Error(`${arg} 必须提供值`);
+      if (options.command !== "agent" || !["install", "uninstall"].includes(options.subcommand)) throw new Error(`${arg} 只能用于 agent install / uninstall`);
+      options[arg === "--plist-dir" ? "plistDir" : "label"] = value;
+    }
     else throw new Error(`未知参数：${arg}`);
   }
 
-  if (!["launch", "attach", "inject", "unmount", "status", "stop-codex", "cards", "config"].includes(options.command)) {
+  if (!["launch", "attach", "inject", "unmount", "status", "stop-codex", "cards", "config", "agent"].includes(options.command)) {
     throw new Error(`未知命令：${options.command}`);
   }
   if (options.port !== null && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65_535)) {
@@ -96,6 +113,10 @@ export function parseArgs(argv) {
   }
   if (options.command === "cards" && options.subcommand !== "list") throw new Error("cards 仅支持 list");
   if (options.command === "config" && !["get", "patch"].includes(options.subcommand)) throw new Error("config 仅支持 get / patch");
+  if (options.command === "agent" && ![null, "install", "uninstall", "status", "restart-codex"].includes(options.subcommand)) throw new Error("agent 子命令无效");
+  if (options.command === "agent" && (options.once || options.port !== null || argv.includes("--app"))) {
+    throw new Error("agent 不接受 --once / --port / --app；目标应用请使用 CODEX_COMPANION_CODEX_APP");
+  }
   return options;
 }
 
@@ -108,71 +129,16 @@ async function endpointIsAvailable(port) {
   }
 }
 
-export async function createEmbyRuntime(port, {
-  InjectorClass = CodexInjector,
-  loadRuntimeSource = async () => "",
-  configStore = new CompanionConfig(),
-  serviceFactory = ({ logger, configStore }) => new CodexCompanionService({ logger, configStore }),
-  loadConfig = () => configStore.loadV2(),
-  logger = console
-} = {}) {
-  const [runtimePrelude, config] = await Promise.all([loadRuntimeSource(), loadConfig()]);
-  const service = serviceFactory({ logger, configStore });
-  const injector = new InjectorClass(port, {
-    rpcHandler: service,
-    runtimePrelude,
-    config,
-    cards: config.cards,
-    placement: config.placement,
-    cardOrder: config.cardOrder,
-    enabled: config.enabled,
-    logger
-  });
-  return { injector, service, embyService: service, runtimePrelude, config };
-}
-
-export function createRuntimeShutdown({
-  injector,
-  embyService,
-  logger = console,
-  processRef = process
-}) {
-  let shutdownPromise = null;
-  return function shutdown(signal = "shutdown") {
-    if (shutdownPromise) return shutdownPromise;
-    shutdownPromise = (async () => {
-      let failure = null;
-      try {
-        await embyService.dispose();
-      } catch (error) {
-        failure = error;
-      }
-
-      try {
-        injector.stop();
-      } catch (error) {
-        failure ??= error;
-      }
-
-      if (failure) {
-        const code = typeof failure.code === "string" && /^[A-Z][A-Z0-9_]*$/.test(failure.code)
-          ? `（${failure.code}）`
-          : "";
-        logger.error(`[codex-companion] 停止媒体会话失败${code}`);
-        processRef.exitCode = 1;
-      } else if (signal) {
-        logger.info(`[codex-companion] 已停止维护（${signal}）`);
-      }
-    })();
-    return shutdownPromise;
-  };
-}
-
-export async function runCli(argv = process.argv.slice(2)) {
+export async function runCli(argv = process.argv.slice(2), dependencies = {}) {
   const options = parseArgs(argv);
   if (options.help) {
     printHelp();
     return;
+  }
+
+  if (options.command === "agent") {
+    const { executable, ...agentOptions } = options;
+    return runAgentCommand(options.subcommand, { ...agentOptions, ...dependencies });
   }
 
   const companionConfig = new CompanionConfig({ path: options.configPath });
@@ -293,9 +259,8 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const { injector, embyService } = await createEmbyRuntime(port, { configStore: companionConfig });
-
   if (options.command === "inject" || options.once) {
+    const { injector, embyService } = await createEmbyRuntime(port, { configStore: companionConfig, executable: options.executable });
     try {
       const results = await injector.injectOnce("mount");
       console.log(`[codex-companion] 已向 ${results.length} 个 renderer 注入卡片`);
@@ -305,9 +270,10 @@ export async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const shutdown = createRuntimeShutdown({ injector, embyService });
+  const session = createCodexSession({ port, configStore: companionConfig, executable: options.executable });
+  const shutdown = signal => session.stop(signal);
   try {
-    await injector.start();
+    await session.start();
   } catch (error) {
     await shutdown("启动失败");
     throw error;
@@ -330,8 +296,7 @@ export async function runCli(argv = process.argv.slice(2)) {
   const configWatcher = await watchCompanionConfig({
     config: companionConfig,
     onChange: async (next) => {
-      try { await embyService.applyConfig(next); }
-      finally { injector.setConfig({ config: next }); }
+      await session.applyConfig(next);
       console.log(`[codex-companion] 配置已更新，revision=${next.revision}`);
     },
     onError: error => console.error(`[codex-companion] 保留上次有效配置：${error.message}`)

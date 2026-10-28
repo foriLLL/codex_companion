@@ -229,6 +229,9 @@ export class HongguoService {
         directSession: null
       };
       session.directSession = this.#directSessionFactory({
+        ...(context.mediaTransport === "rpc"
+          ? { maxBatchBytes: 128 * 1024, maxQueueBytes: 8 * 1024 * 1024, resumeQueueBytes: 4 * 1024 * 1024 }
+          : {}),
         readRange: async ({ start, end, resolvedUrl, signal }) => {
           const attempt = (useResolved) => this.#client.loadRange(session.source.mp4Url, {
             start,

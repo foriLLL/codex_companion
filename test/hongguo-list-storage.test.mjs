@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { HongguoListStorage, normalizeListEntry } from "../src/hongguo-list-storage.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
 
 const poster = "https://p6-novel.byteimg.com/cover.jpg";
 
@@ -40,7 +41,7 @@ test("add：去重并置顶为最新；0600 落盘可回读", async () => {
     assert.equal(items[0].name, "A2");
 
     const info = await stat(path);
-    assert.equal(info.mode & 0o777, 0o600);
+    assertMode(info, 0o600);
 
     assert.deepEqual((await store.load()).map((x) => x.id), ["111", "222"]);
   });

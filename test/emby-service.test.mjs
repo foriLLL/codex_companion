@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EmbyError } from "../src/emby-client.mjs";
 import { embyServerKey } from "../src/emby-storage.mjs";
+import { resolveMediaInterceptUrl } from "../src/media-intercept.mjs";
 import {
   EmbyService,
   computeSourceKey,
@@ -14,6 +15,11 @@ import {
   pickMediaSource,
   secondsToTicks
 } from "../src/emby-service.mjs";
+
+// 遥测超时计时器在生产中 unref，避免拖住进程退出；部分用例的假客户端永不完成，
+// 若宿主上恰好没有其它活动句柄，事件循环会在超时触发前结束。这里显式保活。
+const keepAlive = setInterval(() => {}, 60_000);
+test.after(() => clearInterval(keepAlive));
 
 class FakeStorage {
   constructor(config = null, token = null, homeCache = null) {
@@ -1421,8 +1427,8 @@ test("仅支持直连的 MP4 优先返回本机 Range 代理并保留 MSE 会话
     randomUUIDImpl: () => "direct-playback"
   });
 
-  const opened = await service.handleRpc("playback.open", { itemId: "movie" });
-  const { directProxyUrl, ...openedDto } = opened;
+  const opened = await service.handleRpc("playback.open", { itemId: "movie" }, { mediaTransport: "intercept" });
+  const { directMediaUrl, ...openedDto } = opened;
   assert.deepEqual(openedDto, {
     playbackId: "direct-playback",
     itemId: "movie",
@@ -1436,9 +1442,12 @@ test("仅支持直连的 MP4 优先返回本机 Range 代理并保留 MSE 会话
     qualityLabel: "SD MP4 H264",
     sourceKey: "sd|mp4#0"
   });
+  // 页面拿到的是拦截域名；CDP 拦截把它改写回已登记的 loopback 代理端口。
+  assert.match(directMediaUrl, /^https:\/\/codex-companion\.invalid\/\d+\/hls\/direct-playback\/Videos\/movie\/stream\.mp4(\?Static=true)?$/);
+  const directProxyUrl = resolveMediaInterceptUrl(directMediaUrl);
   const directProxy = new URL(directProxyUrl);
   assert.equal(directProxy.hostname, "127.0.0.1");
-  assert.match(directProxy.pathname, /^\/hls\/direct-playback\/Videos\/movie\/stream\.mp4$/);
+  assert.match(directProxy.pathname, /^\/hls\/direct-playback\/Videos\/movie\/stream\.mp4(\?Static=true)?$/);
   assert.equal(calls.some((call) => call.method === "started"), true);
   assert.equal(calls.some((call) => call.method === "stopEncoding"), false);
 

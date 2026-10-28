@@ -18,6 +18,7 @@ const RESUME_QUEUE_BYTES = 12 * 1024 * 1024;
 const NEXT_BATCH_BYTES = 6 * 1024 * 1024;
 const START_TIMEOUT_MS = 40_000;
 const MAX_STDERR_BYTES = 8 * 1024;
+const MAX_OUTPUT_FRAGMENT_BYTES = 48 * 1024 * 1024;
 // Renderer 侧 fMP4 仍需经过有界 Base64/CDP 通道。高于 40 Mbps 时即使编码兼容，
 // 直传也没有足够吞吐余量；转为 VideoToolbox H.264 后再交给同一 MSE 播放器。
 export const DIRECT_VIDEO_BITRATE_LIMIT = 40_000_000;
@@ -109,6 +110,8 @@ class FragmentParser {
     this.buffer = Buffer.alloc(0);
     this.initialization = [];
     this.fragment = [];
+    this.initializationBytes = 0;
+    this.fragmentBytes = 0;
     this.ready = false;
     this.onInitialization = onInitialization;
     this.onSegment = onSegment;
@@ -116,30 +119,46 @@ class FragmentParser {
 
   push(chunk) {
     if (!chunk?.length) return;
+    if (this.buffer.length + chunk.length > MAX_OUTPUT_FRAGMENT_BYTES) {
+      throw new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 输出的媒体 box 超过内存预算");
+    }
     this.buffer = this.buffer.length === 0
       ? Buffer.from(chunk)
       : Buffer.concat([this.buffer, chunk], this.buffer.length + chunk.length);
     while (this.buffer.length >= 8) {
       const size = boxSize(this.buffer);
+      if (size !== null && size > MAX_OUTPUT_FRAGMENT_BYTES) {
+        throw new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 输出的媒体 box 超过内存预算");
+      }
       if (size === null || this.buffer.length < size) return;
       if (size < 8) throw new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 输出了无效的 MP4 box");
       const box = Buffer.from(this.buffer.subarray(0, size));
       this.buffer = this.buffer.subarray(size);
       const type = box.toString("ascii", 4, 8);
       if (!this.ready) {
+        this.initializationBytes += box.length;
+        if (this.initializationBytes > MAX_OUTPUT_FRAGMENT_BYTES) {
+          throw new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 初始化数据超过内存预算");
+        }
         this.initialization.push(box);
         if (type === "moov") {
           this.ready = true;
           const initialization = Buffer.concat(this.initialization);
           this.initialization.length = 0;
+          this.initializationBytes = 0;
           this.onInitialization(initialization);
         }
         continue;
+      }
+      this.fragmentBytes += box.length;
+      if (this.fragmentBytes > MAX_OUTPUT_FRAGMENT_BYTES) {
+        throw new EmbyError("FFMPEG_OUTPUT_INVALID", "FFmpeg 媒体分片超过内存预算");
       }
       this.fragment.push(box);
       if (type === "mdat") {
         const fragment = Buffer.concat(this.fragment);
         this.fragment.length = 0;
+        this.fragmentBytes = 0;
         this.onSegment(fragment);
       }
     }
@@ -748,11 +767,19 @@ export class FfmpegFmp4Session {
     toneMappingSupportImpl = requireToneMappingSupport,
     spawnImpl = spawn,
     randomUUIDImpl = randomUUID,
+    maxBatchBytes = NEXT_BATCH_BYTES,
+    maxQueueBytes = MAX_QUEUE_BYTES,
+    resumeQueueBytes = Math.min(RESUME_QUEUE_BYTES, Math.floor(maxQueueBytes / 2)),
     platform = process.platform,
     env = process.env
   } = {}) {
     if (typeof readRange !== "function" && typeof openRangeStream !== "function") {
       throw new TypeError("readRange 或 openRangeStream 必须至少提供一个");
+    }
+    if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes <= 0
+      || !Number.isSafeInteger(maxQueueBytes) || maxQueueBytes < maxBatchBytes
+      || !Number.isSafeInteger(resumeQueueBytes) || resumeQueueBytes < 0 || resumeQueueBytes >= maxQueueBytes) {
+      throw new TypeError("媒体批次与队列限制无效");
     }
     if (!ffmpegPathImpl) {
       throw new EmbyError(
@@ -761,6 +788,9 @@ export class FfmpegFmp4Session {
       );
     }
     this.ffmpegPath = ffmpegPathImpl;
+    this.maxBatchBytes = maxBatchBytes;
+    this.maxQueueBytes = maxQueueBytes;
+    this.resumeQueueBytes = resumeQueueBytes;
     this.color = videoColorInfo(mediaSource);
     this.toneMappingSupportImpl = toneMappingSupportImpl;
     this.spawnImpl = spawnImpl;
@@ -785,6 +815,7 @@ export class FfmpegFmp4Session {
     this.child = null;
     this.queue = [];
     this.queueBytes = 0;
+    this.segmentOffset = 0;
     this.waiters = [];
     this.ready = false;
     this.ended = false;
@@ -814,25 +845,32 @@ export class FfmpegFmp4Session {
     if (this.queue.length === 0 && !this.ended) await this.#waitForSegment(signal);
     if (this.queue.length === 0 && this.failure) throw this.failure;
 
-    // 打包已就绪的多个分片一起返回（受 NEXT_BATCH_BYTES 约束），减少 CDP 往返，
-    // 避免每 2s 一个分片单独往返导致的卡顿。至少返回一个（若有）。
+    // 单个 moof+mdat 也可能超过 MCP 的消息预算。按连续字节拆包，保留边界
+    // 标志供 MSE 配额回收使用；拆包不改变解码器接收到的字节顺序。
     const segments = [];
     let batchBytes = 0;
     while (this.queue.length > 0) {
-      if (segments.length > 0 && batchBytes + this.queue[0].byteLength > NEXT_BATCH_BYTES) break;
-      const segment = this.queue.shift();
-      this.queueBytes -= segment.byteLength;
-      batchBytes += segment.byteLength;
+      const segment = this.queue[0];
+      const available = this.maxBatchBytes - batchBytes;
+      if (available <= 0) break;
+      const offset = this.segmentOffset || 0;
+      if (segments.length > 0 && offset === 0 && segment.byteLength > available) break;
+      const length = Math.min(segment.byteLength - offset, available);
+      const complete = offset + length === segment.byteLength;
+      this.queueBytes -= length;
+      batchBytes += length;
       segments.push({
         trackId: 0,
-        data: asBase64(segment),
+        data: asBase64(segment.subarray(offset, offset + length)),
         sampleNumber: 0,
-        segmentStart: true,
-        segmentEnd: true,
+        segmentStart: offset === 0,
+        segmentEnd: complete,
         last: false
       });
+      this.segmentOffset = complete ? 0 : offset + length;
+      if (complete) this.queue.shift();
     }
-    if (this.queueBytes <= RESUME_QUEUE_BYTES) this.child?.stdout?.resume();
+    if (this.queueBytes <= this.resumeQueueBytes) this.child?.stdout?.resume();
     if (segments.length > 0) return { segments, end: false };
     if (this.ended) return { segments: [], end: true };
     return { segments: [], end: false };
@@ -855,6 +893,7 @@ export class FfmpegFmp4Session {
     this.#stopChild();
     this.queue.length = 0;
     this.queueBytes = 0;
+    this.segmentOffset = 0;
     this.#rejectWaiters(new EmbyError("PLAYBACK_NOT_FOUND", "FFmpeg 播放会话已经结束"));
     void this.proxy.close();
     if (this.subtitleDirectory) void rm(this.subtitleDirectory, { recursive: true, force: true });
@@ -868,6 +907,7 @@ export class FfmpegFmp4Session {
     this.#stopChild();
     this.queue.length = 0;
     this.queueBytes = 0;
+    this.segmentOffset = 0;
     this.ended = false;
     this.ready = false;
     this.failure = null;
@@ -902,7 +942,7 @@ export class FfmpegFmp4Session {
         if (generation !== this.generation || this.destroyed) return;
         this.queue.push(segment);
         this.queueBytes += segment.byteLength;
-        if (this.queueBytes >= MAX_QUEUE_BYTES) child.stdout.pause();
+        if (this.queueBytes >= this.maxQueueBytes) child.stdout.pause();
         this.#resolveWaiters();
       }
     });

@@ -60,8 +60,10 @@ try {
   // 用最新源码的临时快照重新生成 renderer，不覆盖开发目录的生成物。
   const snapshot = path.join(temporary, "source");
   await cp(path.join(repoRoot, "src"), path.join(snapshot, "src"), { recursive: true });
+  // src/agent/main.mjs 以 JSON import 读取版本号。
+  await cp(path.join(repoRoot, "package.json"), path.join(snapshot, "package.json"));
   await symlink(path.join(repoRoot, "node_modules"), path.join(snapshot, "node_modules"));
-  const bun = path.join(repoRoot, "node_modules/.bin/bun");
+  const bun = path.join(repoRoot, "node_modules", "bun", "bin", "bun.exe");
   const rendererPath = path.join(temporary, "renderer.js");
   await exec(bun, ["build", path.join(snapshot, "src/renderer/entry.mjs"), "--target=browser", "--format=iife", "--outfile", rendererPath]);
   const renderer = await readFile(rendererPath, "utf8");

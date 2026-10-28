@@ -5,6 +5,13 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 export const DEFAULT_CODEX_EXECUTABLE = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
 
+// 由 Companion 识别、退出并带参数重启 Codex 桌面端目前只在 macOS 上实现：
+// 其它平台的安装位置与进程模型（如 Windows 的打包应用）不同，相关功能降级为不可用，
+// 插件的卡片与媒体能力不受影响。
+export function codexLaunchSupported(platform = process.platform) {
+  return platform === "darwin";
+}
+
 export async function reserveLoopbackPort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -23,6 +30,30 @@ export async function reserveLoopbackPort() {
 }
 
 const CDP_PORT_FLAG = "--remote-debugging-port";
+// Chromium 在 macOS 上不读 HTTP(S)_PROXY，只认系统代理或 --proxy-server；
+// 环境变量留给内置 codex CLI，命令行参数让界面层网络请求也走同一代理。
+const PROXY_SERVER_FLAG = "--proxy-server";
+// 局域网 Emby 等私网地址不经代理；loopback 由 Chromium 默认直连。
+const PROXY_BYPASS_LIST = "<local>;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16";
+
+function sanitizeFlagPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65_535 ? port : null;
+}
+
+function parseCdpPort(command) {
+  const match = command.match(/(?:^|\s)--remote-debugging-port[= ](\d{1,5})(?=\s|$)/);
+  return match ? sanitizeFlagPort(match[1]) : null;
+}
+
+/**
+ * 从 Codex 命令行读出本机代理端口；只认 Companion 自己写入的 loopback 形式，
+ * 其他代理地址不当作「通过 Companion 代理启动」。
+ */
+export function parseCodexProxyPort(command) {
+  const match = command.match(/(?:^|\s)--proxy-server=(?:http:\/\/)?127\.0\.0\.1:(\d{1,5})(?=\s|$)/);
+  return match ? sanitizeFlagPort(match[1]) : null;
+}
 
 /**
  * 扫描正在运行的 Codex 进程，返回每个进程的 pid、完整命令行，以及是否带 CDP 调试端口 flag。
@@ -42,7 +73,9 @@ export async function inspectRunningCodex(executable = DEFAULT_CODEX_EXECUTABLE,
       matches.push({
         pid: Number(pid),
         command,
-        hasCdpFlag: command.includes(`${CDP_PORT_FLAG}=`) || command.includes(`${CDP_PORT_FLAG} `)
+        hasCdpFlag: command.includes(`${CDP_PORT_FLAG}=`) || command.includes(`${CDP_PORT_FLAG} `),
+        cdpPort: parseCdpPort(command),
+        proxyPort: parseCodexProxyPort(command)
       });
     }
   }
@@ -54,16 +87,39 @@ export async function findRunningCodex(executable = DEFAULT_CODEX_EXECUTABLE, op
   return processes.map((entry) => entry.pid);
 }
 
+/**
+ * 找到本 Companion 维护的 Codex 主进程并返回其代理端口。
+ * 代理只能在启动时设定，命令行即事实来源；复用或 attach 已运行的 Codex 时同样准确。
+ */
+export async function detectCodexProxy({
+  executable = DEFAULT_CODEX_EXECUTABLE,
+  cdpPort = null,
+  inspectImpl = inspectRunningCodex,
+  platform = process.platform
+} = {}) {
+  if (!codexLaunchSupported(platform)) return { supported: false, running: null, proxyPort: null };
+  const processes = await inspectImpl(executable);
+  const codex = processes.find((entry) => cdpPort !== null && entry.cdpPort === cdpPort)
+    ?? processes.find((entry) => entry.hasCdpFlag)
+    ?? processes[0];
+  return { running: Boolean(codex), proxyPort: codex?.proxyPort ?? null };
+}
+
+function hasProxyPort(proxyPort) {
+  if (proxyPort === null || proxyPort === undefined) return false;
+  if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65_535) {
+    throw new RangeError("代理端口必须是 1–65535 的整数");
+  }
+  return true;
+}
+
 export function buildCodexLaunchEnvironment(proxyPort, baseEnvironment = process.env) {
   const environment = { ...baseEnvironment };
   // 代理是本次 Codex 启动的显式选择，避免继承 Companion 进程的旧代理值。
   for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
     delete environment[name];
   }
-  if (proxyPort !== null && proxyPort !== undefined) {
-    if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65_535) {
-      throw new RangeError("代理端口必须是 1–65535 的整数");
-    }
+  if (hasProxyPort(proxyPort)) {
     const proxy = `http://127.0.0.1:${proxyPort}`;
     environment.HTTP_PROXY = proxy;
     environment.HTTPS_PROXY = proxy;
@@ -71,12 +127,17 @@ export function buildCodexLaunchEnvironment(proxyPort, baseEnvironment = process
   return environment;
 }
 
+export function buildCodexLaunchArgs(port, proxyPort = null) {
+  const args = ["--remote-debugging-address=127.0.0.1", `${CDP_PORT_FLAG}=${port}`];
+  if (hasProxyPort(proxyPort)) {
+    args.push(`${PROXY_SERVER_FLAG}=http://127.0.0.1:${proxyPort}`, `--proxy-bypass-list=${PROXY_BYPASS_LIST}`);
+  }
+  return args;
+}
+
 export function launchCodex({ executable = DEFAULT_CODEX_EXECUTABLE, port, proxyPort = null, spawnImpl = spawn }) {
   const environment = buildCodexLaunchEnvironment(proxyPort);
-  const child = spawnImpl(executable, [
-    "--remote-debugging-address=127.0.0.1",
-    `--remote-debugging-port=${port}`
-  ], {
+  const child = spawnImpl(executable, buildCodexLaunchArgs(port, proxyPort), {
     detached: true,
     stdio: "ignore",
     env: environment

@@ -1,0 +1,11 @@
+{
+  "id": "proxy",
+  "title": "代理状态",
+  "version": 1,
+  "defaultEnabled": true,
+  "defaultOrder": 0,
+  "layout": { "height": "content", "minHeight": 0, "scroll": "outer" },
+  "lifecycle": { "hidden": "suspend", "start": "first-visible" },
+  "state": { "scope": "global", "version": 1 },
+  "capabilities": ["rpc"]
+}

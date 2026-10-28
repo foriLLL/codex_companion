@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { CdpConnection } from "../src/cdp-connection.mjs";
 import { reserveLoopbackPort } from "../src/launcher.mjs";
+import { attachMediaIntercept, registerMediaInterceptPort } from "../src/media-intercept.mjs";
 import { listCdpTargets } from "../src/targets.mjs";
 
 const run = promisify(execFile);
@@ -19,7 +20,7 @@ let chrome;
 let cdp;
 let server;
 try {
-  const bun = path.join(root, "node_modules/.bin/bun");
+  const bun = path.join(root, "node_modules", "bun", "bin", "bun.exe");
   for (const [source, output] of [["src/cards/emby/renderer.mjs", "emby.js"], ["src/cards/hongguo/renderer.mjs", "hongguo.js"], ["src/renderer/platform/effects.mjs", "effects.js"]]) {
     await run(bun, ["build", source, "--target", "browser", "--outfile", path.join(temporary, output)], { cwd: root });
   }
@@ -37,6 +38,7 @@ try {
     try {
       let name = new URL(request.url, "http://127.0.0.1").pathname.slice(1);
       if (name === "hls/11111111-1111-4111-8111-111111111111/clip.mp4") name = "clip.mp4";
+      if (name.startsWith("hls/")) { response.writeHead(404).end(); return; }
       if (!name) { response.end('<!doctype html><meta charset="utf-8"><script type="module" src="/page.mjs"></script>'); return; }
       if (!/^[a-zA-Z0-9.-]+$/.test(name)) { response.writeHead(400).end(); return; }
       const data = await readFile(path.join(temporary, name));
@@ -46,7 +48,7 @@ try {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = await reserveLoopbackPort();
-  chrome = spawn(chromePath, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required", "--remote-debugging-address=127.0.0.1", `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(temporary, "profile")}`, `http://127.0.0.1:${server.address().port}/`], { stdio: "ignore" });
+  chrome = spawn(chromePath, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required", "--remote-debugging-address=127.0.0.1", `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(temporary, "profile")}`, "about:blank"], { stdio: "ignore" });
   let target;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try { target = (await listCdpTargets(port)).find((entry) => entry.type === "page"); } catch {}
@@ -56,6 +58,10 @@ try {
   assert.ok(target, "独立 Chromium target 启动");
   cdp = new CdpConnection(target.webSocketDebuggerUrl, { timeoutMs: 60000 });
   await cdp.connect();
+  // 与注入链路相同：页面请求 .invalid 媒体地址，由 CDP 拦截改写到登记过的本机端口。
+  registerMediaInterceptPort(server.address().port);
+  assert.equal((await attachMediaIntercept(cdp)).active, true, "CDP 媒体拦截启用");
+  await cdp.send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const ready = await cdp.send("Runtime.evaluate", { expression: "Boolean(globalThis.__mediaResult)", returnByValue: true });
     if (ready.result.value) break;

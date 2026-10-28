@@ -31,10 +31,21 @@ export function createCardRuntime({
   const records = new Map();
   const failures = [];
   const shell = shellFactory();
+  const platformController = new AbortController();
+  // 设置有独立代次和 signal，关闭业务卡片不能中止平台 RPC。
+  const hasSettings = typeof shell.configureSettings === "function";
+  if (hasSettings) {
+    const call = rpcClient.scoped("companion", allocateGeneration(), platformController.signal);
+    shell.configureSettings({ call: (method, params) => call(method, params, { timeoutMs: 15_000 }) });
+  }
   let disposed = false;
   let disposal;
   let visibility = { visible: false, reason: "initial", placement: initialConfig.placement };
+  // 独立插件页面可以逐卡切换；旧注入入口未设置覆盖值时保持原有行为。
+  const cardVisibility = new Map();
   let config = normalizeRuntimeConfig(initialConfig, manifests);
+
+  const effectiveVisibility = (id) => ({ ...visibility, visible: visibility.visible && cardVisibility.get(id) !== false });
 
   function report(error, details = {}) {
     failures.push({ message: error?.message || String(error), code: error?.code, ...details });
@@ -109,7 +120,7 @@ export function createCardRuntime({
     record.lifecycle = createCardLifecycle({
       createContext({ signal, effects, settings }) {
         record.effects = effects;
-        effects.setSuspended?.(manifest.lifecycle.hidden === "suspend" && !visibility.visible);
+        effects.setSuspended?.(manifest.lifecycle.hidden === "suspend" && !effectiveVisibility(manifest.id).visible);
         const generation = allocateGeneration();
         record.generation = generation;
         const rpc = rpcClient.scoped(manifest.id, generation, signal);
@@ -117,7 +128,7 @@ export function createCardRuntime({
           root: record.slot.root, manifest, settings,
           storage: makeStorage(manifest, signal), rpc, effects,
           reportError: (error) => report(error, { cardId: manifest.id, phase: "card" }),
-          isVisible: () => visibility.visible,
+          isVisible: () => effectiveVisibility(manifest.id).visible,
           // 只有平台负责可见性；业务可以申请展开，不能操作原生 DOM。
           requestOpen: () => adapter?.setOpen(true)
         };
@@ -136,22 +147,33 @@ export function createCardRuntime({
       }
     });
     records.set(manifest.id, record);
-    record.lifecycle.visibilityChanged(visibility);
-    if (manifest.lifecycle.start === "immediate" || visibility.visible) start(record);
+    record.lifecycle.visibilityChanged(effectiveVisibility(manifest.id));
+    if (manifest.lifecycle.start === "immediate" || effectiveVisibility(manifest.id).visible) start(record);
     return record;
   }
 
   function visibilityChanged(state) {
     visibility = typeof state === "boolean" ? { visible: state, placement: config.placement } : state;
     for (const record of records.values()) {
-      record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !visibility.visible);
-      if (visibility.visible) start(record);
-      record.lifecycle.visibilityChanged(visibility).catch((error) => report(error, { cardId: record.manifest.id }));
+      const effective = effectiveVisibility(record.manifest.id);
+      record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !effective.visible);
+      if (effective.visible) start(record);
+      record.lifecycle.visibilityChanged(effective).catch((error) => report(error, { cardId: record.manifest.id }));
     }
   }
 
+  function setCardVisibility(id, visible) {
+    cardVisibility.set(id, Boolean(visible));
+    const record = records.get(id);
+    if (!record || disposed) return;
+    const effective = effectiveVisibility(id);
+    record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !effective.visible);
+    if (effective.visible) start(record);
+    return record.lifecycle.visibilityChanged(effective).catch((error) => report(error, { cardId: id }));
+  }
+
   const adapter = adapterFactory({
-    host: shell.host, placement: config.placement, hasCards: false,
+    host: shell.host, placement: config.placement, hasCards: false, hasSettings,
     onVisibilityChange: visibilityChanged,
     onError: (error) => report(error, { phase: "adapter" })
   });
@@ -174,6 +196,7 @@ export function createCardRuntime({
     if (disposed) return false;
     const normalized = normalizeRuntimeConfig(next, manifests);
     if (normalized.revision !== null && config.revision !== null && normalized.revision < config.revision) return false;
+    const keepSettingsOpen = normalized.placement !== config.placement && shell.isSettingsOpen?.();
     config = normalized;
     const cleanups = [];
     for (const [id, record] of records) {
@@ -189,8 +212,10 @@ export function createCardRuntime({
       }
     }
     shell.reorder(config.order);
+    shell.setEmptyState?.({ enabled: config.enabled, count: records.size });
     adapter.setPlacement(config.placement);
     adapter.setHasCards(records.size > 0);
+    if (keepSettingsOpen) adapter.setOpen(true);
     await Promise.allSettled(cleanups);
     return true;
   }
@@ -206,6 +231,7 @@ export function createCardRuntime({
   function dispose() {
     if (disposal) return disposal;
     disposed = true;
+    platformController.abort();
     const jobs = [...records.values()].map((record) => remove(record, "unmounted"));
     adapter.dispose();
     shell.dispose();
@@ -215,7 +241,7 @@ export function createCardRuntime({
 
   void applyConfig(initialConfig);
   return {
-    artifactHash, applyConfig, receiveRpc: rpcClient.receiveRpc, retry, dispose,
+    artifactHash, applyConfig, receiveRpc: rpcClient.receiveRpc, retry, dispose, setCardVisibility,
     getCardApi: (id) => records.get(id)?.handle?.api,
     isMounted: () => !disposed,
     isPlaced: () => adapter.isPlaced(),

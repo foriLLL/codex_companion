@@ -34,7 +34,7 @@ export async function stopCodex({
 }
 
 /**
- * 汇总当前状态：Codex 是否运行、是否带 CDP flag、运行时状态文件内容与配置。
+ * 汇总当前状态：Codex 是否运行、是否带 CDP flag、代理端口、运行时状态文件内容与配置。
  * 输出为可被 Swift 侧 JSONDecoder 直接解析的扁平结构。
  *
  * 注意：ps 扫描失败与「确认没有进程」必须区分——前者 statusError=true，
@@ -59,11 +59,15 @@ export async function collectStatus({
     Promise.resolve().then(loadConfig ?? (() => null)).catch(() => null)
   ]);
 
+  // 代理端口取自 Companion 维护的那个 Codex 的命令行；未带 --proxy-server 时为 null。
+  const maintained = processes.find((entry) => runtime?.port && entry.cdpPort === runtime.port)
+    ?? processes.find((entry) => entry.hasCdpFlag);
   return {
     statusError,
     codexRunning: processes.length > 0,
     hasCdpFlag: processes.some((entry) => entry.hasCdpFlag),
     codexPids: processes.map((entry) => entry.pid),
+    proxyPort: maintained?.proxyPort ?? null,
     port: runtime?.port ?? null,
     daemonPid: runtime?.daemonPid ?? null,
     cards: config?.cards ?? null

@@ -8,6 +8,7 @@ import {
   DEFAULT_CARDS,
   normalizeCompanionConfig
 } from "../src/companion-config.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
 
 async function withTempDir(run) {
   const dir = await mkdtemp(join(tmpdir(), "companion-config-"));
@@ -23,9 +24,8 @@ test("normalize：默认四张卡片全开、placement 默认 standalone，未�
     version: 1,
     enabled: true,
     placement: "standalone-button",
-    cards: { games: true, hongguo: true, riverclub: true, emby: true },
-    cardOrder: ["games", "hongguo", "riverclub", "emby"],
-    riverclubUrl: "https://riverclub.booocai.com/"
+    cards: { games: true, hongguo: true, emby: true },
+    cardOrder: ["games", "hongguo", "emby"]
   });
   assert.deepEqual(normalizeCompanionConfig({
     version: 99,
@@ -37,40 +37,38 @@ test("normalize：默认四张卡片全开、placement 默认 standalone，未�
     version: 1,
     enabled: true,
     placement: "standalone-button",
-    cards: { games: true, hongguo: false, riverclub: true, emby: true },
-    cardOrder: ["games", "hongguo", "riverclub", "emby"],
-    riverclubUrl: "https://riverclub.booocai.com/"
+    cards: { games: true, hongguo: false, emby: true },
+    cardOrder: ["games", "hongguo", "emby"]
   });
   assert.equal(normalizeCompanionConfig({ enabled: false }).enabled, false);
   assert.equal(normalizeCompanionConfig({ placement: "inline-in-summary" }).placement, "inline-in-summary");
-  assert.deepEqual(normalizeCompanionConfig({ cards: [] }).cards, DEFAULT_CARDS);
+  assert.deepEqual(normalizeCompanionConfig({ cards: [] }).cards, { games: true, hongguo: true, emby: true });
 });
 
 test("normalize：cardOrder 白名单过滤、去重、缺失项补末尾", () => {
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "hongguo"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "emby", "bogus"] }).cardOrder, ["games", "emby", "hongguo", "riverclub"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: "emby" }).cardOrder, ["games", "hongguo", "riverclub", "emby"]);
-  assert.deepEqual(normalizeCompanionConfig({ cardOrder: [] }).cardOrder, ["games", "hongguo", "riverclub", "emby"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "hongguo"] }).cardOrder, ["games", "emby", "hongguo"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby"] }).cardOrder, ["games", "emby", "hongguo"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: ["emby", "emby", "bogus"] }).cardOrder, ["games", "emby", "hongguo"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: "emby" }).cardOrder, ["games", "hongguo", "emby"]);
+  assert.deepEqual(normalizeCompanionConfig({ cardOrder: [] }).cardOrder, ["games", "hongguo", "emby"]);
 });
 
 test("save 写入 0600 并可 load 回读", async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, "config.json");
-    const config = new CompanionConfig({ path });
+    const config = new CompanionConfig({ path, execFileImpl: async () => ({ stdout: "" }) });
     await config.save({ cards: { hongguo: false, emby: true } });
 
     const info = await stat(path);
-    assert.equal(info.mode & 0o777, 0o600);
+    assertMode(info, 0o600);
 
     const loaded = await config.load();
     assert.deepEqual(loaded, {
       version: 1,
       enabled: true,
       placement: "standalone-button",
-      cards: { games: true, hongguo: false, riverclub: true, emby: true },
-      cardOrder: ["games", "hongguo", "riverclub", "emby"],
-    riverclubUrl: "https://riverclub.booocai.com/"
+      cards: { proxy: true, games: true, hongguo: false, emby: true },
+      cardOrder: ["proxy", "games", "hongguo", "emby"]
     });
   });
 });
@@ -78,14 +76,13 @@ test("save 写入 0600 并可 load 回读", async () => {
 test("load：文件缺失或损坏时回退默认，不抛异常", async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, "config.json");
-    const config = new CompanionConfig({ path });
+    const config = new CompanionConfig({ path, execFileImpl: async () => ({ stdout: "" }) });
     assert.deepEqual(await config.load(), {
       version: 1,
       enabled: true,
       placement: "standalone-button",
       cards: { ...DEFAULT_CARDS },
-      cardOrder: ["games", "hongguo", "riverclub", "emby"],
-    riverclubUrl: "https://riverclub.booocai.com/"
+      cardOrder: ["proxy", "games", "hongguo", "emby"]
     });
 
     await writeFile(path, "{ broken", "utf8");
@@ -94,8 +91,7 @@ test("load：文件缺失或损坏时回退默认，不抛异常", async () => {
       enabled: true,
       placement: "standalone-button",
       cards: { ...DEFAULT_CARDS },
-      cardOrder: ["games", "hongguo", "riverclub", "emby"],
-    riverclubUrl: "https://riverclub.booocai.com/"
+      cardOrder: ["proxy", "games", "hongguo", "emby"]
     });
   });
 });
@@ -112,8 +108,9 @@ test("save 失败时清理临时文件", async () => {
 });
 
 
-test("River Club URL 限制来源，旧配置迁移到红果之后且保留既有顺序", () => {
-  assert.deepEqual(normalizeCompanionConfig({cardOrder:["hongguo","emby"]}).cardOrder,["games","hongguo","riverclub","emby"]);
-  assert.equal(normalizeCompanionConfig({riverclubUrl:"https://evil.test/"}).riverclubUrl,"https://riverclub.booocai.com/");
-  assert.equal(normalizeCompanionConfig({riverclubUrl:"https://riverclub.booocai.com/?invite=test"}).riverclubUrl,"https://riverclub.booocai.com/?invite=test");
+test("v1 配置里未知卡片与字段被忽略", () => {
+  const config = normalizeCompanionConfig({ cards: { retired: true }, cardOrder: ["retired", "emby"], retiredUrl: "https://example.com/" });
+  assert.equal(Object.hasOwn(config, "retiredUrl"), false);
+  assert.equal(Object.hasOwn(config.cards, "retired"), false);
+  assert.deepEqual(config.cardOrder, ["games", "emby", "hongguo"]);
 });

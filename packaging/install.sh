@@ -97,6 +97,20 @@ EOF
 
 main() {
   [ "$(uname -s)" = "Darwin" ] || die "目前仅支持 macOS。"
+  if [ "$#" -eq 1 ] && [ "$1" = "--uninstall" ]; then
+    [ -d "$APP_PATH" ] && [ ! -L "$APP_PATH" ] || die "未找到可卸载的 App：$APP_PATH"
+    local identifier backend
+    identifier="$(defaults read "$APP_PATH/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+    [ "$identifier" = "$BUNDLE_ID" ] || die "Bundle ID 不匹配；拒绝删除 $APP_PATH。"
+    backend="$APP_PATH/Contents/Resources/codex-companion"
+    [ -x "$backend" ] || die "未找到 App 内的后端；请在 App 中停用后手动卸载。"
+    # 后台服务未成功停用时保留 App，避免留下指向已删除程序的 job。
+    "$backend" agent uninstall || die "停用后台服务失败；App 已保留，请重试。"
+    rm -rf "$APP_PATH"
+    log "Companion 已卸载；配置保留在 ~/Library/Application Support/codex-companion。"
+    return 0
+  fi
+  [ "$#" -eq 0 ] || die "用法：bash install.sh [--uninstall]"
   [[ "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
     || die "这是未注入有效 Apple Team ID 的安装脚本模板，请改用 GitHub Release 中的 install.sh。"
 
@@ -195,19 +209,21 @@ main() {
 
   log "主程序安装完成：$APP_PATH"
   ensure_optional_ffmpeg
-  if ! open "$APP_PATH"; then
-    log "应用已安装，但未能自动打开；请从 $APP_PATH 手动启动。"
-  fi
-
   cat <<EOF
 
   已安装到：$APP_PATH
-  以后请通过「$APP_NAME」启动 Codex。
-  日志：~/Library/Logs/$APP_NAME/launcher.log
+  即将打开引导，请点击「启用自动加载」；如需批准，请前往「系统设置 › 通用 › 登录项」。
+  以后直接打开 Codex 即可；「$APP_NAME」仅用于引导、状态和备用设置。
+  日志：~/Library/Logs/codex-companion/
+  卸载：在 App 中点击「卸载 Companion」后移到废纸篓，或运行 bash install.sh --uninstall。
+  配置保留在 ~/Library/Application Support/codex-companion。
 
 EOF
   print_ffmpeg_summary
   printf '\n'
+  if ! open "$APP_PATH"; then
+    log "应用已安装，但未能打开引导；请手动打开 $APP_PATH 并点击「启用自动加载」。"
+  fi
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

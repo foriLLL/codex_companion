@@ -2,15 +2,16 @@ import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { companionDataDir, legacyCompanionDataDir } from "./platform/paths.mjs";
 
 const CACHE_FILE_LIMIT = 4 * 1024 * 1024;
 
 export function defaultHongguoCachePath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "hongguo-home.json");
+  return join(companionDataDir(home), "hongguo-home.json");
 }
 
 export function legacyHongguoCachePath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-hg", "hongguo-home.json");
+  return join(legacyCompanionDataDir(home), "hongguo-home.json");
 }
 
 function validCatalog(catalog) {

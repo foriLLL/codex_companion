@@ -30,11 +30,3 @@ test("统一 RPC Service 按命名空间隔离红果和 Emby", async () => {
 });
 
 
-test("River Club 入口使用本机固定配置，忽略 renderer 传入的任意 URL", async () => {
-  const calls=[];
-  const service=new CodexCompanionService({embyService:{},hongguoService:{},
-    configStore:{load:async()=>({riverclubUrl:"https://riverclub.booocai.com/?invite=test"})},
-    openUrlImpl:async url=>calls.push(url)});
-  assert.deepEqual(await service.handleRpc("riverclub.open",{url:"file:///etc/passwd"}),{opened:true});
-  assert.deepEqual(calls,["https://riverclub.booocai.com/?invite=test"]);
-});

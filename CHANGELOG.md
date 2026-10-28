@@ -2,6 +2,15 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## Unreleased
+
+- 主入口改为官方 Codex 插件（MCP Apps），后端由 Codex 自动启动，不再依赖 CDP；
+- 插件支持 macOS、Windows 与 Linux（arm64 / x64）：数据目录遵循各平台约定，
+  Emby Token 分别存入钥匙串、DPAPI 与 Secret Service；
+- 卡片平台化：统一外框、配置 v2、生命周期、存档与 RPC，新增代理状态卡片；
+- Emby 播放界面重做，注入模式下兼容 MP4 经 CDP 媒体拦截原生播放；
+- 通过代理重启 Codex、无感注入与 `.app` 仅在 macOS 提供。
+
 ## 0.0.1 - 2026-07-30
 
 首个公开预览版本：

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { HongguoCatalogStorage } from "../src/hongguo-storage.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
 
 test("红果目录快照原子保存为 0600，并忽略损坏缓存", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-companion-hongguo-storage-"));
@@ -23,7 +24,7 @@ test("红果目录快照原子保存为 0600，并忽略损坏缓存", async (t)
 
   await storage.save(snapshot);
   assert.deepEqual(await storage.load(), snapshot);
-  assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+  assertMode(await stat(cachePath), 0o600);
   assert.match(await readFile(cachePath, "utf8"), /"短剧"/);
 
   await writeFile(cachePath, "{broken", "utf8");

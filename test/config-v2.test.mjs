@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { watch } from "node:fs";
 import test from "node:test";
-import { CompanionConfig, toLegacyCompanionConfig } from "../src/companion-config.mjs";
+import { CompanionConfig, normalizeCompanionConfigV2, toLegacyCompanionConfig } from "../src/companion-config.mjs";
 import { CARD_MANIFESTS } from "../src/card-registry.mjs";
 import { watchCompanionConfig } from "../src/platform/config/watcher.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
+
+const createConfig = options => new CompanionConfig({ execFileImpl: async () => ({ stdout: "" }), ...options });
 
 async function temporary(t) {
   const dir = await mkdtemp(join(tmpdir(), "companion-v2-"));
@@ -38,20 +41,21 @@ async function eventually(predicate) {
 test("v1 迁移保留原文件与精确备份，v2 0600，旧窗口写入不再影响新配置", async t => {
   const { dir, path } = await temporary(t);
   const oldPath = join(dir, "config.json");
-  const original = JSON.stringify({ version: 1, enabled: false, cards: { games: false, hongguo: true, emby: false }, cardOrder: ["emby", "hongguo"], riverclubUrl: "https://riverclub.booocai.com/?invite=test" });
+  const original = JSON.stringify({ version: 1, enabled: false, cards: { games: false, hongguo: true, emby: false }, cardOrder: ["emby", "hongguo"], retiredUrl: "https://example.com/?invite=test" });
   await writeFile(oldPath, original);
-  const store = new CompanionConfig({ path });
+  const store = createConfig({ path });
   const config = await store.loadV2();
   assert.equal(config.version, 2);
   assert.equal(config.revision, 0);
   assert.equal(config.cards.games.enabled, false);
   assert.equal(config.cards.emby.enabled, false);
-  assert.equal(config.cards.riverclub.settings.url, "https://riverclub.booocai.com/?invite=test");
-  assert.deepEqual(config.order, ["games", "emby", "hongguo", "riverclub"]);
+  // v1 的未知顶层字段不迁移。
+  assert.equal(Object.hasOwn(config, "retiredUrl"), false);
+  assert.deepEqual(config.order, ["proxy", "games", "emby", "hongguo"]);
   assert.equal(await readFile(oldPath, "utf8"), original);
   assert.equal(await readFile(`${oldPath}.v1.bak`, "utf8"), original);
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
-  assert.equal((await stat(`${oldPath}.v1.bak`)).mode & 0o777, 0o600);
+  assertMode(await stat(path), 0o600);
+  assertMode(await stat(`${oldPath}.v1.bak`), 0o600);
   await writeFile(oldPath, JSON.stringify({ version: 1, enabled: true }));
   assert.equal((await store.loadV2()).enabled, false);
 });
@@ -59,7 +63,7 @@ test("v1 迁移保留原文件与精确备份，v2 0600，旧窗口写入不再�
 test("未知卡片、未知 settings 保留；默认从 manifest 产生；补丁仅更新指定字段", async t => {
   const { path } = await temporary(t);
   const manifests = [...CARD_MANIFESTS, { id: "fifth", defaultEnabled: false }];
-  const store = new CompanionConfig({ path, manifests });
+  const store = createConfig({ path, manifests });
   let config = await store.loadV2();
   assert.equal(config.cards.fifth.enabled, false);
   config = await store.patch({ cards: { future: { enabled: false, settings: { a: 1, nested: { preserve: true } } }, games: { settings: { sound: false } } } }, { expectedRevision: config.revision });
@@ -67,14 +71,14 @@ test("未知卡片、未知 settings 保留；默认从 manifest 产生；补丁
   assert.deepEqual(config.cards.future.settings, { a: 1, nested: { preserve: true }, b: 2 });
   assert.equal(config.cards.games.settings.sound, false);
   assert.equal(toLegacyCompanionConfig(config).cards.fifth, false);
-  const oldBinary = new CompanionConfig({ path });
+  const oldBinary = createConfig({ path });
   assert.deepEqual((await oldBinary.loadV2()).cards.fifth, config.cards.fifth);
 });
 
 test("两个写入者同 revision 仅一个成功；冲突重读后保留前一写入", async t => {
   const { path, dir } = await temporary(t);
-  const a = new CompanionConfig({ path });
-  const b = new CompanionConfig({ path });
+  const a = createConfig({ path });
+  const b = createConfig({ path });
   const initial = await a.loadV2();
   const results = await Promise.allSettled([
     a.patch({ enabled: false }, { expectedRevision: initial.revision }),
@@ -94,7 +98,7 @@ test("两个写入者同 revision 仅一个成功；冲突重读后保留前一�
 test("初次损坏明确失败，运行中损坏保留 last-good，补丁不能覆盖损坏文件", async t => {
   const { path } = await temporary(t);
   await writeFile(path, "{broken");
-  const fresh = new CompanionConfig({ path });
+  const fresh = createConfig({ path });
   await assert.rejects(fresh.loadV2(), { code: "CONFIG_INVALID" });
   await rm(path);
   const good = await fresh.loadV2();
@@ -108,13 +112,13 @@ test("初次损坏明确失败，运行中损坏保留 last-good，补丁不能�
 test("旧配置损坏不迁移，不生成默认配置覆盖用户意图", async t => {
   const { path, dir } = await temporary(t);
   await writeFile(join(dir, "config.json"), "broken");
-  await assert.rejects(new CompanionConfig({ path }).loadV2(), { code: "CONFIG_MIGRATION_INVALID" });
+  await assert.rejects(createConfig({ path }).loadV2(), { code: "CONFIG_MIGRATION_INVALID" });
   await assert.rejects(stat(path), { code: "ENOENT" });
 });
 
 test("实际目录 watcher 覆盖四卡与第五卡的 enabled/settings、顺序、placement、损坏恢复", async t => {
   const { path } = await temporary(t);
-  const store = new CompanionConfig({ path, manifests: [...CARD_MANIFESTS, { id: "fifth", defaultEnabled: false }] });
+  const store = createConfig({ path, manifests: [...CARD_MANIFESTS, { id: "fifth", defaultEnabled: false }] });
   let latest;
   const seen = [];
   const errors = [];
@@ -144,16 +148,31 @@ test("实际目录 watcher 覆盖四卡与第五卡的 enabled/settings、顺序
 
 test("CLI 真实子进程目录、配置和 stdin 补丁；冲突机器可读且不写配置", async t => {
   const { path } = await temporary(t);
+  // 子进程读取已含 launch 的隔离配置，不触发真实 defaults 迁移。
+  await createConfig({ path }).loadV2();
   const catalog = await command(["cards", "list"]);
   assert.equal(catalog.code, 0, catalog.stderr);
   assert.deepEqual(JSON.parse(catalog.stdout).map(card => card.id), CARD_MANIFESTS.map(card => card.id));
   const initial = await command(["config", "get", "--config-path", path]);
   assert.equal(initial.code, 0, initial.stderr);
   const config = JSON.parse(initial.stdout);
-  const patched = await command(["config", "patch", "--config-path", path], { expectedRevision: config.revision, patch: { cards: { games: { enabled: false }, future: { enabled: true, settings: { test: 1 } } } } });
+  const patched = await command(["config", "patch", "--config-path", path], { expectedRevision: config.revision, patch: {
+    cards: { games: { enabled: false }, future: { enabled: true, settings: { test: 1 } } },
+    launch: { proxy: { port: 7891 } }, agent: { autoRelaunch: false }
+  } });
   assert.equal(patched.code, 0, patched.stderr);
   const result = JSON.parse(patched.stdout);
   assert.equal(result.cards.games.enabled, false);
+  assert.deepEqual(result.launch, { proxy: { enabled: false, port: 7891 } });
+  assert.deepEqual(result.agent, { autoRelaunch: false });
+  const readBack = await command(["config", "get", "--config-path", path]);
+  assert.equal(readBack.code, 0, readBack.stderr);
+  assert.deepEqual(JSON.parse(readBack.stdout), result);
+  const invalid = await command(["config", "patch", "--config-path", path], {
+    expectedRevision: result.revision, patch: { launch: { proxy: { port: 65536 } } }
+  });
+  assert.equal(invalid.code, 1);
+  assert.equal(JSON.parse(invalid.stderr).error.code, "CONFIG_PATCH_INVALID");
   const conflict = await command(["config", "patch", "--config-path", path], { expectedRevision: config.revision, patch: { enabled: false } });
   assert.equal(conflict.code, 1);
   assert.equal(JSON.parse(conflict.stderr).error.code, "CONFIG_CONFLICT");
@@ -162,7 +181,7 @@ test("CLI 真实子进程目录、配置和 stdin 补丁；冲突机器可读且
 
 test("非法补丁、缺 revision、锁超时均失败关闭", async t => {
   const { path } = await temporary(t);
-  const store = new CompanionConfig({ path, lockTimeoutMs: 30 });
+  const store = createConfig({ path, lockTimeoutMs: 30 });
   const config = await store.loadV2();
   await assert.rejects(store.patch({ enabled: false }), { code: "CONFIG_REVISION_REQUIRED" });
   for (const patch of [{ revision: 42 }, { enabled: "false" }, { cards: { games: { settings: null } } }]) {
@@ -176,7 +195,7 @@ test("非法补丁、缺 revision、锁超时均失败关闭", async t => {
 
 test("运行中删除配置不重新迁移旧文件，异步应用失败可重试且不并发", async t => {
   const { path } = await temporary(t);
-  const store = new CompanionConfig({ path });
+  const store = createConfig({ path });
   const initial = await store.loadV2();
   await rm(path);
   assert.deepEqual(await store.loadV2(), initial);
@@ -207,7 +226,7 @@ test("已知 revision 0 的写入者遇到文件消失时拒绝重新迁移", as
   const { path, dir } = await temporary(t);
   const oldPath = join(dir, "config.json");
   await writeFile(oldPath, JSON.stringify({ cards: { hongguo: false, future: { enabled: false, settings: { preserve: 1 } } } }));
-  const store = new CompanionConfig({ path });
+  const store = createConfig({ path });
   const initial = await store.loadV2();
   assert.equal(initial.revision, 0);
   await rm(path);
@@ -220,7 +239,7 @@ test("已知 revision 0 的写入者遇到文件消失时拒绝重新迁移", as
 test("watcher 隔离同步抛错和异步拒绝的 reporter，包括原生 watcher error", async t => {
   for (const asynchronous of [false, true]) {
     const { path } = await temporary(t);
-    const store = new CompanionConfig({ path });
+    const store = createConfig({ path });
     const initial = await store.loadV2();
     await writeFile(path, "broken");
     let nativeWatcher;
@@ -255,14 +274,14 @@ test("迁移拒绝有效 JSON 中的类型损坏，不写 v2 或备份", async t
     { cards: [] }, { cards: null }, { cards: { hongguo: "false" } },
     { cards: { hongguo: { enabled: "false" } } },
     { cards: { future: { enabled: false, settings: [] } } },
-    { cardOrder: "hongguo" }, { cardOrder: [false] }, { riverclubUrl: 42 }
+    { cardOrder: "hongguo" }, { cardOrder: [false] }
   ];
   for (const value of invalid) {
     const { path, dir } = await temporary(t);
     const oldPath = join(dir, "config.json");
     const original = JSON.stringify(value);
     await writeFile(oldPath, original);
-    await assert.rejects(new CompanionConfig({ path }).loadV2(), { code: "CONFIG_MIGRATION_INVALID" });
+    await assert.rejects(createConfig({ path }).loadV2(), { code: "CONFIG_MIGRATION_INVALID" });
     assert.equal(await readFile(oldPath, "utf8"), original);
     await assert.rejects(stat(path), { code: "ENOENT" });
     await assert.rejects(stat(`${oldPath}.v1.bak`), { code: "ENOENT" });
@@ -274,14 +293,26 @@ test("迁移保留缺省字段与未知卡片数据，兼容对象设置不会�
   const unknown = { enabled: false, settings: { nested: { keep: true } }, futureData: [1, 2] };
   await writeFile(join(dir, "config.json"), JSON.stringify({ cards: {
     hongguo: false, future: unknown, futurebool: false,
-    riverclub: { enabled: false, settings: { url: "https://riverclub.booocai.com/?invite=keep" } }
+    retired: { enabled: false, settings: { url: "https://example.com/?invite=keep" } }
   } }));
-  const config = await new CompanionConfig({ path }).loadV2();
+  const config = await createConfig({ path }).loadV2();
   assert.equal(config.enabled, true);
   assert.equal(config.placement, "standalone-button");
   assert.equal(config.cards.hongguo.enabled, false);
   assert.deepEqual(config.cards.future, unknown);
   assert.equal(config.cards.futurebool.enabled, false);
-  assert.equal(config.cards.riverclub.enabled, false);
-  assert.equal(config.cards.riverclub.settings.url, "https://riverclub.booocai.com/?invite=keep");
+  assert.equal(config.cards.retired.enabled, false);
+  assert.equal(config.cards.retired.settings.url, "https://example.com/?invite=keep");
+});
+
+test("升级新增的内置卡按 defaultOrder 插入，已有卡片相对顺序不变", () => {
+  const manifests = [
+    { id: "proxy", defaultEnabled: true, defaultOrder: 0 },
+    { id: "games", defaultEnabled: true, defaultOrder: 10 },
+    { id: "middle", defaultEnabled: false, defaultOrder: 25 },
+    { id: "emby", defaultEnabled: true, defaultOrder: 40 }
+  ];
+  const config = normalizeCompanionConfigV2({ version: 2, order: ["emby", "games", "orphan"], cards: { orphan: { enabled: true } } }, manifests);
+  assert.deepEqual(config.order, ["proxy", "middle", "emby", "games", "orphan"]);
+  assert.deepEqual(normalizeCompanionConfigV2({ version: 2 }, manifests).order, ["proxy", "games", "middle", "emby"]);
 });

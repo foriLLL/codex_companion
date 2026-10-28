@@ -1,12 +1,14 @@
+import { setTimeout as sleep } from "node:timers/promises";
+
 const REQUEST_TIMEOUT_MS = 2_000;
 
-export async function listCdpTargets(port, { fetchImpl = fetch } = {}) {
+export async function listCdpTargets(port, { fetchImpl = fetch, signal } = {}) {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new TypeError(`无效 CDP 端口：${port}`);
   }
 
   const response = await fetchImpl(`http://127.0.0.1:${port}/json/list`, {
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`CDP target 查询失败：HTTP ${response.status}`);
 
@@ -39,18 +41,21 @@ export function filterCodexTargets(targets) {
   });
 }
 
-export async function waitForCodexTargets(port, { timeoutMs = 30_000, intervalMs = 300 } = {}) {
+export async function waitForCodexTargets(port, { timeoutMs = 30_000, intervalMs = 300, signal, listTargets = listCdpTargets } = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
 
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
-      const targets = filterCodexTargets(await listCdpTargets(port));
+      const targets = filterCodexTargets(await listTargets(port, { signal }));
+      signal?.throwIfAborted();
       if (targets.length > 0) return targets;
     } catch (error) {
+      signal?.throwIfAborted();
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await sleep(intervalMs, undefined, { signal });
   }
 
   const suffix = lastError ? `；最后错误：${lastError.message}` : "";

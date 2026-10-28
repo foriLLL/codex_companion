@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -9,13 +10,27 @@ struct CardDescriptor: Identifiable, Decodable {
     let defaultEnabled: Bool
 }
 
-struct CompanionStatus: Decodable {
-    var statusError: Bool?
-    var codexRunning: Bool
-    var hasCdpFlag: Bool
-    var codexPids: [Int]
-    var port: Int?
-    var daemonPid: Int?
+struct AgentStatus: Decodable {
+    struct Codex: Decodable {
+        let running: Bool
+        let pid: Int?
+        let attached: Bool
+        let port: Int?
+        let proxyPort: Int?
+    }
+    struct Event: Decodable { let event: String; let at: Double }
+    let available: Bool
+    let version: String
+    let pid: Int?
+    let autoRelaunch: Bool
+    let codex: Codex
+    let lastEvent: Event?
+    let nativeHelper: String
+
+    // status 未暴露调试地址；已有端口时不猜测实例归属，也不建议重启。
+    var shouldOfferRestart: Bool {
+        available && codex.running && !codex.attached && codex.port == nil && nativeHelper == "ok"
+    }
 }
 
 struct CardConfig: Decodable {
@@ -23,12 +38,17 @@ struct CardConfig: Decodable {
 }
 
 struct CompanionConfigFile: Decodable {
+    struct Launch: Decodable {
+        struct Proxy: Decodable { let enabled: Bool; let port: Int }
+        let proxy: Proxy
+    }
     var version: Int
     var revision: Int
     var enabled: Bool
     var placement: String
     var cards: [String: CardConfig]
     var order: [String]
+    var launch: Launch
 }
 
 struct BackendFailure: Decodable {
@@ -36,9 +56,34 @@ struct BackendFailure: Decodable {
     let error: Detail
 }
 
-struct StopResult: Decodable {
-    var stopped: Bool
-    var reason: String
+struct AgentInstallResult: Decodable { let installed: Bool }
+struct AgentUninstallResult: Decodable { let uninstalled: Bool; let unmountError: String? }
+struct AgentRestartResult: Decodable {
+    let launched: Bool
+    let reason: String?
+    let message: String?
+
+    func validate() throws {
+        guard launched else {
+            throw BackendError.commandFailed(message ?? "未能重启 Codex：\(reason ?? "未知原因")")
+        }
+    }
+}
+
+// 路径选择保持纯逻辑，测试不读取真实 bundle 或用户目录。
+func resolveBackendURL(resourcesURL: URL?, developmentPath: String?, isExecutable: (String) -> Bool) -> URL? {
+    if let bundled = resourcesURL?.appendingPathComponent("codex-companion"), isExecutable(bundled.path) {
+        return bundled
+    }
+    if let developmentPath, isExecutable(developmentPath) { return URL(fileURLWithPath: developmentPath) }
+    return nil
+}
+
+func parseProxyPort(_ text: String) -> Int? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isASCII && $0.isNumber }),
+          let port = Int(trimmed), (1...65_535).contains(port) else { return nil }
+    return port
 }
 
 // MARK: - 后端桥（调 Resources/codex-companion 子命令、读写共享配置文件）
@@ -64,16 +109,9 @@ final class CompanionBackend {
     static let shared = CompanionBackend()
 
     private var binaryURL: URL? {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("codex-companion"),
-           FileManager.default.isExecutableFile(atPath: bundled.path) {
-            return bundled
-        }
-        // 开发态回退：swift run 时无 bundle 资源，用环境变量指向仓库里的二进制
-        if let dev = ProcessInfo.processInfo.environment["CODEX_COMPANION_BACKEND"],
-           FileManager.default.isExecutableFile(atPath: dev) {
-            return URL(fileURLWithPath: dev)
-        }
-        return nil
+        resolveBackendURL(resourcesURL: Bundle.main.resourceURL,
+                          developmentPath: ProcessInfo.processInfo.environment["CODEX_COMPANION_BACKEND"],
+                          isExecutable: FileManager.default.isExecutableFile(atPath:))
     }
 
     private func backendEnvironment() -> [String: String] {
@@ -119,12 +157,26 @@ final class CompanionBackend {
         }
     }
 
-    func status() async throws -> CompanionStatus {
-        try JSONDecoder().decode(CompanionStatus.self, from: await run(["status"]))
+    func status() async throws -> AgentStatus {
+        try JSONDecoder().decode(AgentStatus.self, from: await run(["agent", "status"]))
     }
 
-    func stopCodex() async throws -> StopResult {
-        try JSONDecoder().decode(StopResult.self, from: await run(["stop-codex"]))
+    func installAgent() async throws {
+        let result = try JSONDecoder().decode(AgentInstallResult.self, from: await run(["agent", "install"]))
+        guard result.installed else { throw BackendError.commandFailed("后台服务安装失败。") }
+    }
+
+    func uninstallAgent() async throws {
+        let result = try JSONDecoder().decode(AgentUninstallResult.self, from: await run(["agent", "uninstall"]))
+        guard result.uninstalled else { throw BackendError.commandFailed("后台服务停用失败。") }
+        if let error = result.unmountError {
+            throw BackendError.commandFailed("后台服务已停用，但卡片未完全移除：\(error)。可重试停用。")
+        }
+    }
+
+    func restartCodex() async throws {
+        let result = try JSONDecoder().decode(AgentRestartResult.self, from: await run(["agent", "restart-codex"]))
+        try result.validate()
     }
 
     func catalog() async throws -> [CardDescriptor] {
@@ -140,46 +192,122 @@ final class CompanionBackend {
         return try JSONDecoder().decode(CompanionConfigFile.self, from: await run(["config", "patch"], input: data))
     }
 
-    private(set) var launchedProcess: Process?
+}
 
-    /// 启动 Codex + 常驻注入维护。launch 是长驻进程，不等待退出；输出写入日志文件。
-    func launchDetached(proxyPort: Int? = nil) throws {
-        guard let binary = binaryURL else { throw BackendError.binaryMissing }
-        let logDirectory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/Codex Companion")
-        try? FileManager.default.createDirectory(
-            at: logDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        let logURL = logDirectory.appendingPathComponent("launcher.log")
-        // 日志会记录临时 CDP 端口等信息；限制为仅本用户可读写（0600），
-        // 避免同机其他用户读取端口后连上无鉴权的 CDP 调试端点。
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(
-                atPath: logURL.path,
-                contents: nil,
-                attributes: [.posixPermissions: 0o600]
-            )
-        } else {
-            // 收紧旧版本可能以默认 0644 创建的日志文件。
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
-        }
+// MARK: - 自动加载注册（依赖可替换；测试不调用 ServiceManagement 或 CLI）
 
-        let process = Process()
-        process.executableURL = binary
-        process.arguments = ["launch"] + (proxyPort.map { ["--proxy-port", String($0)] } ?? [])
-        process.environment = backendEnvironment()
-        if let logHandle = try? FileHandle(forWritingTo: logURL) {
-            logHandle.seekToEndOfFile()
-            process.standardOutput = logHandle
-            process.standardError = logHandle
-        }
-        try process.run()
-        // 不 waitUntilExit：launch 常驻。保留引用避免被提前回收。
-        launchedProcess = process
+enum AgentInstallMethod: String { case serviceManagement, commandLine }
+enum AgentRegistrationState { case enabled, requiresApproval, notRegistered, notFound }
+
+@MainActor
+final class AgentRegistration {
+    static let defaultsKey = "agentInstallMethod"
+    private let readMethod: () -> AgentInstallMethod?
+    private let writeMethod: (AgentInstallMethod?) -> Void
+    private let serviceState: () -> AgentRegistrationState
+    private let fallbackExists: () -> Bool
+    private let registerService: () throws -> Void
+    private let unregisterService: () async throws -> Void
+    private let installCommand: () async throws -> Void
+    private let uninstallCommand: () async throws -> Void
+
+    init(readMethod: @escaping () -> AgentInstallMethod?, writeMethod: @escaping (AgentInstallMethod?) -> Void,
+         serviceState: @escaping () -> AgentRegistrationState, fallbackExists: @escaping () -> Bool,
+         registerService: @escaping () throws -> Void, unregisterService: @escaping () async throws -> Void,
+         installCommand: @escaping () async throws -> Void, uninstallCommand: @escaping () async throws -> Void) {
+        self.readMethod = readMethod
+        self.writeMethod = writeMethod
+        self.serviceState = serviceState
+        self.fallbackExists = fallbackExists
+        self.registerService = registerService
+        self.unregisterService = unregisterService
+        self.installCommand = installCommand
+        self.uninstallCommand = uninstallCommand
     }
 
+    var method: AgentInstallMethod? {
+        if let saved = readMethod() { return saved }
+        if serviceState() == .enabled || serviceState() == .requiresApproval { return .serviceManagement }
+        return fallbackExists() ? .commandLine : nil
+    }
+
+    var state: AgentRegistrationState {
+        switch method {
+        case .serviceManagement: return serviceState()
+        case .commandLine: return fallbackExists() ? .enabled : .notRegistered
+        case nil: return .notRegistered
+        }
+    }
+
+    func enable() async throws {
+        // 保持既有安装路径，避免重复注册同一个 label。
+        if method == .commandLine {
+            writeMethod(.commandLine)
+            try await installCommand()
+            return
+        }
+        if serviceState() == .enabled || serviceState() == .requiresApproval {
+            writeMethod(.serviceManagement)
+            return
+        }
+        do {
+            try registerService()
+        } catch {
+            // 系统已经登记但等待批准时，不能通过 fallback 绕过用户的登录项选择。
+            if serviceState() == .enabled || serviceState() == .requiresApproval {
+                writeMethod(.serviceManagement)
+                return
+            }
+            // CLI 可能在写 plist 后 bootstrap 失败；提前记住路径，便于停用时清理。
+            writeMethod(.commandLine)
+            try await installCommand()
+            return
+        }
+        writeMethod(.serviceManagement)
+        guard state == .enabled || state == .requiresApproval else {
+            throw BackendError.commandFailed("系统未确认自动加载注册，请重试。")
+        }
+    }
+
+    func disable() async throws {
+        switch method {
+        case .serviceManagement:
+            if serviceState() != .notRegistered {
+                try await unregisterService()
+            }
+        case .commandLine: try await uninstallCommand()
+        case nil: break
+        }
+        // 失败时保留选择，下一次停用仍走原路径。
+        writeMethod(nil)
+    }
+
+    static func live(backend: CompanionBackend, defaults: UserDefaults = .standard) -> AgentRegistration {
+        let service = SMAppService.agent(plistName: "com.codexcompanion.agent.plist")
+        let plist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.codexcompanion.agent.plist")
+        return AgentRegistration(
+            readMethod: { defaults.string(forKey: defaultsKey).flatMap(AgentInstallMethod.init(rawValue:)) },
+            writeMethod: { method in
+                if let method { defaults.set(method.rawValue, forKey: defaultsKey) }
+                else { defaults.removeObject(forKey: defaultsKey) }
+            },
+            serviceState: {
+                switch service.status {
+                case .enabled: return .enabled
+                case .requiresApproval: return .requiresApproval
+                case .notRegistered: return .notRegistered
+                case .notFound: return .notFound
+                @unknown default: return .notFound
+                }
+            },
+            fallbackExists: { FileManager.default.fileExists(atPath: plist.path) },
+            registerService: { try service.register() },
+            unregisterService: { try await service.unregister() },
+            installCommand: { try await backend.installAgent() },
+            uninstallCommand: { try await backend.uninstallAgent() }
+        )
+    }
 }
 
 // MARK: - 视图模型
@@ -193,21 +321,37 @@ final class CompanionViewModel: ObservableObject {
     @Published var configReady = false
     @Published var draggingCardId: String?
     @Published var standalonePlacement = true   // true=独立按钮；false=随 Summary 显示
-    @Published var codexRunning = false
-    @Published var hasCdpFlag = false
-    @Published var port: Int?
+    @Published var proxyEnabled = false
+    @Published var proxyPort = "7890"
+    @Published var agentStatus: AgentStatus?
+    @Published var registrationState = AgentRegistrationState.notRegistered
     @Published var busy = false
-    @Published var statusUnknown = false
+    @Published var saving = false
+    @Published var statusUnknown = true
     @Published var errorMessage: String?
 
     private let backend = CompanionBackend.shared
+    private lazy var registration = AgentRegistration.live(backend: backend)
     private var pollTimer: Timer?
     private var config: CompanionConfigFile?
     private var pendingPatches: [[String: Any]] = []
-    private var saving = false
     private var refreshing = false
+    private var promptAfterEnable = false
+
+    var autoLoadEnabled: Bool { registrationState == .enabled && agentStatus?.autoRelaunch != false }
+    var requiresApproval: Bool { registrationState == .requiresApproval }
+    var statusTitle: String {
+        let loading = requiresApproval ? "自动加载未启用（待批准）" : autoLoadEnabled ? "自动加载已启用" : "自动加载未启用"
+        guard !statusUnknown, let status = agentStatus else { return "\(loading) · 后台与卡片状态未知" }
+        let service = status.available ? "后台服务运行中" : "后台服务未运行"
+        let cards = !status.codex.running ? "Codex 未运行" : status.codex.attached ? "Codex 已加载卡片" : "Codex 未加载卡片"
+        return "\(loading) · \(service) · \(cards)"
+    }
 
     func start() {
+        guard pollTimer == nil else { return }
+        registrationState = registration.state
+        promptAfterEnable = requiresApproval
         Task {
             do {
                 cardCatalog = try await backend.catalog()
@@ -226,6 +370,8 @@ final class CompanionViewModel: ObservableObject {
         injectionEnabled = value.enabled
         standalonePlacement = value.placement != "inline-in-summary"
         cardEnabled = value.cards.mapValues { $0.enabled }
+        proxyEnabled = value.launch.proxy.enabled
+        proxyPort = String(value.launch.proxy.port)
         let ids = Set(cardCatalog.map(\.id))
         cardOrder = value.order.filter { ids.contains($0) }
     }
@@ -238,27 +384,23 @@ final class CompanionViewModel: ObservableObject {
     }
 
     func refreshStatus() {
-        guard !refreshing else { return }
+        guard !refreshing, !busy else { return }
+        registrationState = registration.state
         refreshing = true
-        let backend = self.backend
         Task {
             defer { refreshing = false }
-            let status = try? await backend.status()
-            await MainActor.run {
-                guard let status else {
-                    // 连 status 命令都跑不起来：标记未知，不误判为「未运行」。
-                    self.statusUnknown = true
-                    return
+            do {
+                let status = try await backend.status()
+                guard !busy else { return }
+                registrationState = registration.state
+                agentStatus = status
+                statusUnknown = false
+                if promptAfterEnable && autoLoadEnabled && status.available {
+                    promptAfterEnable = false
+                    if status.shouldOfferRestart { confirmRestart() }
                 }
-                // ps 扫描失败时后端置 statusError=true；此时进程状态不可信，显示未知。
-                if status.statusError == true {
-                    self.statusUnknown = true
-                    return
-                }
-                self.statusUnknown = false
-                self.codexRunning = status.codexRunning
-                self.hasCdpFlag = status.hasCdpFlag
-                self.port = status.port
+            } catch {
+                statusUnknown = true
             }
         }
     }
@@ -284,6 +426,21 @@ final class CompanionViewModel: ObservableObject {
         })
     }
 
+    var proxyBinding: Binding<Bool> {
+        Binding(get: { self.proxyEnabled }, set: { value in
+            self.proxyEnabled = value
+            self.enqueue(["launch": ["proxy": ["enabled": value]]])
+        })
+    }
+
+    func saveProxyPort() {
+        guard let port = parseProxyPort(proxyPort) else {
+            errorMessage = "代理端口请输入 1–65535 的整数。"
+            return
+        }
+        enqueue(["launch": ["proxy": ["port": port]]])
+    }
+
     func persistOrder() {
         let known = Set(cardCatalog.map(\.id))
         enqueue(["order": cardOrder + (config?.order.filter { !known.contains($0) } ?? [])])
@@ -299,15 +456,7 @@ final class CompanionViewModel: ObservableObject {
             while !pendingPatches.isEmpty {
                 let next = pendingPatches.removeFirst()
                 do {
-                    guard let current = config else { break }
-                    let updated: CompanionConfigFile
-                    do {
-                        updated = try await backend.patchConfig(next, expectedRevision: current.revision)
-                    } catch BackendError.conflict {
-                        let latest = try await backend.loadConfig()
-                        config = latest
-                        updated = try await backend.patchConfig(next, expectedRevision: latest.revision)
-                    }
+                    let updated = try await savePatch(next)
                     config = updated
                     if pendingPatches.isEmpty { apply(updated) }
                     errorMessage = nil
@@ -320,57 +469,73 @@ final class CompanionViewModel: ObservableObject {
         }
     }
 
-    func launchCodex(proxyPort portText: String? = nil) {
-        var proxyPort: Int?
-        if let portText {
-            let trimmed = portText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let port = Int(trimmed), (1...65_535).contains(port) else {
-                errorMessage = "代理端口请输入 1–65535 的整数。"
-                return
-            }
-            proxyPort = port
-        }
-        busy = true
-        errorMessage = nil
-        let backend = self.backend
-        Task.detached {
-            do {
-                try backend.launchDetached(proxyPort: proxyPort)
-            } catch {
-                await MainActor.run { self.errorMessage = error.localizedDescription }
-            }
-            // 给 Codex 一点启动时间再刷新状态
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            await MainActor.run {
-                self.busy = false
-                self.refreshStatus()
-            }
+    private func savePatch(_ patch: [String: Any]) async throws -> CompanionConfigFile {
+        let current: CompanionConfigFile
+        if let config { current = config }
+        else { current = try await backend.loadConfig() }
+        do {
+            return try await backend.patchConfig(patch, expectedRevision: current.revision)
+        } catch BackendError.conflict {
+            let latest = try await backend.loadConfig()
+            return try await backend.patchConfig(patch, expectedRevision: latest.revision)
         }
     }
 
-    /// 停止 Codex：先弹确认（温和退出 + 确认），确认后 SIGTERM，绝不强杀。
-    func confirmAndStopCodex() {
-        let alert = NSAlert()
-        alert.messageText = "停止 Codex？"
-        alert.informativeText = "将温和退出 Codex（等同于正常退出）。如果 Codex 正在执行任务，任务会被中断。"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "停止")
-        alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
+    func enableAutoLoad() {
+        guard !busy, !saving else { return }
         busy = true
         errorMessage = nil
-        let backend = self.backend
-        Task.detached {
+        Task {
+            defer {
+                registrationState = registration.state
+                busy = false
+                refreshStatus()
+            }
             do {
-                _ = try await backend.stopCodex()
-            } catch {
-                await MainActor.run { self.errorMessage = error.localizedDescription }
+                apply(try await savePatch(["agent": ["autoRelaunch": true]]))
+                try await registration.enable()
+                promptAfterEnable = true
+            } catch { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func disableAutoLoad(uninstall: Bool = false) {
+        guard !busy, !saving else { return }
+        busy = true
+        errorMessage = nil
+        promptAfterEnable = false
+        Task {
+            defer {
+                registrationState = registration.state
+                busy = false
+                refreshStatus()
             }
-            await MainActor.run {
-                self.busy = false
-                self.refreshStatus()
-            }
+            do {
+                try await registration.disable()
+                if uninstall {
+                    let alert = NSAlert()
+                    alert.messageText = "Companion 已停用"
+                    alert.informativeText = "现在可以将 Codex Companion App 移到废纸篓。配置保留在 ~/Library/Application Support/codex-companion。"
+                    alert.addButton(withTitle: "知道了")
+                    alert.runModal()
+                }
+            } catch { errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func confirmRestart() {
+        let alert = NSAlert()
+        alert.messageText = "重启 Codex 以加载卡片？"
+        alert.informativeText = "将正常退出并重新打开 Codex，未保存的输入可能丢失。也可以等下次启动时生效。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "立即重启 Codex 以启用")
+        alert.addButton(withTitle: "下次启动时生效")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        busy = true
+        Task {
+            defer { busy = false; refreshStatus() }
+            do { try await backend.restartCodex() }
+            catch { errorMessage = error.localizedDescription }
         }
     }
 }
@@ -379,93 +544,47 @@ final class CompanionViewModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = CompanionViewModel()
-    @AppStorage("launchThroughProxy") private var launchThroughProxy = false
-    @AppStorage("launchProxyPort") private var launchProxyPort = "7890"
+    @State private var showBackupSettings = false
 
     var body: some View {
         Form {
-            // 状态区
             Section {
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 10, height: 10)
-                    Text(statusTitle)
-                        .font(.headline)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    statusButton
-                    if model.busy {
-                        ProgressView().controlSize(.small)
+                Text(model.statusTitle)
+                    .font(.callout)
+                    .accessibilityLabel(model.statusTitle)
+                HStack {
+                    Button(model.autoLoadEnabled || model.requiresApproval ? "停用自动加载" : "启用自动加载") {
+                        if model.autoLoadEnabled || model.requiresApproval { model.disableAutoLoad() }
+                        else { model.enableAutoLoad() }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.busy || model.saving)
+                    Button("卸载 Companion") { model.disableAutoLoad(uninstall: true) }
+                        .disabled(model.busy || model.saving)
+                    if model.busy { ProgressView().controlSize(.small) }
                 }
-                .padding(.vertical, 4)
-                HStack(spacing: 10) {
-                    Toggle("通过代理启动", isOn: $launchThroughProxy)
-                        .toggleStyle(.checkbox)
-                    if launchThroughProxy {
-                        Text("端口")
-                        TextField("7890", text: $launchProxyPort)
-                            .frame(width: 72)
-                            .textFieldStyle(.roundedBorder)
-                            .accessibilityLabel("本机代理端口")
-                    }
-                }
-                .disabled(model.busy || model.codexRunning)
-                Text("代理仅对新启动的 Codex 生效；已运行时需先退出再启动。")
+                Text("启用一次后，直接打开 Codex 即可。日常设置在 Codex 卡片区的齿轮中。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-
-            // 卡片区：总开关 + 可拖拽排序的卡片行（为以后更多卡片设计）
-            Section {
-                Toggle("启用注入卡片", isOn: model.enabledBinding)
-                    .disabled(!model.configReady)
-
-                ForEach(model.cardOrder, id: \.self) { cardId in
-                    HStack(spacing: 10) {
-                        Image(systemName: "line.3.horizontal")
-                            .foregroundStyle(.tertiary)
-                        Text(model.cardTitle(cardId))
-                        Spacer()
-                        Toggle("", isOn: model.cardBinding(cardId))
-                            .labelsHidden()
-                    }
-                    .padding(.vertical, 2)
-                    .contentShape(Rectangle())
-                    .onDrag {
-                        model.draggingCardId = cardId
-                        return NSItemProvider(object: cardId as NSString)
-                    }
-                    .onDrop(of: [UTType.text], delegate: CardReorderDropDelegate(
-                        target: cardId,
-                        order: $model.cardOrder,
-                        draggingId: $model.draggingCardId,
-                        persist: model.persistOrder
-                    ))
+                if model.requiresApproval {
+                    Text("请到「系统设置 › 通用 › 登录项」批准自动加载。")
+                        .font(.caption)
+                    Button("打开登录项设置") { SMAppService.openSystemSettingsLoginItems() }
                 }
-                .disabled(!model.configReady || !model.injectionEnabled)
-            } header: {
-                Text("卡片")
-            } footer: {
-                Text("拖动 ≡ 调整卡片顺序；改动实时生效，无需重启 Codex。升级后请关闭旧版设置窗口，再重新打开。")
-            }
-
-            // 显示方式
-            Section {
-                Picker("显示方式", selection: model.placementBinding) {
-                    Text("独立浮层").tag(true)
-                    Text("随 Summary").tag(false)
+                if model.statusUnknown {
+                    Button("重试读取状态") { model.refreshStatus() }.disabled(model.busy)
+                } else if model.agentStatus?.nativeHelper == "missing" {
+                    Text("原生助手缺失，请重新安装 Companion。")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .disabled(!model.configReady || !model.injectionEnabled)
-            } header: {
-                Text("显示方式")
-            } footer: {
-                Text("独立浮层由顶栏播放图标打开，与 Summary 互斥；随 Summary 时由摘要开关统一控制，播放器按卡片顺序排在摘要下方。")
             }
 
+            Section {
+                DisclosureGroup("备用设置", isExpanded: $showBackupSettings) {
+                    backupSettings
+                }
+            }
             if let message = model.errorMessage {
                 Section {
                     Text(message)
@@ -476,38 +595,59 @@ struct ContentView: View {
             }
         }
         .formStyle(.grouped)
-        .padding(16)
-        .frame(width: 400)
+        .padding(12)
+        .frame(width: 620, height: showBackupSettings ? 680 : 300)
         .onAppear { model.start() }
         .onDisappear { model.stop() }
     }
 
-    @ViewBuilder
-    private var statusButton: some View {
-        if model.statusUnknown {
-            Button("重试") { model.refreshStatus() }
-                .disabled(model.busy)
-        } else if model.codexRunning {
-            Button("停止 Codex") { model.confirmAndStopCodex() }
-                .disabled(model.busy)
-        } else {
-            Button("启动 Codex") { model.launchCodex(proxyPort: launchThroughProxy ? launchProxyPort : nil) }
-                .keyboardShortcut(.defaultAction)
-                .disabled(model.busy)
+    private var backupSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle("启用注入卡片", isOn: model.enabledBinding)
+            ForEach(model.cardOrder, id: \.self) { cardId in
+                HStack(spacing: 10) {
+                    Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
+                    Text(model.cardTitle(cardId))
+                    Spacer()
+                    Toggle("启用\(model.cardTitle(cardId))", isOn: model.cardBinding(cardId)).labelsHidden()
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+                .onDrag {
+                    model.draggingCardId = cardId
+                    return NSItemProvider(object: cardId as NSString)
+                }
+                .onDrop(of: [UTType.text], delegate: CardReorderDropDelegate(
+                    target: cardId, order: $model.cardOrder, draggingId: $model.draggingCardId,
+                    persist: model.persistOrder
+                ))
+            }
+            .disabled(!model.injectionEnabled)
+            Text("拖动 ≡ 调整卡片顺序；卡片与显示方式的改动实时生效。")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("显示方式", selection: model.placementBinding) {
+                Text("独立浮层").tag(true)
+                Text("随 Summary").tag(false)
+            }
+            .pickerStyle(.segmented)
+            .disabled(!model.injectionEnabled)
+            Divider()
+            Toggle("通过代理启动", isOn: model.proxyBinding)
+            HStack {
+                Text("代理端口")
+                TextField("7890", text: $model.proxyPort)
+                    .frame(width: 80)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { model.saveProxyPort() }
+                    .accessibilityLabel("本机代理端口")
+                Button("保存端口") { model.saveProxyPort() }
+            }
+            .disabled(!model.proxyEnabled)
+            Text("代理设置在重启 Codex 后生效。")
+                .font(.caption).foregroundStyle(.secondary)
         }
-    }
-
-    private var statusColor: Color {
-        if model.statusUnknown { return .gray }
-        if !model.codexRunning { return .gray }
-        return model.hasCdpFlag ? .green : .orange
-    }
-
-    private var statusTitle: String {
-        if model.statusUnknown { return "状态未知（无法查询后端）" }
-        if !model.codexRunning { return "Codex 未运行" }
-        if model.hasCdpFlag { return "Codex 运行中（伴侣已启用）" }
-        return "Codex 运行中（未启用伴侣，请从本 App 重启）"
+        .padding(.top, 8)
+        .disabled(!model.configReady || model.busy || model.saving)
     }
 }
 
@@ -542,6 +682,7 @@ private struct CardReorderDropDelegate: DropDelegate {
 
 // MARK: - App 入口
 
+#if !COMPANION_TESTING
 @main
 struct CodexCompanionApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -557,11 +698,12 @@ struct CodexCompanionApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
-        // 等待用户选择是否使用代理，再由窗口按钮启动 Codex。
+        // 只展示引导；启用服务前不操作 Codex。
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // 关窗即退出 App；后端 launch 进程是独立子进程组，Codex 不受影响。
+        // 关窗即退出设置；后台服务由系统独立管理。
         true
     }
 }
+#endif

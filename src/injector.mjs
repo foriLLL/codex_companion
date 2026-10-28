@@ -1,6 +1,7 @@
 import { CdpConnection } from "./cdp-connection.mjs";
 import { buildInjectionSource, buildConfigUpdateSource, ARTIFACT_HASH, BRIDGE_KEY } from "./injection.mjs";
 import { CARD_MANIFESTS } from "./card-registry.mjs";
+import { attachMediaIntercept } from "./media-intercept.mjs";
 import { normalizeRuntimeConfig } from "./platform/config/runtime-config.mjs";
 import { CdpRpcBridge, DEFAULT_RPC_TIMEOUT_MS } from "./rpc-bridge.mjs";
 import { filterCodexTargets, isCodexAppTarget, listCdpTargets, waitForCodexTargets } from "./targets.mjs";
@@ -139,10 +140,15 @@ export class CodexInjector {
     return results;
   }
 
-  async start() {
+  async start({ signal } = {}) {
+    signal?.throwIfAborted();
     this.#stopped = false;
-    await waitForCodexTargets(this.#port);
+    await waitForCodexTargets(this.#port, { signal });
+    signal?.throwIfAborted();
+    if (this.#stopped) return;
     await this.#runScan();
+    signal?.throwIfAborted();
+    if (this.#stopped) return;
     // 注意：不要 unref 这个定时器——它是常驻进程保持事件循环存活的关键。
     this.#scanTimer = setInterval(() => {
       this.#runScan().catch((error) => this.#logger.warn(`[codex-companion] 扫描失败：${error.message}`));
@@ -223,8 +229,7 @@ export class CodexInjector {
     }
 
     for (const target of targets) {
-      // 总开关关闭时不挂载新页面（已有页面的卸载在上面的会话循环里处理）。
-      if (!this.#config.enabled) break;
+      // 总开关只控制业务卡片；新页面仍需挂载平台设置入口，供用户重新启用。
       if (this.#sessions.has(target.id)) continue;
 
       const connection = new CdpConnection(target.webSocketDebuggerUrl);
@@ -288,10 +293,14 @@ export class CodexInjector {
     await connection.send("Runtime.enable");
 
     let rpcBridge;
+    let mediaIntercept = null;
     if (action === "mount") {
+      // 常驻会话才启用媒体拦截：一次性注入随即关闭连接，拦截也随之失效。
+      if (installOnNewDocument) mediaIntercept = await attachMediaIntercept(connection, { logger: this.#logger });
       rpcBridge = new CdpRpcBridge(connection, {
         handler: this.#rpcHandler,
         targetId: target.id,
+        mediaTransport: mediaIntercept?.active ? "intercept" : undefined,
         logger: this.#logger,
         timeoutMs: this.#rpcTimeoutMs
       });
@@ -315,6 +324,7 @@ export class CodexInjector {
       };
     } catch (error) {
       rpcBridge?.detach();
+      mediaIntercept?.detach();
       throw error;
     }
   }

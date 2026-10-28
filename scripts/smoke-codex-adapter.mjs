@@ -186,6 +186,74 @@ try {
   await waitFor(`fallbackAdapter.isOpen()`, "异常降级按钮仍可打开");
   await evaluate(`fallbackAdapter.dispose()`);
   assert.equal(await evaluate(`document.getElementById('modern-scroll').getAttribute('data-codex-companion-scroll-root')`), "original-scroll");
+  // Summary 变体：无 origin-top-right 动画列，面板经 display:contents 包装在 flex 纵列里。
+  await evaluate(`(() => {
+    document.body.innerHTML='<header style="display:flex;justify-content:flex-end"><button id="variant-toggle" aria-label="Toggle pinned summary" aria-pressed="true"><svg></svg></button><button aria-label="New tab"><svg></svg></button></header><div id="variant-root" class="thread-floating-content-top-inset right-0" style="position:absolute;top:48px;bottom:16px;right:0;max-width:100%"><div style="position:relative;display:flex;max-height:100%;padding-right:8px"><div id="variant-scroll" style="max-height:100%;min-height:0"><div id="variant-column" style="display:flex;flex-direction:column;gap:12px;max-height:100%;width:300px"><div style="display:contents"><div id="variant-native" data-summary-panel-variant="summary" style="display:flex;flex-direction:column;height:212px;width:300px;border-radius:20px;background:white">Summary</div></div></div></div></div></div>';
+    globalThis.variantAdapter=createCodexAdapter({host,placement:'inline-in-summary',onError:error=>errors.push(error.message)});
+  })()`);
+  assert.equal(await evaluate(`variantAdapter.getDiagnostics().mode`), "animated-summary", "Summary 变体应挂在摘要下方");
+  assert.equal(await evaluate(`Math.round(host.getBoundingClientRect().top-document.getElementById('variant-native').getBoundingClientRect().bottom)`), 24);
+  await evaluate(`variantAdapter.dispose()`);
+  // 未知结构：Summary 已打开却定位不到面板时，短暂等待后退回独立入口，不能让入口消失。
+  await evaluate(`(() => {
+    document.body.innerHTML='<header style="display:flex;justify-content:flex-end"><button aria-label="Toggle pinned summary" aria-pressed="true" onclick="this.setAttribute(\\'aria-pressed\\',String(this.getAttribute(\\'aria-pressed\\')!==\\'true\\'))"><svg></svg></button><button aria-label="New tab"><svg></svg></button></header><div style="position:absolute;top:48px;right:0;width:300px;height:200px;border-radius:20px;background:white">Unknown summary</div>';
+    globalThis.unknownAdapter=createCodexAdapter({host,placement:'inline-in-summary',onError:error=>errors.push(error.message)});
+  })()`);
+  assert.equal(await evaluate(`unknownAdapter.getDiagnostics().summaryUnsupported`), false, "宽限期内不立即切换");
+  await waitFor(`unknownAdapter.getDiagnostics().summaryUnsupported && unknownAdapter.getDiagnostics().inlineEntryFallback`, "未知 Summary 结构退回独立入口");
+  assert.equal(await evaluate(`Boolean(document.getElementById('codex-companion-root-toolbar')?.isConnected) || document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('button').hidden === false`), true, "退回后顶栏或悬浮入口可见");
+  await evaluate(`unknownAdapter.setOpen(true)`);
+  await waitFor(`unknownAdapter.isOpen()`, "退回后入口可打开");
+  assert.equal(await evaluate(`unknownAdapter.getDiagnostics().inlineEntryFallback`), true, "Summary 关闭后仍保持独立入口");
+  await evaluate(`unknownAdapter.dispose()`);
+  // 新版标题栏右侧只剩一个按钮（New tab），分组内也只有它：入口仍进顶栏，放在它左侧。
+  await evaluate(`(() => {
+    document.body.innerHTML='<header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="display:flex;gap:6px"><button aria-label="Back">B</button></div><div style="margin-left:auto;display:inline-flex;height:100%;align-items:center"><div style="display:flex;gap:6px;align-items:center"><div><button id="new-tab" aria-label="New tab" style="width:28px;height:28px">+</button></div></div></div></header>';
+    globalThis.titlebarAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+  })()`);
+  await waitFor(`!!document.getElementById('codex-companion-root-toolbar')`, "标题栏只有单个按钮时未进入顶栏");
+  assert.deepEqual(await evaluate(`(() => {
+    const entry=document.getElementById('codex-companion-root-toolbar').getBoundingClientRect(), tab=document.getElementById('new-tab').getBoundingClientRect();
+    return {leftOfNative:entry.right<=tab.left, sameRow:Math.round(entry.top)===Math.round(tab.top), nativeAtEdge:Math.round(innerWidth-tab.right)===0,
+      floatingHidden:document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('button').hidden};
+  })()`), { leftOfNative: true, sameRow: true, nativeAtEdge: true, floatingHidden: true });
+  await evaluate(`titlebarAdapter.setOpen(true)`);
+  await waitFor(`titlebarAdapter.isOpen()`, "顶栏入口打开");
+  await evaluate(`titlebarAdapter.dispose()`);
+  assert.equal(await evaluate(`!!document.getElementById('codex-companion-root-toolbar')`), false, "dispose 移除顶栏入口");
+  assert.deepEqual(await evaluate(`errors`), []);
+
+  // 内容列居中且留白足够：与原生 Summary 一样平移而非收窄，宽度不变、开合有逐帧动画、中途反向不跳变。
+  await connection.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "no-preference" }] });
+  await evaluate(`(() => {
+    document.body.innerHTML='<header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="margin-left:auto;display:flex;gap:6px"><div><button aria-label="New tab" style="width:28px;height:28px">+</button></div></div></header>'
+      + '<div class="thread-scroll-container" style="position:absolute;inset:48px 0 0;height:700px;overflow:auto"><div id="shift-frame" style="--thread-wide-block-inline-shift: 0px; transform: none;"><div id="shift-column" data-thread-user-message-navigation-content style="max-width:600px;margin:0 auto">Conversation</div></div>'
+      + '<div id="shift-footer" data-thread-scroll-footer style="position:absolute;left:0;right:0;bottom:0">Input</div></div>';
+    globalThis.shiftAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+    globalThis.shiftOf=(id)=>{const m=getComputedStyle(document.getElementById(id)).transform;return m==='none'?0:-new DOMMatrix(m).m41;};
+    globalThis.sampleShift=(ms)=>new Promise(resolve=>{const out=[],start=performance.now();const tick=()=>{out.push(Math.round(shiftOf('shift-frame')*10)/10);if(performance.now()-start<ms)requestAnimationFrame(tick);else resolve(out);};requestAnimationFrame(tick);});
+  })()`);
+  const shiftWidths = await evaluate(`({scroller:document.querySelector('.thread-scroll-container').getBoundingClientRect().width,column:document.getElementById('shift-column').getBoundingClientRect().width})`);
+  const opening = await evaluate(`(async()=>{shiftAdapter.setOpen(true);return sampleShift(500);})()`);
+  const expectedShift = Math.round(Math.min(348, shiftWidths.scroller * 0.45) / 2);
+  assert.equal(opening.at(-1), expectedShift, "平移量为抽屉宽度一半");
+  assert.ok(opening.filter((value) => value > 0 && value < expectedShift).length >= 5, `打开需逐帧平移：${opening.join(",")}`);
+  assert.ok(opening.every((value, index) => index === 0 || value >= opening[index - 1] - 0.5), "打开平移单调");
+  assert.deepEqual(await evaluate(`({scroller:document.querySelector('.thread-scroll-container').getBoundingClientRect().width,column:document.getElementById('shift-column').getBoundingClientRect().width,
+    footer:Math.round(shiftOf('shift-footer')),wide:getComputedStyle(document.getElementById('shift-frame')).getPropertyValue('--thread-wide-block-inline-shift').trim()})`),
+    { ...shiftWidths, footer: expectedShift, wide: `${expectedShift}px` }, "平移不改宽度，输入框与宽块同步");
+  const reversed = await evaluate(`(async()=>{shiftAdapter.setOpen(false);const head=await sampleShift(90);shiftAdapter.setOpen(true);const tail=await sampleShift(500);return {head,tail};})()`);
+  const jump = Math.abs(reversed.tail[0] - reversed.head.at(-1));
+  assert.ok(reversed.head.at(-1) < expectedShift && reversed.head.at(-1) > 0, `关闭中途：${reversed.head.join(",")}`);
+  assert.ok(jump < 40, `中途反向必须从当前帧继续，跳变 ${jump}px`);
+  assert.equal(reversed.tail.at(-1), expectedShift);
+  const closing = await evaluate(`(async()=>{shiftAdapter.setOpen(false);return sampleShift(500);})()`);
+  assert.ok(closing.filter((value) => value > 0 && value < expectedShift).length >= 5, `关闭需逐帧回位：${closing.join(",")}`);
+  await waitFor(`!document.querySelector('[data-companion-dock]') && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').hidden`, "关闭后撤销平移标记");
+  assert.equal(await evaluate(`document.getElementById('shift-frame').getAttribute('style')`), "--thread-wide-block-inline-shift: 0px; transform: none;", "原生 inline style 原样保留");
+  assert.equal(await evaluate(`shiftOf('shift-frame')`), 0);
+  await evaluate(`shiftAdapter.dispose()`);
+  assert.deepEqual(await evaluate(`errors`), []);
 
   await evaluate(`clearInterval(frameTimer);video.srcObject.getTracks().forEach(track=>track.stop())`);
   console.log("Codex adapter smoke passed:", JSON.stringify(evidence));

@@ -29,7 +29,7 @@ for (const manifest of [...CARD_MANIFESTS, probe]) {
   await writeFile(join(directory, "renderer.mjs"), "export function mount(ctx) { return globalThis.__fixtureMount(ctx); }\n");
 }
 const discovered = await discoverCards({ cardsDir, requireEntries: true });
-assert.equal(discovered.cards.length, 5);
+assert.equal(discovered.cards.length, CARD_MANIFESTS.length + 1);
 const catalog = discovered.cards.map(card => ({ manifest: card.manifest, rendererUrl: `/fixture-cards/${card.manifest.id}/renderer.mjs` }));
 const fixturePath = join(ownRepo, "scripts/fixtures/card-platform-browser.mjs");
 const server = createServer(async (req, res) => {
@@ -64,7 +64,8 @@ try {
     if (!target) await new Promise(resolve => setTimeout(resolve, 100));
   }
   assert.ok(target?.webSocketDebuggerUrl, "隔离 Chromium 启动失败");
-  connection = new CdpConnection(target.webSocketDebuggerUrl); await connection.connect();
+  // 全组合矩阵随卡片数阶乘增长，单次 evaluate 需要比默认 CDP 超时更长。
+  connection = new CdpConnection(target.webSocketDebuggerUrl, { timeoutMs: 600_000 }); await connection.connect();
   const run = async expression => {
     const result = await connection.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (result.exceptionDetails) throw Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
@@ -87,7 +88,8 @@ try {
   assert.deepEqual(unhandled, [], "浏览器存在未处理的 Promise 拒绝");
   const failures = results.filter(result => !result.ok);
   assert.equal(failures.length, 0, `${failures.length} 个平台浏览器场景失败: ${failures.map(result => result.name).join(", ")}`);
-  console.log(`Card platform smoke passed against ${repo}: 768 combinations and ${names.length - 1} lifecycle/integration scenarios`);
+  const combinations = results.find(result => result.name === "matrix")?.evidence?.cases;
+  console.log(`Card platform smoke passed against ${repo}: ${combinations} combinations and ${names.length - 1} lifecycle/integration scenarios`);
 } finally {
   connection?.close(); chrome.kill("SIGTERM"); server.close();
   await new Promise(resolve => { chrome.once("exit", resolve); setTimeout(resolve, 1500).unref(); });

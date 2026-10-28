@@ -103,13 +103,13 @@ test("discoverCards 发现第五张未知卡并按稳定顺序返回入口存在
   await withCards(async (cardsDir) => {
     await writeCard(cardsDir, "emby", manifest({ id: "emby", title: "Emby", defaultOrder: 40 }));
     await writeCard(cardsDir, "games", manifest({ id: "games", title: "摸鱼", defaultOrder: 10 }), { renderer: true });
-    await writeCard(cardsDir, "riverclub", manifest({ id: "riverclub", title: "River Club", defaultOrder: 30, capabilities: ["rpc"] }));
+    await writeCard(cardsDir, "chess", manifest({ id: "chess", title: "Chess", defaultOrder: 30, capabilities: ["rpc"] }));
     await writeCard(cardsDir, "hongguo", manifest({ id: "hongguo", title: "红果短剧", defaultOrder: 20 }));
     await writeCard(cardsDir, "arcade", manifest({ id: "arcade", title: "Arcade", defaultOrder: 15, capabilities: [] }), { service: true });
 
     const first = await discoverCards({ cardsDir });
     const second = await discoverCards({ cardsDir, requireEntries: false });
-    assert.deepEqual(first.cards.map((card) => card.manifest.id), ["games", "arcade", "hongguo", "riverclub", "emby"]);
+    assert.deepEqual(first.cards.map((card) => card.manifest.id), ["games", "arcade", "hongguo", "chess", "emby"]);
     assert.deepEqual(second.cards.map((card) => card.directoryName), first.cards.map((card) => card.directoryName));
     const games = first.cards[0];
     const arcade = first.cards[1];
@@ -185,17 +185,18 @@ test("requireEntries 要求 renderer.mjs，service.mjs 可选", async () => {
   });
 });
 
-test("仓库内置四张卡可被发现且能力符合冻结枚举", async () => {
+test("仓库内置卡片可被发现且能力符合冻结枚举", async () => {
   const cardsDir = fileURLToPath(new URL("../src/cards/", import.meta.url));
   const discovered = await discoverCards({ cardsDir });
-  assert.deepEqual(discovered.cards.map((card) => card.manifest.id), ["games", "hongguo", "riverclub", "emby"]);
-  assert.deepEqual(discovered.cards.map((card) => card.manifest.defaultOrder), [10, 20, 30, 40]);
+  assert.deepEqual(discovered.cards.map((card) => card.manifest.id), ["proxy", "games", "hongguo", "emby"]);
+  assert.deepEqual(discovered.cards.map((card) => card.manifest.defaultOrder), [0, 10, 20, 40]);
+  assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "proxy").manifest.capabilities, ["rpc"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "games").manifest.capabilities, ["storage"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "hongguo").manifest.capabilities, ["rpc", "storage"]);
-  assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "riverclub").manifest.capabilities, ["rpc"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "emby").manifest.capabilities, ["rpc", "storage"]);
   for (const card of discovered.cards) {
-    assert.equal(card.manifest.lifecycle.hidden, "retain");
+    // 代理轮询在收起时暂停，其余卡片保留媒体或存档。
+    assert.equal(card.manifest.lifecycle.hidden, card.manifest.id === "proxy" ? "suspend" : "retain");
     assert.equal(card.manifest.lifecycle.start, "first-visible");
     assert.equal(card.entries.renderer, true);
     assert.equal(card.entries.service, card.manifest.capabilities.includes("rpc"));
@@ -236,7 +237,7 @@ test("临时第五张卡生成可导入的入口注册表，输出目录与卡�
     await writeCard(cardsDir, "emby", manifest({ id: "emby", title: "Emby", defaultOrder: 40, capabilities: ["rpc", "storage"] }));
     await writeCard(cardsDir, "games", manifest({ id: "games", title: "摸鱼", defaultOrder: 10 }));
     await writeCard(cardsDir, "hongguo", manifest({ id: "hongguo", title: "红果", defaultOrder: 20, capabilities: ["rpc", "storage"] }));
-    await writeCard(cardsDir, "riverclub", manifest({ id: "riverclub", title: "River", defaultOrder: 30, capabilities: ["rpc"] }));
+    await writeCard(cardsDir, "chess", manifest({ id: "chess", title: "Chess", defaultOrder: 30, capabilities: ["rpc"] }));
     await writeCard(cardsDir, "arcade", manifest({ id: "arcade", title: "Arcade", defaultOrder: 15, capabilities: ["storage", "rpc"] }), { renderer: true, service: true });
     await writeFile(join(cardsDir, "arcade", "renderer.mjs"), "export const marker = \"arcade-renderer\";\n");
     await writeFile(join(cardsDir, "arcade", "service.mjs"), "export const marker = \"arcade-service\";\n");
@@ -244,7 +245,7 @@ test("临时第五张卡生成可导入的入口注册表，输出目录与卡�
     const registry = await import(pathToFileURL(result.files.registry).href);
     const renderers = await import(pathToFileURL(result.files.rendererRegistry).href);
     const services = await import(pathToFileURL(result.files.serviceRegistry).href);
-    assert.deepEqual(registry.CARD_MANIFESTS.map((item) => item.id), ["games", "arcade", "hongguo", "riverclub", "emby"]);
+    assert.deepEqual(registry.CARD_MANIFESTS.map((item) => item.id), ["games", "arcade", "hongguo", "chess", "emby"]);
     assert.equal(registry.getCardManifest("arcade").title, "Arcade");
     assert.equal(registry.getCardManifest("missing"), null);
     assert.equal(registry.CARD_REGISTRY_HASH, result.hash);

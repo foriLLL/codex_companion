@@ -245,7 +245,11 @@ export function mountGames(root, engine, options = {}) {
       const b = button(label, () => { data.selected = id; selected = null; notice = ""; save("selection"); render(); }, $(".game-tabs")); b.setAttribute("aria-pressed", String(name === id));
     }
     $(".game-actions").replaceChildren();
-    button("新一局", () => { if (!document.defaultView.confirm("重新开始这款游戏？当前进度将被替换。") || !active()) return; act(() => { data.games[name] = name === "2048" ? engine.new2048() : name === "mines" ? engine.newMines() : engine.newSolitaire(); selected = null; notice = ""; }); }, $(".game-actions"));
+    button("新一局", async () => {
+      const confirmed = options.confirmReset ? await options.confirmReset() : document.defaultView.confirm("重新开始这款游戏？当前进度将被替换。");
+      if (!confirmed || !active() || data.selected !== name) return;
+      act(() => { data.games[name] = name === "2048" ? engine.new2048() : name === "mines" ? engine.newMines() : engine.newSolitaire(); selected = null; notice = ""; });
+    }, $(".game-actions"));
     const undo = button("撤销", () => { data.games[name] = JSON.parse(history[name].pop()); selected = null; notice = ""; save(); render(); }, $(".game-actions")); undo.disabled = !history[name].length;
     board.replaceChildren();
     let status = "", help = "";

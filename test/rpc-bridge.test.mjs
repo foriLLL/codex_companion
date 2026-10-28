@@ -111,6 +111,7 @@ test("注册 binding，并把 RPC 结果定向送回来源 execution context", a
   assert.equal(calls[0].context.executionContextId, 42);
   assert.equal(calls[0].context.requestId, "status-1");
   assert.equal(calls[0].context.signal instanceof AbortSignal, true);
+  assert.equal("mediaTransport" in calls[0].context, false, "未启用媒体拦截时不声明传输方式");
   assert.deepEqual(connection.responses[0], {
     contextId: 42,
     response: { id: "status-1", ok: true, result: { connected: true } }
@@ -119,6 +120,21 @@ test("注册 binding，并把 RPC 结果定向送回来源 execution context", a
   bridge.detach();
   await waitFor(() => disposedTargets.length === 1);
   assert.deepEqual(disposedTargets, ["main"]);
+});
+
+test("启用媒体拦截的会话在 RPC 上下文中声明 intercept 传输", async () => {
+  const connection = new FakeConnection();
+  const contexts = [];
+  const bridge = new CdpRpcBridge(connection, {
+    handler: async (_method, _params, context) => { contexts.push(context); return {}; },
+    targetId: "main",
+    mediaTransport: "intercept"
+  });
+  await bridge.attach();
+  emitRequest(connection, { id: "open-1", method: "playback.open", params: {} });
+  await waitFor(() => contexts.length === 1);
+  assert.equal(contexts[0].mediaTransport, "intercept");
+  bridge.detach();
 });
 
 test("错误响应只暴露白名单字段并脱敏", async () => {

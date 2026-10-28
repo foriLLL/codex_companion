@@ -27,6 +27,7 @@ import {
 } from "./ffmpeg-fmp4-session.mjs";
 import { resolveFfmpegPath } from "./ffmpeg-path.mjs";
 import { HlsProxy } from "./hls-proxy.mjs";
+import { toMediaInterceptUrl } from "./media-intercept.mjs";
 
 const DEFAULT_METADATA_TIMEOUT_MS = 12_000;
 const DEFAULT_METADATA_ATTEMPTS = 2;
@@ -431,8 +432,8 @@ export class EmbyService {
     this.ffmpegAvailable = typeof ffmpegAvailable === "boolean"
       ? ffmpegAvailable
       : (typeof ffmpegSessionFactory === "function" || Boolean(resolveFfmpegPath()));
-    // Emby 本地媒体代理：HLS 在 CSP 允许的宿主可走 loopback；原生 MP4 则在
-    // blob 子文档中持续 Range 播放，避开主文档 CSP 与 RPC + Base64 分片通道。
+    // Emby 本地媒体代理：HLS 在 CSP 允许的宿主可走 loopback；原生 MP4 经 CDP
+    // 媒体拦截持续 Range 播放，避开主文档 CSP 与 RPC + Base64 分片通道。
     // lazy start（首次代理播放时启动）；
     // 传 hlsProxyFactory: null 可整体关闭（测试用）。
     this.hlsProxy = hlsProxyFactory === null
@@ -474,7 +475,7 @@ export class EmbyService {
       case "library.get": return this.library(params, { signal });
       case "search": return this.search(params, { signal });
       case "series.get": return this.series(params, { signal });
-      case "playback.open": return this.openPlayback(params, { signal, targetId: context.targetId });
+      case "playback.open": return this.openPlayback(params, { signal, targetId: context.targetId, mediaTransport: context.mediaTransport });
       case "playback.progress": return this.progressPlayback(params, { signal });
       case "playback.stop": return this.stopPlayback(params, { signal });
       case "playback.direct.init": return this.initializeDirectPlayback(params, { signal });
@@ -750,7 +751,7 @@ export class EmbyService {
     });
   }
 
-  async openPlayback(params, { signal, targetId } = {}) {
+  async openPlayback(params, { signal, targetId, mediaTransport } = {}) {
     const itemId = requiredString(params, "itemId", "缺少播放项目 ID");
     const startPositionTicks = params?.startPositionTicks === undefined
       ? (params?.startPositionSeconds === undefined
@@ -798,6 +799,7 @@ export class EmbyService {
       const session = {
         playbackId,
         targetId,
+        mediaTransport,
         itemId,
         userId: config.userId,
         mediaSourceId,
@@ -957,16 +959,25 @@ export class EmbyService {
       // 的估算视频码率传给前端，让相同的内存预算在 2 Mbps 与 40 Mbps 下都成立。
       const mediaBitrate = mseBitrateFor(mediaSource, streamMode, selectedSubtitle);
       if (mediaBitrate !== undefined) result.mediaBitrate = mediaBitrate;
-      if (streamMode === "direct-mp4" && session.directStreamUrl) {
+      // 原生直放只在 CDP 媒体拦截可用时开启：Codex 的 CSP 禁止页面（含 blob
+      // 子文档）直连 loopback，其余情况由 Renderer 走 MSE + RPC 分片。
+      if (mediaTransport === "intercept" && streamMode === "direct-mp4" && session.directStreamUrl) {
         const mediaProxySession = await this.#registerMediaProxySession(client, session.directStreamUrl);
-        if (mediaProxySession) {
+        const directMediaUrl = mediaProxySession
+          ? toMediaInterceptUrl(mediaProxySession.urlFor(session.directStreamUrl))
+          : null;
+        if (directMediaUrl) {
           session.hlsProxySession = mediaProxySession;
-          result.directProxyUrl = mediaProxySession.urlFor(session.directStreamUrl);
+          result.directMediaUrl = directMediaUrl;
+        } else if (mediaProxySession) {
+          this.hlsProxy.unregister(mediaProxySession.secret);
         }
       }
       if (transcodingSource) {
         result.hlsUrl = client.hlsUrl(itemId, session);
-        const hlsProxySession = await this.#registerMediaProxySession(client, result.hlsUrl);
+        const hlsProxySession = mediaTransport === "rpc"
+          ? null
+          : await this.#registerMediaProxySession(client, result.hlsUrl);
         if (hlsProxySession) {
           session.hlsProxySession = hlsProxySession;
           result.hlsProxyUrl = hlsProxySession.urlFor(result.hlsUrl);
@@ -1691,8 +1702,13 @@ export class EmbyService {
     const openRangeStream = !preferChunkedRange && typeof session.openRangeStream === "function"
       ? (options) => session.openRangeStream({ ...options, refreshPositionTicks: session.positionTicks })
       : null;
+    // MCP Apps 沙箱禁止 HTTP loopback。插件按需拉取小批次并直接写入 MSE，
+    // 不向页面暴露代理地址，也不为一次播放持续堆积未消费的媒体数据。
+    const limits = session.mediaTransport === "rpc"
+      ? { maxBatchBytes: 128 * 1024, maxQueueBytes: 8 * 1024 * 1024, resumeQueueBytes: 4 * 1024 * 1024 }
+      : {};
     if (session.streamMode === "direct-mp4") {
-      return this.directSessionFactory({ readRange, openRangeStream });
+      return this.directSessionFactory({ readRange, openRangeStream, ...limits });
     }
     return this.ffmpegSessionFactory({
       readRange,
@@ -1700,7 +1716,8 @@ export class EmbyService {
       mediaSource: session.mediaSource,
       durationSeconds: session.durationSeconds,
       subtitleTrack: subtitle?.mode === "burn-in" ? subtitle : null,
-      subtitleData: subtitle?.mode === "burn-in" ? session.subtitleData : null
+      subtitleData: subtitle?.mode === "burn-in" ? session.subtitleData : null,
+      ...limits
     });
   }
 
@@ -1839,8 +1856,8 @@ export class EmbyService {
   // 为一次 HLS 或原生 MP4 播放注册本地代理会话。pathPrefix 取媒体 URL 所在目录
   // （含 baseUrl 可能携带的子路径，如 /emby/Videos/<itemId>/），把可代理的
   // 路径收口到该视频自己的媒体端点。Codex 主文档 CSP 会阻止 loopback：HLS
-  // 回退到有界 RPC loader，原生 MP4 则由不继承该 CSP 的 blob 子文档访问；代理
-  // 不可用时再回退 MP4Box/MSE。RPC 响应使用 callFunctionOn 参数，不生成动态脚本。
+  // 回退到有界 RPC loader，原生 MP4 经 CDP 媒体拦截（media-intercept.mjs）访问；
+  // 拦截不可用时回退 MP4Box/MSE。RPC 响应使用 callFunctionOn 参数，不生成动态脚本。
   async #registerMediaProxySession(client, mediaUrl) {
     if (!this.hlsProxy) return null;
     try {

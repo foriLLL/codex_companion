@@ -2,13 +2,14 @@ import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { companionDataDir } from "./platform/paths.mjs";
 
 /**
  * 运行时状态文件：记录本次 launch 分配的随机 CDP 端口与相关 PID，
  * 使 attach / 守护进程无需人肉传 --port。权限 0600，参照 emby.json 约定。
  */
 export function defaultRuntimeStatePath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "runtime.json");
+  return join(companionDataDir(home), "runtime.json");
 }
 
 function sanitizePort(value) {
@@ -22,12 +23,18 @@ function sanitizePid(value) {
 export function normalizeRuntimeState(value) {
   if (!value || typeof value !== "object") return null;
   const port = sanitizePort(value.port);
-  if (port === null) return null;
+  // agent 在 Codex 未启动时也要保存冷却时间，不能再要求始终有 CDP 端口。
+  if (port === null && !Object.hasOwn(value, "agentPid")) return null;
   return {
     port,
     codexPid: sanitizePid(value.codexPid),
     daemonPid: sanitizePid(value.daemonPid),
-    startedAt: Number.isFinite(Number(value.startedAt)) ? Number(value.startedAt) : null
+    startedAt: Number.isFinite(Number(value.startedAt)) ? Number(value.startedAt) : null,
+    agentPid: sanitizePid(value.agentPid),
+    lastAttemptAt: Number.isFinite(value.lastAttemptAt) && value.lastAttemptAt >= 0 ? value.lastAttemptAt : 0,
+    lastEvent: typeof value.lastEvent?.event === "string" && Number.isFinite(value.lastEvent.at)
+      ? { event: value.lastEvent.event, at: value.lastEvent.at } : null,
+    codexKey: typeof value.codexKey === "string" ? value.codexKey : null
   };
 }
 

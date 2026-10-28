@@ -15,7 +15,7 @@ export async function generateRenderer({ repoRoot = root, requireEntries = true 
   const temporary = await mkdtemp(join(tmpdir(), "companion-renderer-build-"));
   try {
     const output = join(temporary, "renderer.js");
-    await exec(join(repoRoot, "node_modules/.bin/bun"), ["build", join(repoRoot, "src/renderer/entry.mjs"),
+    await exec(join(repoRoot, "node_modules", "bun", "bin", "bun.exe"), ["build", join(repoRoot, "src/renderer/entry.mjs"),
       "--target=browser", "--format=iife", "--outfile", output], { cwd: repoRoot });
     const source = await readFile(output, "utf8");
     const hash = createHash("sha256").update(source).digest("hex");

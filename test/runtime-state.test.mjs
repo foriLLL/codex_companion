@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { RuntimeState, normalizeRuntimeState } from "../src/runtime-state.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
 
 async function withTempDir(run) {
   const dir = await mkdtemp(join(tmpdir(), "runtime-state-"));
@@ -22,7 +23,7 @@ test("normalizeRuntimeState 丢弃无效端口", () => {
     port: 5000,
     codexPid: null,
     daemonPid: 3,
-    startedAt: null
+    startedAt: null, agentPid: null, lastAttemptAt: 0, lastEvent: null, codexKey: null
   });
 });
 
@@ -33,10 +34,10 @@ test("save 写入 0600 并可 load 回读", async () => {
     await state.save({ port: 51234, codexPid: 42, daemonPid: 7, startedAt: 1000 });
 
     const info = await stat(path);
-    assert.equal(info.mode & 0o777, 0o600);
+    assertMode(info, 0o600);
 
     const loaded = await state.load();
-    assert.deepEqual(loaded, { port: 51234, codexPid: 42, daemonPid: 7, startedAt: 1000 });
+    assert.deepEqual(loaded, { port: 51234, codexPid: 42, daemonPid: 7, startedAt: 1000, agentPid: null, lastAttemptAt: 0, lastEvent: null, codexKey: null });
   });
 });
 
@@ -78,4 +79,22 @@ test("pidIsAlive：存活/不存在/无权限的判定", async () => {
   assert.equal(pidIsAlive(1234, () => {}), true); // kill 成功 = 存活
   assert.equal(pidIsAlive(1234, () => { const e = new Error("no"); e.code = "ESRCH"; throw e; }), false);
   assert.equal(pidIsAlive(1234, () => { const e = new Error("perm"); e.code = "EPERM"; throw e; }), true);
+});
+
+
+test("agent 无 Codex 时仍保存 agentPid/冷却时间/事件；读取旧文件补齐字段", async () => {
+  await withTempDir(async dir => {
+    const state = new RuntimeState({ path: join(dir, "runtime.json") });
+    await state.save({ port: null, agentPid: 8, lastAttemptAt: 1234, lastEvent: { event: "attempt", at: 1234 }, codexKey: null });
+    const loaded = await state.load();
+    assert.equal(loaded.port, null);
+    assert.equal(loaded.agentPid, 8);
+    assert.equal(loaded.lastAttemptAt, 1234);
+    assert.deepEqual(loaded.lastEvent, { event: "attempt", at: 1234 });
+    assertMode(await stat(state.path), 0o600);
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(state.path, JSON.stringify({ port: 51234, daemonPid: 9 }));
+    assert.equal((await state.load()).lastAttemptAt, 0);
+    assert.equal((await state.load()).agentPid, null);
+  });
 });

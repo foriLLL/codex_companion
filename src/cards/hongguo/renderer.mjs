@@ -13,6 +13,7 @@ export function mount(ctx) {
   shadow.innerHTML = `<style>${mediaStyles}</style><section class="panel hg-panel" data-card="hongguo" aria-label="红果短剧播放器"><div class="hg-app" aria-live="polite"></div></section>`;
   const hongguoApp = shadow.querySelector(".hg-app");
   let refreshHongguoImages = () => {};
+  let cardVisible = true;
   let objectUrl = null;
   const releaseObjectUrl = () => {
     if (objectUrl) revokeObjectURL(objectUrl);
@@ -615,7 +616,7 @@ export function mount(ctx) {
         // 连播都停在首帧等用户手点（Emby 侧有 activatePlaybackState 自动起播）。
         // 若浏览器按自动播放策略拒绝则静默兜底，用户仍可手动点播。
         if (isDisposed() || hongguoState.playback !== playback) return;
-        void video.play().catch(() => {});
+        if (ctx.environment?.kind !== "plugin" || cardVisible) void video.play().catch(() => {});
       } catch (errorValue) {
         if (hongguoState.playback !== playback || hongguoState.view !== "playback") return;
         const drama = hongguoState.selectedDrama;
@@ -936,7 +937,12 @@ export function mount(ctx) {
   return {
     api,
     updateSettings() {},
-    visibilityChanged(state) { if (state?.visible && !isDisposed()) refreshHongguoImages(); },
+    visibilityChanged(state) {
+      if (isDisposed()) return;
+      cardVisible = state?.visible === true;
+      if (state?.visible) refreshHongguoImages();
+      else if (ctx.environment?.kind === "plugin") hongguoApp.querySelector("video")?.pause();
+    },
     dispose: scope.dispose,
   };
 }

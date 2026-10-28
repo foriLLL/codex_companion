@@ -2,13 +2,14 @@ import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { companionDataDir } from "./platform/paths.mjs";
 
 const LIST_FILE_LIMIT = 1 * 1024 * 1024;
 const MAX_ENTRIES = 200;
 const ID_PATTERN = /^[0-9]{1,32}$/;
 
 export function defaultHongguoListPath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "hongguo-list.json");
+  return join(companionDataDir(home), "hongguo-list.json");
 }
 
 /** 只保留白名单字段，并做基本校验；无效项返回 null。 */

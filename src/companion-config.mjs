@@ -1,8 +1,14 @@
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { CARD_MANIFESTS } from "./card-registry.mjs";
+import { completeCardOrder } from "./platform/config/runtime-config.mjs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
+import { companionDataDir } from "./platform/paths.mjs";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * v2 是唯一写入格式。旧 config.json 仅作迁移输入，load()/save() 暂保留旧调用形状。
@@ -20,9 +26,11 @@ export const DEFAULT_CARD_ORDER = Object.freeze([...CARD_IDS]);
 // inline-in-summary：卡片排在原生 summary 下方，一起滚动与开合。
 export const PLACEMENTS = Object.freeze(["standalone-button", "inline-in-summary"]);
 export const DEFAULT_PLACEMENT = "standalone-button";
+export const DEFAULT_LAUNCH = Object.freeze({ proxy: Object.freeze({ enabled: false, port: 7890 }) });
+export const DEFAULT_AGENT = Object.freeze({ autoRelaunch: true });
 
 export function defaultCompanionConfigPath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "config-v2.json");
+  return join(companionDataDir(home), "config-v2.json");
 }
 
 function normalizeCards(value) {
@@ -30,7 +38,6 @@ function normalizeCards(value) {
   return {
     games: typeof cards.games === "boolean" ? cards.games : DEFAULT_CARDS.games,
     hongguo: typeof cards.hongguo === "boolean" ? cards.hongguo : DEFAULT_CARDS.hongguo,
-    riverclub: typeof cards.riverclub === "boolean" ? cards.riverclub : DEFAULT_CARDS.riverclub,
     emby: typeof cards.emby === "boolean" ? cards.emby : DEFAULT_CARDS.emby
   };
 }
@@ -51,18 +58,8 @@ export function normalizeCardOrder(value) {
   for (const id of ["hongguo", "emby"]) {
     if (!order.includes(id)) order.push(id);
   }
-  if (!order.includes("riverclub")) order.splice(order.indexOf("hongguo") + 1, 0, "riverclub");
   if (!order.includes("games")) order.unshift("games");
   return order;
-}
-
-// 邀请链接仅存本机配置；网页入口 RPC 不接受任意 URL 或 shell 参数。
-export function normalizeRiverclubUrl(value) {
-  try {
-    const url = new URL(value);
-    if (url.origin === "https://riverclub.booocai.com" && !url.username && !url.password) return url.href;
-  } catch {}
-  return "https://riverclub.booocai.com/";
 }
 
 export function normalizeCompanionConfig(value) {
@@ -73,15 +70,77 @@ export function normalizeCompanionConfig(value) {
     enabled: typeof config.enabled === "boolean" ? config.enabled : true,
     placement: normalizePlacement(config.placement),
     cards: normalizeCards(config.cards),
-    cardOrder: normalizeCardOrder(config.cardOrder),
-    riverclubUrl: normalizeRiverclubUrl(config.riverclubUrl)
+    cardOrder: normalizeCardOrder(config.cardOrder)
   };
 }
 
-// v1 的卡片名单、邀请链接和插入顺序只保留在兼容转换中。
+// v1 的卡片名单与插入顺序只保留在兼容转换中；已下线卡片的旧字段直接忽略。
 const isRecord = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const safeId = id => /^[a-z][a-z0-9-]*$/.test(id) && !["constructor", "prototype", "__proto__"].includes(id);
 const clone = value => JSON.parse(JSON.stringify(value));
+const validPort = value => Number.isInteger(value) && value >= 1 && value <= 65535;
+
+// 新字段允许缺省，但显式提供的错误值不能经 normalize 悄悄恢复成默认值。
+function validLaunch(value) {
+  return isRecord(value) && Object.keys(value).every(key => key === "proxy")
+    && (!Object.hasOwn(value, "proxy") || (isRecord(value.proxy)
+      && Object.keys(value.proxy).every(key => ["enabled", "port"].includes(key))
+      && (!Object.hasOwn(value.proxy, "enabled") || typeof value.proxy.enabled === "boolean")
+      && (!Object.hasOwn(value.proxy, "port") || validPort(value.proxy.port))));
+}
+
+function validAgent(value) {
+  return isRecord(value) && Object.keys(value).every(key => key === "autoRelaunch")
+    && (!Object.hasOwn(value, "autoRelaunch") || typeof value.autoRelaunch === "boolean");
+}
+
+async function hasDeadLockOwner(path) {
+  let file;
+  try {
+    file = await open(path, "r");
+    if ((await file.stat()).size > 128) return false;
+    const { pid } = JSON.parse(await file.readFile("utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) return false;
+    try { process.kill(pid, 0); }
+    catch (error) { return error.code === "ESRCH"; }
+    return false;
+  } catch { return false; }
+  finally { await file?.close(); }
+}
+
+const EMPTY_GUARD_STALE_MS = 10_000;
+
+async function removeIfDeadOwner(path) {
+  if (await hasDeadLockOwner(path)) await unlink(path).catch(error => { if (error.code !== "ENOENT") throw error; });
+}
+
+async function recoverDeadLock(path) {
+  // 只回收可证明已经退出的 PID。空文件、损坏内容、权限不足和 PID 重用均保守等待。
+  if (!await hasDeadLockOwner(path)) return;
+  // 多个回收者必须串行并重新读取；否则第二个回收者可能误删第一个回收后新写入者
+  // 刚建立的锁。guard 用独占创建 + owner PID 实现（Windows/Linux/macOS 通用），
+  // 回收者自身崩溃留下的 guard 同样按「owner 已退出」回收，下一轮重试。
+  const guardPath = `${path}.recovery`;
+  let guard;
+  try {
+    guard = await open(guardPath, "wx", 0o600);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    await removeIfDeadOwner(guardPath);
+    // 创建后、写入 PID 前崩溃会留下空 guard：超过宽限期仍为空才视为遗留。
+    const info = await stat(guardPath).catch(() => null);
+    if (info?.size === 0 && Date.now() - info.mtimeMs > EMPTY_GUARD_STALE_MS) await unlink(guardPath).catch(() => {});
+    return;
+  }
+  try {
+    await guard.writeFile(JSON.stringify({ pid: process.pid }));
+    await guard.sync();
+    await removeIfDeadOwner(path);
+  } finally {
+    await guard.close();
+    await unlink(guardPath).catch(() => {});
+  }
+}
 
 export class ConfigError extends Error {
   constructor(code, message, details = {}) {
@@ -106,17 +165,17 @@ export function normalizeCompanionConfigV2(value, manifests = CARD_MANIFESTS) {
   for (const manifest of manifests) {
     cards[manifest.id] ??= { enabled: legacy?.cards[manifest.id] ?? manifest.defaultEnabled, settings: {} };
   }
-  if (legacy && cards.riverclub && (Object.hasOwn(input, "riverclubUrl") || !Object.hasOwn(cards.riverclub.settings, "url"))) {
-    cards.riverclub.settings.url = legacy.riverclubUrl;
-  }
-  const requested = legacy ? legacy.cardOrder : input.order;
-  const order = [...new Set((Array.isArray(requested) ? requested : []).filter(id => typeof id === "string" && safeId(id)))];
-  for (const id of [...manifests.map(card => card.id), ...Object.keys(cards)]) if (!order.includes(id)) order.push(id);
+  const order = completeCardOrder(legacy ? legacy.cardOrder : input.order, manifests, Object.keys(cards));
   return {
     version: 2,
     revision: Number.isSafeInteger(input.revision) && input.revision >= 0 ? input.revision : 0,
     enabled: typeof input.enabled === "boolean" ? input.enabled : true,
-    placement: normalizePlacement(input.placement), order, cards
+    placement: normalizePlacement(input.placement), order, cards,
+    launch: { proxy: {
+      enabled: typeof input.launch?.proxy?.enabled === "boolean" ? input.launch.proxy.enabled : DEFAULT_LAUNCH.proxy.enabled,
+      port: validPort(input.launch?.proxy?.port) ? input.launch.proxy.port : DEFAULT_LAUNCH.proxy.port
+    } },
+    agent: { autoRelaunch: typeof input.agent?.autoRelaunch === "boolean" ? input.agent.autoRelaunch : DEFAULT_AGENT.autoRelaunch }
   };
 }
 
@@ -125,7 +184,7 @@ export function toLegacyCompanionConfig(value) {
   return {
     version: 1, enabled: config.enabled, placement: config.placement,
     cards: Object.fromEntries(Object.entries(config.cards).map(([id, card]) => [id, card.enabled])),
-    cardOrder: [...config.order], riverclubUrl: normalizeRiverclubUrl(config.cards.riverclub?.settings?.url)
+    cardOrder: [...config.order]
   };
 }
 
@@ -134,7 +193,6 @@ function validateLegacyConfig(value) {
   if (!isRecord(value) || (Object.hasOwn(value, "version") && value.version !== 1)
     || (Object.hasOwn(value, "enabled") && typeof value.enabled !== "boolean")
     || (Object.hasOwn(value, "placement") && !PLACEMENTS.includes(value.placement))
-    || (Object.hasOwn(value, "riverclubUrl") && typeof value.riverclubUrl !== "string")
     || (Object.hasOwn(value, "cardOrder") && (!Array.isArray(value.cardOrder)
       || value.cardOrder.some(id => typeof id !== "string" || !safeId(id))))
     || (Object.hasOwn(value, "cards") && (!isRecord(value.cards)
@@ -150,17 +208,27 @@ function validateV2(value) {
     || typeof value.enabled !== "boolean" || !PLACEMENTS.includes(value.placement)
     || !Array.isArray(value.order) || value.order.some(id => typeof id !== "string" || !safeId(id))
     || !isRecord(value.cards) || Object.entries(value.cards).some(([id, card]) => !safeId(id)
-      || !isRecord(card) || typeof card.enabled !== "boolean" || !isRecord(card.settings))) {
+      || !isRecord(card) || typeof card.enabled !== "boolean" || !isRecord(card.settings))
+    || (Object.hasOwn(value, "launch") && !validLaunch(value.launch))
+    || (Object.hasOwn(value, "agent") && !validAgent(value.agent))) {
     throw new ConfigError("CONFIG_INVALID", "配置 v2 格式无效；保留文件，请修复后重试。");
   }
 }
 
 function applyPatch(current, patch, manifests) {
-  if (!isRecord(patch) || Object.keys(patch).some(key => !["enabled", "placement", "order", "cards"].includes(key))) {
-    throw new ConfigError("CONFIG_PATCH_INVALID", "补丁只能包含 enabled、placement、order、cards。");
+  if (!isRecord(patch) || Object.keys(patch).some(key => !["enabled", "placement", "order", "cards", "launch", "agent"].includes(key))) {
+    throw new ConfigError("CONFIG_PATCH_INVALID", "补丁只能包含 enabled、placement、order、cards、launch、agent。");
   }
   const next = clone(current);
   for (const key of ["enabled", "placement", "order"]) if (Object.hasOwn(patch, key)) next[key] = patch[key];
+  if (Object.hasOwn(patch, "launch")) {
+    if (!validLaunch(patch.launch)) throw new ConfigError("CONFIG_PATCH_INVALID", "launch.proxy 只允许布尔 enabled 和 1–65535 的整数 port。");
+    next.launch.proxy = { ...next.launch.proxy, ...patch.launch.proxy };
+  }
+  if (Object.hasOwn(patch, "agent")) {
+    if (!validAgent(patch.agent)) throw new ConfigError("CONFIG_PATCH_INVALID", "agent 只允许布尔 autoRelaunch。");
+    next.agent = { ...next.agent, ...patch.agent };
+  }
   if (Object.hasOwn(patch, "cards")) {
     if (!isRecord(patch.cards)) throw new ConfigError("CONFIG_PATCH_INVALID", "cards 必须是对象。");
     for (const [id, card] of Object.entries(patch.cards)) {
@@ -173,9 +241,6 @@ function applyPatch(current, patch, manifests) {
     }
   }
   validateV2(next);
-  if (next.cards.riverclub?.settings.url !== undefined) {
-    next.cards.riverclub.settings.url = normalizeRiverclubUrl(next.cards.riverclub.settings.url);
-  }
   return normalizeCompanionConfigV2(next, manifests);
 }
 
@@ -184,31 +249,43 @@ export class CompanionConfig {
     this.path = options.path ?? process.env.CODEX_COMPANION_CONFIG_PATH ?? defaultCompanionConfigPath();
     this.legacyPath = options.legacyPath ?? join(dirname(this.path), "config.json");
     this.manifests = options.manifests ?? CARD_MANIFESTS;
+    this.platform = options.platform ?? process.platform;
+    this.readFileImpl = options.readFileImpl ?? readFile;
+    this.execFileImpl = options.execFileImpl ?? execFileAsync;
     this.randomUUIDImpl = options.randomUUIDImpl ?? randomUUID;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 3000;
     this.lastGood = null;
     this.lastError = null;
+    this.legacyLaunchPromise = null;
   }
 
   async withLock(operation) {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const lockPath = `${this.path}.lock`;
+    const candidate = join(dirname(this.path), `.lock-${process.pid}-${this.randomUUIDImpl()}.tmp`);
     const started = Date.now();
     let lock;
-    while (!lock) {
-      try { lock = await open(lockPath, "wx", 0o600); }
-      catch (error) {
-        if (error.code !== "EEXIST") throw error;
-        if (Date.now() - started >= this.lockTimeoutMs) throw new ConfigError("CONFIG_LOCKED", "配置正被其他进程写入；若写入进程已退出，请移除遗留 lock 文件。" );
-        await new Promise(resolve => setTimeout(resolve, 20));
-      }
-    }
+    let acquired = false;
     try {
+      // 先完成 owner 记录，再以原子的 hard-link 发布锁；异常退出不会留下
+      // 无法判断归属的空锁，同时兼容旧版本已经写好的 { pid } 锁文件。
+      lock = await open(candidate, "wx", 0o600);
       await lock.writeFile(JSON.stringify({ pid: process.pid }));
+      await lock.sync();
+      while (!acquired) {
+        try { await link(candidate, lockPath); acquired = true; }
+        catch (error) {
+          if (error.code !== "EEXIST") throw error;
+          await recoverDeadLock(lockPath);
+          if (Date.now() - started >= this.lockTimeoutMs) throw new ConfigError("CONFIG_LOCKED", "配置正被其他进程写入，或锁文件归属不明；请稍后重试。" );
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      }
+      await unlink(candidate);
       return await operation();
     } finally {
-      await lock.close();
-      await unlink(lockPath);
+      try { if (acquired) await unlink(lockPath); }
+      finally { await lock?.close(); if (lock) await unlink(candidate).catch(() => {}); }
     }
   }
 
@@ -224,13 +301,47 @@ export class CompanionConfig {
 
   async readV2() {
     let parsed;
-    try { parsed = JSON.parse(await readFile(this.path, "utf8")); }
+    try { parsed = JSON.parse(await this.readFileImpl(this.path, "utf8")); }
     catch (error) {
       if (error.code === "ENOENT") throw error;
       throw new ConfigError("CONFIG_INVALID", "无法读取有效配置；保留原文件。", { cause: error });
     }
     validateV2(parsed);
+    // 读取旧 v2 只补内存值，保持 revision 与磁盘内容不变；下次成功 patch 才落盘。
+    if (Object.hasOwn(parsed, "launch")) this.legacyLaunchPromise = null;
+    else parsed.launch = await this.readLegacyLaunch();
     return normalizeCompanionConfigV2(parsed, this.manifests);
+  }
+
+  readLegacyLaunch() {
+    // watcher 与并发读取共享同一次迁移，避免重复执行 defaults 或在同 revision 下漂移。
+    return this.legacyLaunchPromise ??= this.readLegacyLaunchSource();
+  }
+
+  async readLegacyLaunchSource() {
+    try {
+      const value = JSON.parse(await this.readFileImpl(join(dirname(this.path), "plugin-launcher.json"), "utf8"));
+      const preferences = value?.preferences;
+      if (value?.version === 1 && Number.isSafeInteger(value.revision) && value.revision >= 0
+        && isRecord(preferences) && Object.keys(preferences).every(key => ["launchThroughProxy", "proxyPort"].includes(key))
+        && typeof preferences.launchThroughProxy === "boolean" && validPort(preferences.proxyPort)) {
+        return { proxy: { enabled: preferences.launchThroughProxy, port: preferences.proxyPort } };
+      }
+    } catch {}
+    // 缺失、损坏或不可读的旧偏好均不改写、不删除，继续尝试旧 Swift 域。
+    return this.readLegacyLaunchDefaults();
+  }
+
+  async readLegacyLaunchDefaults() {
+    // 旧 Swift 启动器只发布过 macOS 版本，其它平台没有可导入的偏好。
+    if (this.platform !== "darwin") return clone(DEFAULT_LAUNCH);
+    const read = async key => {
+      try { return (await this.execFileImpl("/usr/bin/defaults", ["read", "com.codexcompanion.launcher", key], { timeout: 3000 })).stdout.trim(); }
+      catch { return null; }
+    };
+    const enabled = await read("launchThroughProxy");
+    const port = Number(await read("launchProxyPort"));
+    return { proxy: { enabled: ["1", "true", "YES"].includes(enabled), port: validPort(port) ? port : DEFAULT_LAUNCH.proxy.port } };
   }
 
   async readOrMigrate() {
@@ -240,7 +351,7 @@ export class CompanionConfig {
     let original;
     if (this.legacyPath !== this.path) {
       try {
-        original = await readFile(this.legacyPath, "utf8");
+        original = await this.readFileImpl(this.legacyPath, "utf8");
         legacy = JSON.parse(original);
         validateLegacyConfig(legacy);
       } catch (error) {
@@ -251,8 +362,9 @@ export class CompanionConfig {
       try { await writeFile(`${this.legacyPath}.v1.bak`, original, { mode: 0o600, flag: "wx" }); }
       catch (error) { if (error.code !== "EEXIST") throw error; }
     }
-    const config = normalizeCompanionConfigV2(legacy, this.manifests);
+    const config = normalizeCompanionConfigV2({ ...legacy, launch: await this.readLegacyLaunch() }, this.manifests);
     await this.atomicWrite(this.path, `${JSON.stringify(config, null, 2)}\n`);
+    this.legacyLaunchPromise = null;
     return config;
   }
 
@@ -284,6 +396,7 @@ export class CompanionConfig {
       const next = applyPatch(current, patch, this.manifests);
       next.revision = current.revision + 1;
       await this.atomicWrite(this.path, `${JSON.stringify(next, null, 2)}\n`);
+      this.legacyLaunchPromise = null;
       this.lastGood = clone(next);
       return next;
     });
@@ -296,10 +409,6 @@ export class CompanionConfig {
     for (const key of ["enabled", "placement"]) if (Object.hasOwn(value, key)) patch[key] = value[key];
     if (value.cardOrder || value.order) patch.order = value.order ?? normalizeCardOrder(value.cardOrder);
     if (value.cards) patch.cards = Object.fromEntries(Object.entries(value.cards).map(([id, card]) => [id, typeof card === "boolean" ? { enabled: card } : card]));
-    if (value.riverclubUrl !== undefined) {
-      patch.cards ??= {};
-      patch.cards.riverclub = { ...patch.cards.riverclub, settings: { ...patch.cards.riverclub?.settings, url: normalizeRiverclubUrl(value.riverclubUrl) } };
-    }
     const next = await this.patch(patch, { expectedRevision: value.revision ?? current.revision });
     return value.version === 2 ? next : toLegacyCompanionConfig(next);
   }

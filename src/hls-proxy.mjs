@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { pipeline } from "node:stream/promises";
 import { EmbyError, SECRET_QUERY_KEYS, validateExternalMediaUrl } from "./emby-client.mjs";
+import { registerMediaInterceptPort } from "./media-intercept.mjs";
 
 // playlist 很小（几十 KB），重写时需要整体缓冲；超过上限说明上游在冒充清单，直接报错。
 const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
@@ -106,6 +107,8 @@ export class HlsProxy {
     }
     this.server = server;
     this.port = address.port;
+    // 只有登记过的代理端口才允许被 CDP 媒体拦截改写（见 media-intercept.mjs）。
+    this.unregisterIntercept = registerMediaInterceptPort(this.port);
     // 辅助服务器不允许独自撑起事件循环：忘记 close（如单元测试没有 dispose）时
     // 不能阻止进程退出；存活期由持有它的服务进程里的其它句柄保证。
     server.unref();
@@ -119,6 +122,8 @@ export class HlsProxy {
     const server = this.server;
     this.server = null;
     this.port = null;
+    this.unregisterIntercept?.();
+    this.unregisterIntercept = null;
     if (!server) return;
     await new Promise((resolve) => {
       server.close(resolve);

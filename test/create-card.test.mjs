@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile, mkdir } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -147,8 +147,11 @@ test("既有文件/目录/符号链接和并发创建均不覆盖目标", async 
   const outside = join(directory, "outside");
   await mkdir(outside);
   await writeFile(join(outside, "marker"), "preserve-link-target");
-  await symlink(outside, join(cardsDir, "linked"));
-  for (const id of ["file", "existing", "linked"]) await assert.rejects(createCard({ id, cardsDir }), { code: "EEXIST" });
+  // Windows 未开启开发者模式时不能创建符号链接，此时只验证文件与目录。
+  const linked = await symlink(outside, join(cardsDir, "linked"))
+    .then(() => lstat(join(cardsDir, "linked")))
+    .then((stats) => stats.isSymbolicLink(), () => false);
+  for (const id of ["file", "existing", ...(linked ? ["linked"] : [])]) await assert.rejects(createCard({ id, cardsDir }), { code: "EEXIST" });
   assert.equal(await readFile(join(cardsDir, "file"), "utf8"), "preserve-file");
   assert.equal(await readFile(join(cardsDir, "existing", "marker"), "utf8"), "preserve-directory");
   assert.deepEqual(await readdir(outside), ["marker"]);

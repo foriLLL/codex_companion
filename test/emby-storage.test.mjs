@@ -9,6 +9,7 @@ import {
   LEGACY_KEYCHAIN_SERVICE,
   embyServerKey
 } from "../src/emby-storage.mjs";
+import { assertMode } from "./helpers/permissions.mjs";
 
 test("配置只保存非敏感字段、权限为 0600 且 DeviceId 稳定", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-companion-emby-storage-"));
@@ -32,7 +33,7 @@ test("配置只保存非敏感字段、权限为 0600 且 DeviceId 稳定", asyn
 
   const raw = await readFile(configPath, "utf8");
   assert.doesNotMatch(raw, /must-not-persist|password|accessToken/i);
-  assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  assertMode(await stat(configPath), 0o600);
   const loaded = await storage.loadConfig();
   assert.equal(loaded.deviceId, "stable-device");
   assert.equal(storage.createDeviceId(loaded), "stable-device");
@@ -107,7 +108,7 @@ test("首页缓存原子保存、权限为 0600 且与账号绑定", async (t) =
     data: { views: [], resume: [{ id: "one" }], latest: [] }
   });
 
-  assert.equal((await stat(homeCachePath)).mode & 0o777, 0o600);
+  assertMode(await stat(homeCachePath), 0o600);
   assert.equal((await storage.loadHomeCache("server", "user")).data.resume[0].id, "one");
   assert.equal(await storage.loadHomeCache("server", "another-user"), null);
 });
@@ -175,12 +176,30 @@ test("旧 Keychain Token 首次读取时迁移到 codex-companion service", asyn
   ]);
 });
 
-test("Keychain 中没有 Token 时返回 null，非 macOS 明确拒绝", async () => {
+test("Keychain 中没有 Token 时返回 null，读取失败给出平台化错误", async () => {
   const missing = Object.assign(new Error("missing"), { code: 44 });
   const storage = new EmbyStorage({ platform: "darwin", execFileImpl: async () => { throw missing; } });
   assert.equal(await storage.readToken("server", "user"), null);
   assert.equal(await storage.deleteToken("server", "user"), false);
 
-  const unsupported = new EmbyStorage({ platform: "linux" });
-  await assert.rejects(unsupported.readToken("server", "user"), { code: "UNSUPPORTED_PLATFORM" });
+  const broken = new EmbyStorage({ platform: "darwin", execFileImpl: async () => { throw Object.assign(new Error("denied"), { code: 51 }); } });
+  await assert.rejects(broken.readToken("server", "user"), { code: "CREDENTIAL_READ_FAILED", message: /macOS 钥匙串/ });
+});
+
+test("Linux 没有密钥环时 Token 存入配置目录下 0600 的凭证文件", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "emby-linux-secret-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const storage = new EmbyStorage({
+    platform: "linux",
+    configPath: join(dir, "emby.json"),
+    homeCachePath: join(dir, "emby-home.json"),
+    secretRunImpl: async () => { throw Object.assign(new Error("spawn secret-tool ENOENT"), { code: "ENOENT" }); }
+  });
+  await storage.saveToken("server", "user", "linux-token");
+  assert.equal(await storage.readToken("server", "user"), "linux-token");
+  const file = join(dir, "credentials.json");
+  assertMode(await stat(file), 0o600);
+  assert.doesNotMatch(await readFile(file, "utf8"), /server:user/, "文件内只保存条目哈希，不暴露服务器与用户");
+  assert.equal(await storage.deleteToken("server", "user"), true);
+  assert.equal(await storage.readToken("server", "user"), null);
 });

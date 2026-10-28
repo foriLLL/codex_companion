@@ -223,11 +223,11 @@ test("unmount 不创建无接收方的 RPC binding", async () => {
   assert.deepEqual(methods, ["Page.enable", "Runtime.enable", "Runtime.evaluate"]);
 });
 
-test("enabled=false 时不挂载新页面，已有 runtime 通过配置停用和恢复", async (t) => {
+test("enabled=false 时仍挂载新页面的设置入口，已有 runtime 通过配置停用和恢复", async (t) => {
   cdpTargets = [mainTarget];
   AutoReplyWebSocket.instances = [];
 
-  // 总开关关闭启动：不建立任何会话/连接。
+  // 总开关关闭启动：照常建立 RPC 与挂载入口，runtime 负责只移除业务卡片。
   const disabledInjector = new CodexInjector(9222, {
     rpcHandler: async () => ({ ok: true }),
     enabled: false,
@@ -235,7 +235,18 @@ test("enabled=false 时不挂载新页面，已有 runtime 通过配置停用和
   });
   t.after(() => disabledInjector.stop());
   await disabledInjector.start();
-  assert.equal(AutoReplyWebSocket.instances.length, 0, "总开关关闭不应挂载新页面");
+  assert.equal(AutoReplyWebSocket.instances.length, 1, "总开关关闭仍应挂载平台入口");
+  const disabledSocket = AutoReplyWebSocket.instances[0];
+  assert.equal(disabledSocket.health.mounted, true);
+  assert.equal(disabledSocket.health.config.enabled, false);
+  assert.equal(disabledSocket.calls.filter(({ method }) => method === "Runtime.addBinding").length, 1);
+  assert.equal(disabledSocket.scripts.size, 1, "禁用时导航也保留入口");
+  cdpTargets = [mainTarget, { ...mainTarget, id: "new-page" }];
+  await disabledInjector.scanNow();
+  assert.equal(AutoReplyWebSocket.instances.length, 2, "禁用期间新开的页面仍挂载");
+  assert.equal(AutoReplyWebSocket.instances[1].health.config.enabled, false);
+  disabledInjector.stop();
+  cdpTargets = [mainTarget];
 
   // 已经建立的 runtime 保留，由 applyConfig 停用卡片。
   const injector = new CodexInjector(9222, {
@@ -375,7 +386,7 @@ test("legacy getter/setter 兼容，配置与 getter 不共享可变 settings", 
   const settings = { nested: { value: 1 } };
   const injector = new CodexInjector(9222, { cards: { emby: false }, cardOrder: ["emby"] });
   assert.equal(injector.cards.emby, false);
-  assert.equal(injector.cardOrder[0], "emby");
+  assert.deepEqual(injector.cardOrder, ["proxy", "games", "hongguo", "emby"]);
   injector.setConfig({ cards: { emby: { settings } } });
   settings.nested.value = 99;
   assert.equal(injector.cards.emby, false);
@@ -428,4 +439,39 @@ test("stop 在首次异步注入期间发生时不会登记泄漏会话", async 
   };
   await injector.scanNow();
   assert.ok(AutoReplyWebSocket.instances.every((socket) => socket.readyState === 3));
+});
+
+test("start 在 CDP 就绪前取消，不会创建扫描定时器或连接", async t => {
+  const abort = new AbortController();
+  const previousFetch = globalThis.fetch;
+  const previousInterval = globalThis.setInterval;
+  let intervals = 0;
+  globalThis.setInterval = () => { intervals += 1; return 1; };
+  globalThis.fetch = async (_url, { signal }) => new Promise((_, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+  const injector = new CodexInjector(51234, { logger: quietLogger });
+  t.after(() => { globalThis.fetch = previousFetch; globalThis.setInterval = previousInterval; injector.stop(); });
+  const pending = assert.rejects(injector.start({ signal: abort.signal }), { name: "AbortError" });
+  injector.stop();
+  abort.abort();
+  await pending;
+  assert.equal(intervals, 0);
+});
+
+test("start 在首次扫描中 stop，不会复活定时器", async t => {
+  const previousInterval = globalThis.setInterval;
+  let intervals = 0;
+  globalThis.setInterval = () => { intervals += 1; return 1; };
+  cdpTargets = [mainTarget];
+  AutoReplyWebSocket.instances = [];
+  const injector = new CodexInjector(51234, { logger: quietLogger });
+  t.after(() => { globalThis.setInterval = previousInterval; AutoReplyWebSocket.onSend = null; injector.stop(); });
+  AutoReplyWebSocket.onSend = ({ method, params }) => {
+    if (method === "Runtime.evaluate" && params.expression.includes('"action":"mount"')) injector.stop();
+  };
+  await injector.start();
+  assert.equal(intervals, 0);
+  assert.ok(AutoReplyWebSocket.instances.every(socket => socket.readyState === 3));
 });

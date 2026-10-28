@@ -97,7 +97,7 @@ try {
   };
   const root = "document.getElementById('codex-companion-root-shell').shadowRoot";
   const app = `${root}.querySelector('#codex-companion-root').shadowRoot`;
-  await read(buildInjectionSource("mount", { placement: "standalone-button", cards: { hongguo: false, riverclub: false, emby: true } }));
+  await read(buildInjectionSource("mount", { placement: "standalone-button", cards: { hongguo: false, emby: true } }));
   await waitFor("window.__CODEX_COMPANION__.emby.getState().view === 'home'");
   await read(`${root}.querySelector('button').click()`);
   const mapped = { ...mapEmbyItem(item, client), positionTicks: 900_000_000 };

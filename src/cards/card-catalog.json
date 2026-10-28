@@ -1,6 +1,33 @@
 {
-  "hash": "4719c539c5161a164bf78f40eaf22c0945b72fa5fd23e2e98842404bb750f6e3",
+  "hash": "8e645683a1d39455cb9c0622be1fb70bd388db9d373376b63561c9f05e5bc2b2",
   "cards": [
+    {
+      "id": "proxy",
+      "title": "代理状态",
+      "version": 1,
+      "defaultEnabled": true,
+      "defaultOrder": 0,
+      "layout": {
+        "height": "content",
+        "minHeight": 0,
+        "scroll": "outer"
+      },
+      "lifecycle": {
+        "hidden": "suspend",
+        "start": "first-visible"
+      },
+      "state": {
+        "scope": "global",
+        "version": 1
+      },
+      "capabilities": [
+        "rpc"
+      ],
+      "entries": {
+        "renderer": true,
+        "service": true
+      }
+    },
     {
       "id": "games",
       "title": "摸鱼",
@@ -50,33 +77,6 @@
       "capabilities": [
         "rpc",
         "storage"
-      ],
-      "entries": {
-        "renderer": true,
-        "service": true
-      }
-    },
-    {
-      "id": "riverclub",
-      "title": "River Club",
-      "version": 1,
-      "defaultEnabled": true,
-      "defaultOrder": 30,
-      "layout": {
-        "height": "content",
-        "minHeight": 220,
-        "scroll": "outer"
-      },
-      "lifecycle": {
-        "hidden": "retain",
-        "start": "first-visible"
-      },
-      "state": {
-        "scope": "global",
-        "version": 1
-      },
-      "capabilities": [
-        "rpc"
       ],
       "entries": {
         "renderer": true,

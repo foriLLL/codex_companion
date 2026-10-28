@@ -13,6 +13,7 @@ export class ServiceRegistry {
     this.logger = logger;
     this.closed = false;
     for (const manifest of manifests) {
+      if (manifest.id === "companion") throw new TypeError("companion 为平台保留 id，不能注册为卡片");
       const module = modules[manifest.id];
       if (module && typeof module.createService !== "function") throw new TypeError(`卡片 ${manifest.id} 缺少 createService`);
       let service = {};

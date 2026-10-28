@@ -55,6 +55,7 @@ test("collectStatus：汇总进程、运行时状态与配置，异常一律降�
     codexRunning: true,
     hasCdpFlag: true,
     codexPids: [7],
+    proxyPort: null,
     port: 5000,
     daemonPid: 8,
     cards: { hongguo: false, emby: true }
@@ -70,8 +71,20 @@ test("collectStatus：汇总进程、运行时状态与配置，异常一律降�
     codexRunning: false,
     hasCdpFlag: false,
     codexPids: [],
+    proxyPort: null,
     port: null,
     daemonPid: null,
     cards: null
   });
+});
+
+test("collectStatus：代理端口取自运行时状态记录的那个 Codex", async () => {
+  const status = await collectStatus({
+    inspectImpl: async () => [
+      { pid: 7, command: "codex", hasCdpFlag: true, cdpPort: 4000, proxyPort: null },
+      { pid: 9, command: "codex", hasCdpFlag: true, cdpPort: 5000, proxyPort: 7890 }
+    ],
+    loadRuntimeState: () => ({ port: 5000, daemonPid: 8 })
+  });
+  assert.equal(status.proxyPort, 7890);
 });

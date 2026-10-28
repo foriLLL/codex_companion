@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { EmbyError } from "./emby-client.mjs";
+import { companionDataDir, legacyCompanionDataDir } from "./platform/paths.mjs";
+import { createSecretStore } from "./platform/secret-store.mjs";
 
 const execFileAsync = promisify(execFile);
 export const KEYCHAIN_SERVICE = "codex-companion.emby";
@@ -12,19 +14,19 @@ export const LEGACY_KEYCHAIN_SERVICE = "codex-hg.emby";
 const HOME_CACHE_FILE_LIMIT = 4 * 1024 * 1024;
 
 export function defaultEmbyConfigPath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "emby.json");
+  return join(companionDataDir(home), "emby.json");
 }
 
 export function defaultEmbyHomeCachePath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-companion", "emby-home.json");
+  return join(companionDataDir(home), "emby-home.json");
 }
 
 export function legacyEmbyConfigPath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-hg", "emby.json");
+  return join(legacyCompanionDataDir(home), "emby.json");
 }
 
 export function legacyEmbyHomeCachePath(home = homedir()) {
-  return join(home, "Library", "Application Support", "codex-hg", "emby-home.json");
+  return join(legacyCompanionDataDir(home), "emby-home.json");
 }
 
 export function keychainAccount(serverId, userId) {
@@ -85,6 +87,8 @@ export class EmbyStorage {
       ?? (options.homeCachePath === undefined ? legacyEmbyHomeCachePath() : null);
     this.execFileImpl = options.execFileImpl ?? execFileAsync;
     this.platform = options.platform ?? process.platform;
+    this.secretRunImpl = options.secretRunImpl ?? null;
+    this.secretStore = options.secretStore ?? null;
     this.randomUUIDImpl = options.randomUUIDImpl ?? randomUUID;
   }
 
@@ -253,69 +257,53 @@ export class EmbyStorage {
     return existingConfig?.deviceId || this.randomUUIDImpl();
   }
 
+  // 凭证后端按平台选择（见 platform/secret-store.mjs）；首次使用时创建。
+  get secrets() {
+    this.secretStore ??= createSecretStore({
+      platform: this.platform,
+      dataDir: dirname(this.configPath),
+      execFileImpl: this.execFileImpl,
+      ...(this.secretRunImpl ? { runImpl: this.secretRunImpl } : {})
+    });
+    return this.secretStore;
+  }
+
   async readToken(serverId, userId) {
-    this.#assertMacOS();
     const account = keychainAccount(serverId, userId);
     for (const service of [KEYCHAIN_SERVICE, LEGACY_KEYCHAIN_SERVICE]) {
+      let token;
       try {
-        const { stdout } = await this.execFileImpl("/usr/bin/security", [
-          "find-generic-password",
-          "-s", service,
-          "-a", account,
-          "-w"
-        ]);
-        const token = String(stdout ?? "").replace(/[\r\n]+$/, "");
-        if (!token) return null;
-        if (service === LEGACY_KEYCHAIN_SERVICE) await this.saveToken(serverId, userId, token);
-        return token;
+        token = await this.secrets.read(service, account);
       } catch (cause) {
-        if (cause?.code === 44 || /could not be found|not found/i.test(cause?.stderr ?? "")) continue;
-        throw new EmbyError("KEYCHAIN_READ_FAILED", "无法从 macOS 钥匙串读取 Emby 登录信息", { cause });
+        throw new EmbyError("CREDENTIAL_READ_FAILED", `无法从${this.secrets.label}读取 Emby 登录信息`, { cause });
       }
+      if (!token) continue;
+      if (service === LEGACY_KEYCHAIN_SERVICE) await this.saveToken(serverId, userId, token);
+      return token;
     }
     return null;
   }
 
   async saveToken(serverId, userId, token) {
-    this.#assertMacOS();
     if (!token) throw new EmbyError("INVALID_TOKEN", "Emby AccessToken 为空");
     const account = keychainAccount(serverId, userId);
     try {
-      await this.execFileImpl("/usr/bin/security", [
-        "add-generic-password",
-        "-U",
-        "-s", KEYCHAIN_SERVICE,
-        "-a", account,
-        "-w", token
-      ]);
+      await this.secrets.write(KEYCHAIN_SERVICE, account, token);
     } catch (cause) {
-      throw new EmbyError("KEYCHAIN_WRITE_FAILED", "无法写入 macOS 钥匙串", { cause });
+      throw new EmbyError("CREDENTIAL_WRITE_FAILED", `无法写入${this.secrets.label}`, { cause });
     }
   }
 
   async deleteToken(serverId, userId) {
-    this.#assertMacOS();
     const account = keychainAccount(serverId, userId);
     let deleted = false;
     for (const service of [KEYCHAIN_SERVICE, LEGACY_KEYCHAIN_SERVICE]) {
       try {
-        await this.execFileImpl("/usr/bin/security", [
-          "delete-generic-password",
-          "-s", service,
-          "-a", account
-        ]);
-        deleted = true;
+        if (await this.secrets.delete(service, account)) deleted = true;
       } catch (cause) {
-        if (cause?.code === 44 || /could not be found|not found/i.test(cause?.stderr ?? "")) continue;
-        throw new EmbyError("KEYCHAIN_DELETE_FAILED", "无法删除 macOS 钥匙串中的 Emby 登录信息", { cause });
+        throw new EmbyError("CREDENTIAL_DELETE_FAILED", `无法删除${this.secrets.label}中的 Emby 登录信息`, { cause });
       }
     }
     return deleted;
-  }
-
-  #assertMacOS() {
-    if (this.platform !== "darwin") {
-      throw new EmbyError("UNSUPPORTED_PLATFORM", "第一版 Emby 凭证存储仅支持 macOS Keychain");
-    }
   }
 }

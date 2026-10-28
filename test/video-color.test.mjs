@@ -57,8 +57,8 @@ test("没有 FFmpeg 时跳过高分辨率但无法播放的源", () => {
 
 test("只有 HDR 处理优先使用独立安装的 ffmpeg-full；显式覆盖始终优先", () => {
   const fileExists = (path) => ["/custom/ffmpeg", "/opt/homebrew/bin/ffmpeg", "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"].includes(path);
-  assert.equal(resolveFfmpegPath({ env: {}, execPath: "/app/backend", fileExists, preferFull: true }), "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg");
-  assert.equal(resolveFfmpegPath({ env: { CODEX_COMPANION_FFMPEG: "/custom/ffmpeg" }, execPath: "/app/backend", fileExists, preferFull: true }), "/custom/ffmpeg");
+  assert.equal(resolveFfmpegPath({ env: {}, execPath: "/app/backend", fileExists, preferFull: true, platform: "darwin" }), "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg");
+  assert.equal(resolveFfmpegPath({ env: { CODEX_COMPANION_FFMPEG: "/custom/ffmpeg" }, execPath: "/app/backend", fileExists, preferFull: true, platform: "darwin" }), "/custom/ffmpeg");
 });
 
 test("实际执行滤镜探测（包含 GPU 驱动），失败时不继续输出错误色彩", async () => {

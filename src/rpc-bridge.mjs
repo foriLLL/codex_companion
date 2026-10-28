@@ -50,7 +50,8 @@ export function sanitizeRpcError(error) {
   return {
     code,
     message: redactSensitiveText(rawMessage),
-    retryable: error?.retryable === true
+    retryable: error?.retryable === true,
+    ...(Number.isSafeInteger(error?.revision) && error.revision >= 0 ? { revision: error.revision } : {})
   };
 }
 
@@ -129,7 +130,9 @@ function parseRequest(payload) {
     request.params !== undefined
     && (request.params === null || typeof request.params !== "object" || Array.isArray(request.params))
   ) {
-    const error = new RpcBridgeError("RPC_INVALID_REQUEST", "RPC params 必须是对象");
+    // 平台方法遵循参数错误契约；旧卡片请求保留原有错误码。
+    const code = request.method.startsWith("companion.") ? "RPC_INVALID_PARAMS" : "RPC_INVALID_REQUEST";
+    const error = new RpcBridgeError(code, "RPC params 必须是对象");
     error.requestId = request.id;
     throw error;
   }
@@ -159,6 +162,7 @@ export class CdpRpcBridge {
   #generations = new Map();
   #contexts = new Set();
   #targetId;
+  #mediaTransport;
   #logger;
   #timeoutMs;
   #bindingName;
@@ -175,6 +179,7 @@ export class CdpRpcBridge {
   constructor(connection, {
     handler,
     targetId = null,
+    mediaTransport = undefined,
     logger = console,
     timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
     bindingName = RPC_BINDING_NAME,
@@ -197,6 +202,7 @@ export class CdpRpcBridge {
     this.#disposeTarget = normalizedHandler.disposeTarget;
     this.#disposeContext = normalizedHandler.disposeContext;
     this.#targetId = targetId;
+    this.#mediaTransport = mediaTransport;
     this.#logger = logger;
     this.#timeoutMs = timeoutMs;
     this.#bindingName = bindingName;
@@ -320,6 +326,7 @@ export class CdpRpcBridge {
           requestId: request.id,
           targetId: this.#targetId,
           executionContextId,
+          ...(this.#mediaTransport ? { mediaTransport: this.#mediaTransport } : {}),
           ...(request.cardId === undefined ? {} : { cardId: request.cardId, generation: request.generation })
         })),
         aborted

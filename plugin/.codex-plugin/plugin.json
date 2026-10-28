@@ -1,0 +1,10 @@
+{
+  "name": "codex-companion",
+  "version": "0.1.3",
+  "description": "红果短剧、Emby、小游戏与常用工具，在 Codex 侧栏中自然使用。",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Companion",
+    "shortDescription": "片刻放松，随手可达"
+  }
+}

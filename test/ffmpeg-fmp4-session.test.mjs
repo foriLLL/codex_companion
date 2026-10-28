@@ -37,7 +37,7 @@ async function ffmpegHasFilter(name) {
 }
 
 test("Bun 发布运行时使用原生 loopback Range 服务并保持字节精确", async () => {
-  const bunPath = join(process.cwd(), "node_modules", ".bin", "bun");
+  const bunPath = join(process.cwd(), "node_modules", "bun", "bin", "bun.exe");
   const moduleUrl = new URL("../src/ffmpeg-fmp4-session.mjs", import.meta.url).href;
   const script = `
     import { RangeProxy } from ${JSON.stringify(moduleUrl)};

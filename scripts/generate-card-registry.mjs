@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { discoverCards } from "../src/platform/registry/discovery.mjs";
 
@@ -51,15 +51,24 @@ function realpathExisting(path) {
 }
 
 function toImportSpecifier(fromFile, targetFile) {
-  const raw = relative(dirname(realpathExisting(fromFile)), realpathExisting(targetFile));
-  if (!raw || raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) {
-    throw new Error(`入口导入必须是相对路径，无法从 ${fromFile} 指向 ${targetFile}`);
-  }
+  const target = realpathExisting(targetFile);
+  const raw = relative(dirname(realpathExisting(fromFile)), target);
+  if (!raw) throw new Error(`入口导入无效，无法从 ${fromFile} 指向 ${targetFile}`);
+  // Windows 跨盘符时不存在相对路径（例如输出放在另一盘的临时目录），退回 file: URL。
+  // 仓库内的生成产物与源码同盘，始终是可移植的相对导入。
+  if (isAbsolute(raw)) return pathToFileURL(target).href;
   const specifier = raw.split(sep).join("/");
   return specifier.startsWith(".") ? specifier : `./${specifier}`;
 }
 
 function assertFixedEntry(specifier, fileName) {
+  // 跨盘符时 toImportSpecifier 返回由 pathToFileURL 生成的规范化 file: URL。
+  if (specifier.startsWith("file:///")) {
+    if (decodeURIComponent(new URL(specifier).pathname.split("/").at(-1)) !== fileName) {
+      throw new Error(`拒绝非固定入口 ${specifier}`);
+    }
+    return;
+  }
   if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
     throw new Error(`拒绝非相对入口 ${specifier}`);
   }

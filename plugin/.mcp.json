@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "companion": {
+      "command": "/usr/bin/env",
+      "args": ["./companion-backend"],
+      "cwd": "."
+    }
+  }
+}

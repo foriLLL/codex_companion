@@ -60,6 +60,7 @@ export function mount(ctx) {
   const subtitleObjectUrls = new Set();
   let subtitlePreference = null;
   let subtitleSwitching = false;
+  let cardVisible = true;
   // 按 seriesId 记住用户选中的源（sourceKey），会话级，退出 Codex 不保留（与字幕偏好一致）。
   const sourcePreferences = new Map();
   let episodeContextRequestId = null;
@@ -194,8 +195,9 @@ export function mount(ctx) {
         bitmap.src = fallbackUrl;
         await bitmap.decode();
       }
-      const targetWidth = kind === "backdrop" ? 600 : 144;
-      const targetHeight = kind === "backdrop" ? 338 : 208;
+      // tile 为首页媒体库 16:9 小方块；海报按 80px 宽的 2x 屏尺寸输出。
+      const targetWidth = kind === "backdrop" ? 600 : kind === "tile" ? 320 : 160;
+      const targetHeight = kind === "backdrop" ? 338 : kind === "tile" ? 180 : 240;
       const isLibraryTemplate = kind !== "backdrop"
         && item?.type === "CollectionFolder"
         && bitmap.width / Math.max(1, bitmap.height) > 1.4;
@@ -213,7 +215,8 @@ export function mount(ctx) {
         sourceX += (region.width - sourceWidth) / 2;
       } else {
         sourceHeight = region.width / targetRatio;
-        sourceY += (region.height - sourceHeight) / 2;
+        // 竖版封面裁成横图时偏上取景，人物面部通常位于上部。
+        sourceY += (region.height - sourceHeight) * (kind === "tile" ? .22 : .5);
       }
       const canvas = typeof OffscreenCanvas === "function"
         ? new OffscreenCanvas(targetWidth, targetHeight)
@@ -262,7 +265,7 @@ export function mount(ctx) {
     if (!reference) return;
     // 记录绑定信息：host 重挂回 DOM 时 refreshEmbyImages 用它补绑/重试缺 src 的图。
     img.embyImageBinding = { item, kind };
-    const profile = kind === "backdrop" ? "backdrop" : item?.type === "CollectionFolder" ? "library" : "primary";
+    const profile = kind === "backdrop" ? "backdrop" : kind === "tile" ? "tile" : item?.type === "CollectionFolder" ? "library" : "primary";
     const key = `${profile}:${typeof reference === "string" ? reference : JSON.stringify(reference)}`;
     img.dataset.imageState = "loading";
     const cached = imageCache.get(key);
@@ -413,6 +416,7 @@ export function mount(ctx) {
       toolbar.append(makeElement("h2", "emby-toolbar-title", title));
       if (options.search) toolbar.append(makeIconButton("搜索媒体", "search", options.search));
     }
+    if (options.serverAvatar) toolbar.append(makeServerAvatar(options.serverAvatar));
     if (options.servers) toolbar.append(makeIconButton("切换 Emby 服务器", "servers", options.servers));
     if (options.logout) toolbar.append(makeIconButton("退出 Emby", "logout", options.logout));
     return toolbar;
@@ -521,7 +525,85 @@ export function mount(ctx) {
     return view;
   };
 
-  const makePosterButton = (item) => {
+  // 首页右上角的服务器头像：用户名首字母 + 稳定配色，悬停可见完整的 主机 · 用户。
+  const makeServerAvatar = ({ server, onClick }) => {
+    const label = server ? `${serverTitle(server)}${server.username ? ` · ${server.username}` : ""}` : "Emby 服务器";
+    const button = makeElement("button", "emby-server-avatar");
+    button.type = "button";
+    button.setAttribute("aria-label", `切换 Emby 服务器（当前：${label}）`);
+    button.title = label;
+    const seed = [...(server?.key || server?.baseUrl || "emby")].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+    // 只从饱和度适中的几种色相里取，避免算出橄榄、土黄等发灰的颜色。
+    button.style.setProperty("--emby-avatar-hue", String([212, 248, 276, 328, 6, 168, 194][seed % 7]));
+    button.textContent = (server?.username || serverTitle(server) || "E").trim().charAt(0).toUpperCase() || "E";
+    listen(button, "click", onClick);
+    return button;
+  };
+
+  const makeSection = (title, className = "") => {
+    const section = makeElement("section", `emby-section${className ? ` ${className}` : ""}`);
+    section.append(makeElement("h3", "emby-section-title", title));
+    return section;
+  };
+
+  const episodeCode = (item) => item?.type === "Episode" && item.indexNumber
+    ? `${item.parentIndexNumber ? `S${item.parentIndexNumber}` : ""}E${item.indexNumber}`
+    : "";
+
+  const remainingLabel = (item) => {
+    const runtime = Number(item?.runtimeTicks || 0);
+    if (!runtime) return "";
+    const position = Number(item.positionTicks || 0) || runtime * safePercent(item.progressPercent) / 100;
+    const minutes = Math.max(1, Math.round((runtime - position) / 600_000_000));
+    return minutes >= 60 ? `剩余 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分` : `剩余 ${minutes} 分钟`;
+  };
+
+  // 继续观看：16:9 横滑卡片，底部渐变上叠剧名、集数与剩余时长，底边为进度条。
+  const makeResumeCard = (item) => {
+    const button = makeElement("button", "emby-media-button emby-resume");
+    button.type = "button";
+    const title = item.seriesName || item.name || "继续播放";
+    button.title = item.seriesName && item.name ? `${item.seriesName} · ${item.name}` : title;
+    const image = makeElement("img");
+    image.alt = "";
+    bindImage(image, item, "backdrop");
+    const copy = makeElement("span", "emby-resume-copy");
+    copy.append(makeElement("span", "emby-resume-name", title));
+    // 单集名单独一行；集数与剩余时长放最后一行，避免长标题把剩余时长挤出可视区。
+    if (item.seriesName && item.name) copy.append(makeElement("span", "emby-resume-episode", item.name));
+    const meta = [episodeCode(item), remainingLabel(item)].filter(Boolean).join(" · ");
+    if (meta) copy.append(makeElement("span", "emby-resume-meta", meta));
+    const progress = makeElement("span", "emby-progress");
+    const progressFill = makeElement("span");
+    progressFill.style.width = `${safePercent(item.progressPercent)}%`;
+    progress.append(progressFill);
+    button.append(image, makeElement("span", "emby-resume-play"), copy, progress);
+    listen(button, "click", () => openItem(item));
+    return button;
+  };
+
+  // 媒体库只是分类入口：两列 16:9 小方块，名称压在图上，比竖版海报省约三分之二高度。
+  const makeLibraryTile = (item) => {
+    const button = makeElement("button", "emby-library-tile");
+    button.type = "button";
+    button.title = item.name || "媒体库";
+    if (imageReference(item, "primary")) {
+      const image = makeElement("img");
+      image.alt = "";
+      bindImage(image, item, "tile");
+      button.append(image);
+    }
+    button.append(makeElement("span", "emby-library-name", item.name || "媒体库"));
+    listen(button, "click", () => openItem(item));
+    return button;
+  };
+
+  const posterMeta = (item) => [
+    item.productionYear ? String(item.productionYear) : "",
+    item.type === "Series" ? "剧集" : item.type === "Movie" ? "电影" : ""
+  ].filter(Boolean).join(" · ");
+
+  const makePosterButton = (item, options = {}) => {
     const button = makeElement("button", "emby-poster-button");
     button.type = "button";
     button.title = item.name || "打开媒体";
@@ -540,6 +622,8 @@ export function mount(ctx) {
     }
     if (item.played) poster.append(makeElement("span", "emby-badge", "已看"));
     button.append(poster, makeElement("span", "emby-poster-name", item.name || "未命名"));
+    const meta = options.meta ? posterMeta(item) : "";
+    if (meta) button.append(makeElement("span", "emby-poster-meta", meta));
     listen(button, "click", () => openItem(item));
     return button;
   };
@@ -548,9 +632,11 @@ export function mount(ctx) {
     const view = makeElement("div", "emby-view");
     view.dataset.view = "home";
     const activeServer = embyState.servers.find((entry) => entry.active);
-    const activeServerText = activeServer
-      ? `${serverTitle(activeServer)}${activeServer.username ? ` · ${activeServer.username}` : ""}`
-      : "";
+    const openServers = () => {
+      rememberScroll();
+      embyState.view = "servers";
+      renderEmby();
+    };
     view.append(makeToolbar("Emby", {
       searchField: {
         value: embyState.searchQuery,
@@ -564,75 +650,40 @@ export function mount(ctx) {
           runSearch(query);
         }
       },
-      servers: () => {
-        rememberScroll();
-        embyState.view = "servers";
-        renderEmby();
-      }
+      // 当前服务器只保留一个入口；悬停/读屏可获得完整的 主机 · 用户。
+      serverAvatar: { server: activeServer, onClick: openServers }
     }));
     const scroll = makeElement("div", "emby-scroll emby-content");
     scroll.dataset.scrollKey = "home";
 
-    // 顶部显示当前所在服务器，多服务器时一眼可辨（点击进入服务器切换）。
-    if (activeServer) {
-      const serverLine = makeElement("button", "emby-active-server");
-      serverLine.type = "button";
-      serverLine.setAttribute("aria-label", `当前 Emby 服务器：${activeServerText}，点击切换`);
-      serverLine.append(
-        makeToolbarIcon("servers"),
-        makeElement("span", "emby-active-server-name", activeServerText)
-      );
-      listen(serverLine, "click", () => {
-        rememberScroll();
-        embyState.view = "servers";
-        renderEmby();
-      });
-      scroll.append(serverLine);
+    // 继续观看最常用，放在最上方；没有记录时整段不显示。
+    if (embyState.home.resume.length) {
+      const resumeSection = makeSection("继续观看");
+      const row = makeElement("div", "emby-row emby-resume-row");
+      for (const item of embyState.home.resume) row.append(makeResumeCard(item));
+      resumeSection.append(row);
+      scroll.append(resumeSection);
     }
 
-    const librariesSection = makeElement("section", "emby-section");
-    librariesSection.append(makeElement("h3", "emby-section-title", "媒体库"));
+    const librariesSection = makeSection("媒体库");
     if (embyState.home.views.length) {
-      const row = makeElement("div", "emby-row");
-      for (const item of embyState.home.views) row.append(makePosterButton(item));
-      librariesSection.append(row);
+      // 超过 4 个时改为两行横滑，避免媒体库多时把下方内容推出首屏。
+      const tiles = makeElement("div", embyState.home.views.length > 4 ? "emby-row emby-library-tiles" : "emby-library-tiles");
+      for (const item of embyState.home.views) tiles.append(makeLibraryTile(item));
+      librariesSection.append(tiles);
     } else {
       librariesSection.append(makeEmpty("服务器没有可浏览的媒体库"));
     }
 
-    const resumeSection = makeElement("section", "emby-section");
-    resumeSection.append(makeElement("h3", "emby-section-title", "继续观看"));
-    const resumeItem = embyState.home.resume[0];
-    if (resumeItem) {
-      const hero = makeElement("button", "emby-media-button emby-hero");
-      hero.type = "button";
-      const image = makeElement("img");
-      image.alt = "";
-      bindImage(image, resumeItem, "backdrop");
-      const copy = makeElement("span", "emby-hero-copy");
-      copy.append(makeElement("span", "emby-hero-name", resumeItem.name || "继续播放"));
-      const progress = makeElement("span", "emby-progress");
-      const progressFill = makeElement("span");
-      progressFill.style.width = `${safePercent(resumeItem.progressPercent)}%`;
-      progress.append(progressFill);
-      copy.append(progress);
-      hero.append(image, copy);
-      listen(hero, "click", () => openItem(resumeItem));
-      resumeSection.append(hero);
-    } else {
-      resumeSection.append(makeEmpty("还没有可继续观看的内容"));
-    }
-
-    const recentSection = makeElement("section", "emby-section");
-    recentSection.append(makeElement("h3", "emby-section-title", "最近添加"));
+    const recentSection = makeSection("最近添加");
     if (embyState.home.latest.length) {
-      const row = makeElement("div", "emby-row");
-      for (const item of embyState.home.latest) row.append(makePosterButton(item));
+      const row = makeElement("div", "emby-row emby-poster-row");
+      for (const item of embyState.home.latest) row.append(makePosterButton(item, { meta: true }));
       recentSection.append(row);
     } else {
       recentSection.append(makeEmpty("媒体库暂无视频内容"));
     }
-    scroll.append(librariesSection, resumeSection, recentSection);
+    scroll.append(librariesSection, recentSection);
     view.append(scroll);
     return view;
   };
@@ -693,7 +744,11 @@ export function mount(ctx) {
   const removeCurrentEmbyServer = async () => {
     const server = embyState.servers.find((entry) => entry.active);
     if (!server?.key) return;
-    if (!confirm(`移除 ${serverTitle(server)}（${server.username || "未知用户"}）？`)) return;
+    const message = `移除 ${serverTitle(server)}（${server.username || "未知用户"}）？`;
+    const confirmed = typeof ctx.confirmAction === "function"
+      ? await ctx.confirmAction({ title: "移除服务器？", message, confirmLabel: "移除", destructive: true })
+      : confirm(message);
+    if (!confirmed || isDisposed()) return;
     embyState.loadingLabel = `正在移除 ${serverTitle(server)}…`;
     resetEmbyBrowseState();
     embyState.view = "loading";
@@ -1183,16 +1238,7 @@ export function mount(ctx) {
     }
   }
 
-  const currentEmbyVideo = () => {
-    const local = embyApp.querySelector(".emby-video");
-    if (local) return local;
-    const frame = embyApp.querySelector(".emby-video-frame");
-    try {
-      return frame?.contentDocument?.querySelector("video") ?? null;
-    } catch {
-      return null;
-    }
-  };
+  const currentEmbyVideo = () => embyApp.querySelector(".emby-video");
 
   const playbackPayload = (eventName) => {
     const playback = embyState.playback;
@@ -1290,6 +1336,8 @@ export function mount(ctx) {
     if (button) {
       button.title = track ? `字幕：${track.label}` : "字幕：关闭";
       button.setAttribute("aria-label", button.title);
+      const value = button.querySelector(".emby-subtitle-value");
+      if (value) value.textContent = track?.label || "关闭";
     }
     for (const option of embyApp.querySelectorAll(".emby-subtitle-option")) {
       const value = option.dataset.subtitleIndex === "off"
@@ -1388,8 +1436,6 @@ export function mount(ctx) {
       video.removeAttribute("src");
       scope.release(() => video.load());
     }
-    const frame = embyApp.querySelector(".emby-video-frame");
-    if (frame) frame.src = "about:blank";
   };
 
   const switchEmbySubtitle = async (subtitleStreamIndex) => {
@@ -1507,7 +1553,7 @@ export function mount(ctx) {
     }
     delete playback.restorePlaybackState;
     playback.mediaReady = true;
-    if (!restore?.paused) video.play().catch(() => {});
+    if (!restore?.paused && (ctx.environment?.kind !== "plugin" || cardVisible)) video.play().catch(() => {});
     if (Object.prototype.hasOwnProperty.call(playback, "pendingSubtitleSelection")) {
       const pendingSubtitleSelection = playback.pendingSubtitleSelection;
       delete playback.pendingSubtitleSelection;
@@ -1547,55 +1593,35 @@ export function mount(ctx) {
     }
   };
 
-  const configureLoopbackVideoFrame = async (frame, playback, proxyUrl) => {
-    // app:// 主文档的 CSP 禁止 media-src 127.0.0.1；同源 blob 子文档不会继承
-    // 这条主文档策略。把原生 <video> 放进无脚本 blob iframe 后，媒体 Range
-    // 直接流经 loopback HTTP，不再把 Base64 分片塞进 CDP/Renderer 堆。
-    const frameSource = [
-      "<!doctype html><meta charset=\"utf-8\">",
-      "<style>",
-      "html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000}",
-      "video{display:block;width:100%;height:100%;object-fit:contain;background:#000}",
-      "video::cue{color:#fff;background:rgba(0,0,0,.72);font-family:-apple-system,system-ui,sans-serif;font-size:min(4.5vh,44px);text-shadow:0 1px 2px #000,0 0 2px #000}",
-      "video::-webkit-media-controls-toggle-closed-captions-button,video::-webkit-media-controls-fullscreen-button{display:none}",
-      "</style><video controls playsinline preload=\"metadata\"></video>"
-    ].join("");
-    const frameUrl = createObjectURL(new Blob([frameSource], { type: "text/html;charset=utf-8" }));
+  // CDP 媒体拦截地址（见 src/media-intercept.mjs）：保留域名 + 代理端口 + 秘密路径。
+  const requireInterceptMediaUrl = (value) => {
     try {
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => finish(reject, rpcError("MEDIA_FRAME_TIMEOUT", "原生媒体容器启动超时", true)), 10_000);
-        const finish = (callback, value) => {
-          clearTimeout(timeout);
-          unlisten(frame, "load", onLoad);
-          unlisten(frame, "error", onError);
-          callback(value);
-        };
-        const onLoad = () => finish(resolve);
-        const onError = () => finish(reject, rpcError("MEDIA_FRAME_FAILED", "原生媒体容器启动失败", true));
-        listen(frame, "load", onLoad, { once: true });
-        listen(frame, "error", onError, { once: true });
-        frame.src = frameUrl;
-      });
-    } finally {
-      revokeObjectURL(frameUrl);
+      const url = new URL(String(value ?? ""));
+      const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+      if (
+        url.origin !== "https://codex-companion.invalid"
+        || url.username
+        || url.password
+        || url.hash
+        || !new RegExp(`^/\\d{1,5}/hls/${uuid}/.+`, "i").test(url.pathname)
+      ) return null;
+      return url.href;
+    } catch {
+      return null;
     }
-    if (isDisposed() || !frame.isConnected || embyState.playback !== playback) {
-      throw rpcError("ABORTED", "播放器已经关闭");
-    }
-    let video = null;
-    try {
-      video = frame.contentDocument?.querySelector("video") ?? null;
-    } catch {}
-    if (!video) throw rpcError("MEDIA_FRAME_FAILED", "原生媒体容器中没有视频元素", true);
-    video.disablePictureInPicture = true;
-    video.src = proxyUrl;
+  };
+
+  // 原生直放：<video> 直接请求拦截地址，Range 数据走 Chromium 网络栈，
+  // 不经 RPC/Base64，也不占 MSE SourceBuffer 配额。
+  const configureNativeVideo = async (video, playback, mediaUrl) => {
+    video.src = mediaUrl;
     video.load();
     await new Promise((resolve, reject) => {
       if (video.readyState >= 1) {
         resolve();
         return;
       }
-      const timeout = setTimeout(() => finish(reject, rpcError("MEDIA_METADATA_TIMEOUT", "视频元数据加载超时", true)), 30_000);
+      const timeout = setTimeout(() => finish(reject, rpcError("MEDIA_METADATA_TIMEOUT", "视频元数据加载超时", true)), 15_000);
       const finish = (callback, value) => {
         clearTimeout(timeout);
         unlisten(video, "loadedmetadata", onMetadata);
@@ -1804,26 +1830,6 @@ export function mount(ctx) {
     return item?.name || "选集";
   };
 
-  const closePlaybackEpisodePicker = (
-    view = embyApp.querySelector(".emby-playback"),
-    { restoreCurrentSeason = true } = {}
-  ) => {
-    if (!view) return;
-    const picker = view.querySelector(".emby-episode-picker");
-    const button = view.querySelector(".emby-episode-picker-button");
-    if (picker) picker.hidden = true;
-    if (button) button.setAttribute("aria-expanded", "false");
-    view.dataset.episodePickerOpen = "false";
-    const playback = embyState.playback;
-    if (
-      restoreCurrentSeason
-      && playback?.item?.seasonId
-      && embyState.selectedSeasonId !== playback.item.seasonId
-    ) {
-      void loadPlaybackSeason(playback.item.seasonId, playback);
-    }
-  };
-
   const syncPlaybackEpisodeNavigation = (view = embyApp.querySelector(".emby-playback")) => {
     const playback = embyState.playback;
     if (!view || !playback) return;
@@ -1831,7 +1837,8 @@ export function mount(ctx) {
     const nav = view.querySelector(".emby-playback-episode-nav");
     const previous = view.querySelector('[data-episode-direction="-1"]');
     const next = view.querySelector('[data-episode-direction="1"]');
-    const pickerButton = view.querySelector(".emby-episode-picker-button");
+    const picker = view.querySelector(".emby-episode-picker");
+    const pickerLabel = view.querySelector(".emby-episode-picker-button");
     const pickerHeader = view.querySelector(".emby-episode-picker-header");
     const pickerGrid = view.querySelector(".emby-episode-picker-grid");
     const endedNext = view.querySelector(".emby-ended-next");
@@ -1844,23 +1851,29 @@ export function mount(ctx) {
       && (Array.isArray(embyState.seasons) ? embyState.seasons.length : 0) <= 1
       && (Array.isArray(embyState.episodes) ? embyState.episodes.length : 0) <= 1;
     if (nav) nav.hidden = !isEpisode || singleEpisodeOnly;
+    if (picker) picker.hidden = !isEpisode || !item.seriesId || singleEpisodeOnly;
     if (endedNext) endedNext.hidden = !isEpisode;
     if (!isEpisode) return;
-    if (singleEpisodeOnly) closePlaybackEpisodePicker(view);
 
-    const sameSeries = embyState.seriesItem?.id === item.seriesId;
-    if (previous) previous.disabled = !hasContext || !hasAdjacentEpisode(item.id, -1);
-    if (next) next.disabled = !hasContext || !hasAdjacentEpisode(item.id, 1);
-    if (endedNext) endedNext.disabled = !hasContext || !hasAdjacentEpisode(item.id, 1);
-    if (pickerButton) {
-      pickerButton.textContent = playbackEpisodeLabel(item);
-      pickerButton.disabled = !item.seriesId;
-      pickerButton.title = item.name || pickerButton.textContent;
+    // 选集里切到别的季浏览时，episodes 不再包含当前集：上一集/下一集沿用最后一次
+    // 在当前季算出的可用性（playAdjacentEpisode 会先切回当前季再跳转）。
+    if (hasContext) {
+      playback.adjacent = { previous: hasAdjacentEpisode(item.id, -1), next: hasAdjacentEpisode(item.id, 1) };
+    }
+    const adjacent = playback.adjacent || { previous: false, next: false };
+    if (previous) previous.disabled = !adjacent.previous;
+    if (next) next.disabled = !adjacent.next;
+    if (endedNext) endedNext.disabled = !adjacent.next;
+    if (pickerLabel) {
+      pickerLabel.textContent = hasContext && embyState.episodes.length ? `共 ${embyState.episodes.length} 集` : "";
     }
     if (!pickerHeader || !pickerGrid) return;
 
+    const sameSeries = embyState.seriesItem?.id === item.seriesId;
+    const seasons = sameSeries ? embyState.seasons : [];
+    pickerHeader.hidden = seasons.length <= 1;
     pickerHeader.replaceChildren();
-    for (const season of sameSeries ? embyState.seasons : []) {
+    for (const season of seasons) {
       const chip = makeElement("button", "emby-episode-season", season.name || `第 ${season.indexNumber || "?"} 季`);
       chip.type = "button";
       chip.setAttribute("aria-selected", String(season.id === embyState.selectedSeasonId));
@@ -1879,31 +1892,38 @@ export function mount(ctx) {
       ));
       return;
     }
+    let current = null;
     for (const episode of embyState.episodes) {
       const button = makeElement(
         "button",
         "emby-episode-picker-item",
-        episode.indexNumber ? `第 ${episode.indexNumber} 集` : episode.name || "播放"
+        episode.indexNumber ? String(episode.indexNumber) : episode.name || "播放"
       );
       button.type = "button";
-      button.title = episode.name || button.textContent;
+      button.title = [episode.indexNumber ? `第 ${episode.indexNumber} 集` : "", episode.name].filter(Boolean).join(" · ");
+      button.setAttribute("aria-label", button.title || "播放");
       button.setAttribute("aria-current", String(episode.id === playback.itemId));
+      if (episode.played) button.dataset.played = "true";
+      if (episode.id === playback.itemId) current = button;
       listen(button, "click", () => {
-        closePlaybackEpisodePicker(view, { restoreCurrentSeason: false });
         if (episode.id !== playback.itemId) void beginPlayback(episode, true);
       });
       pickerGrid.append(button);
     }
-    pickerGrid.querySelector('[aria-current="true"]')?.scrollIntoView({ block: "nearest" });
+    // 集数多时网格自身限高滚动：只滚网格让当前集可见，不用 scrollIntoView——
+    // 它会顺带滚动信息区和外层卡片列表。
+    if (current) {
+      requestAnimationFrame(() => {
+        if (!current.isConnected || pickerGrid.scrollHeight <= pickerGrid.clientHeight) return;
+        pickerGrid.scrollTop = Math.max(0, current.offsetTop - pickerGrid.offsetTop - (pickerGrid.clientHeight - current.offsetHeight) / 2);
+      });
+    }
   };
 
   const loadPlaybackSeason = async (seasonId, playback = embyState.playback) => {
     if (!playback?.item?.seriesId || embyState.playback !== playback) return null;
-    const pickerButton = embyApp.querySelector(".emby-episode-picker-button");
-    if (pickerButton) {
-      pickerButton.textContent = "正在加载…";
-      pickerButton.disabled = true;
-    }
+    const pickerLabel = embyApp.querySelector(".emby-episode-picker-button");
+    if (pickerLabel) pickerLabel.textContent = "正在加载…";
     try {
       const result = await fetchPlaybackEpisodeContext(playback.item, seasonId);
       if (isDisposed() || embyState.playback !== playback) return null;
@@ -1925,6 +1945,11 @@ export function mount(ctx) {
   const playAdjacentEpisode = async (direction) => {
     const playback = embyState.playback;
     if (!playback?.item || playback.item.type !== "Episode") return;
+    // 选集里正浏览别的季：先切回当前集所在季，相邻集按当前季计算。
+    if (!episodeContextMatches(playback.item) && playback.item.seasonId) {
+      await loadPlaybackSeason(playback.item.seasonId, playback);
+      if (embyState.playback !== playback || !episodeContextMatches(playback.item)) return;
+    }
     let episode = adjacentEpisodeInSeason(playback.itemId, direction);
     if (episode) {
       await beginPlayback(episode, true);
@@ -1949,88 +1974,93 @@ export function mount(ctx) {
     }
   };
 
+  const AUTO_NEXT_SECONDS = 8;
+
   const renderPlayback = () => {
     const view = makeElement("div", "emby-view emby-playback");
     view.dataset.view = "playback";
     view.tabIndex = 0;
     const playback = embyState.playback;
-    const directProxyUrl = playback?.streamMode === "direct-mp4"
-      ? requireLoopbackMediaUrl(playback.directProxyUrl)
+    const directMediaUrl = playback?.streamMode === "direct-mp4"
+      ? requireInterceptMediaUrl(playback.directMediaUrl)
       : null;
-    let embyVideo = directProxyUrl ? null : makeElement("video", "emby-video");
-    let mediaElement = embyVideo;
-    if (embyVideo) {
-      embyVideo.controls = true;
-      embyVideo.playsInline = true;
-      embyVideo.preload = "metadata";
-      // 与红果播放视图一致禁用画中画（Electron 下 PiP 行为未验证，两卡统一）。
-      embyVideo.disablePictureInPicture = true;
-    } else {
-      const frame = makeElement("iframe", "emby-video-frame");
-      frame.title = "Emby 原生视频播放器";
-      frame.setAttribute("allow", "autoplay; fullscreen");
-      mediaElement = frame;
-    }
+    const embyVideo = makeElement("video", "emby-video");
+    embyVideo.controls = true;
+    embyVideo.playsInline = true;
+    embyVideo.preload = "metadata";
+    // 与红果播放视图一致禁用画中画（Electron 下 PiP 行为未验证，两卡统一）。
+    embyVideo.disablePictureInPicture = true;
+    // 布局：视频按片源比例固定在顶部（.emby-stage），画面上只叠返回/全屏两个
+    // 自动隐藏的控件；标题、集数、上一集/下一集、字幕与选集都放在下方信息区，
+    // 不再遮挡画面。全屏时信息区隐藏，舞台铺满。
+    const stage = makeElement("div", "emby-stage");
     const chrome = makeElement("div", "emby-playback-chrome");
     const back = makeIconButton("返回媒体列表", "back", () => stopPlayback(true));
     back.classList.add("emby-playback-back");
-    chrome.append(back, makeElement("span", "emby-playback-title", embyState.playback?.item?.name || "正在播放"));
+    chrome.append(back, makeElement("span", "emby-playback-spacer"));
+    const playbackItem = embyState.playback?.item || {};
+    const info = makeElement("div", "emby-playback-info emby-scroll");
+    const heading = makeElement("div", "emby-playback-heading");
+    if (playbackItem.type === "Episode" && playbackItem.seriesName) {
+      heading.append(makeElement("div", "emby-playback-kicker", playbackItem.seriesName));
+    }
+    heading.append(makeElement("div", "emby-playback-title", playbackItem.name || "正在播放"));
+    const tags = makeElement("div", "emby-playback-tags");
+    const codeLabel = playbackItem.type === "Episode"
+      ? playbackEpisodeLabel(playbackItem)
+      : playbackItem.productionYear ? String(playbackItem.productionYear) : "";
+    if (codeLabel) tags.append(makeElement("span", "emby-playback-tag", codeLabel));
     // 画质透出：与选源 chips 同源的标签（如 "4K MKV H264"、"1080p MP4"），没有时不占位。
     if (embyState.playback?.qualityLabel) {
-      chrome.append(makeElement("span", "emby-playback-quality", embyState.playback.qualityLabel));
+      tags.append(makeElement("span", "emby-playback-tag emby-playback-quality", embyState.playback.qualityLabel));
     }
+    if (tags.childElementCount) heading.append(tags);
+    info.append(heading);
     const subtitles = Array.isArray(embyState.playback?.subtitles) ? embyState.playback.subtitles : [];
     let subtitleMenu = null;
     const episodeNav = makeElement("div", "emby-playback-episode-nav");
     episodeNav.hidden = true;
-    const previousEpisode = makeElement("button", "emby-episode-nav-button", "上一集");
-    previousEpisode.type = "button";
-    previousEpisode.dataset.episodeDirection = "-1";
-    previousEpisode.setAttribute("aria-label", "播放上一集");
-    listen(previousEpisode, "click", () => void playAdjacentEpisode(-1));
-    const episodePickerButton = makeElement("button", "emby-episode-nav-button emby-episode-picker-button", "选集");
-    episodePickerButton.type = "button";
-    episodePickerButton.setAttribute("aria-label", "打开选集");
-    episodePickerButton.setAttribute("aria-haspopup", "dialog");
-    episodePickerButton.setAttribute("aria-expanded", "false");
-    const nextEpisodeButton = makeElement("button", "emby-episode-nav-button", "下一集");
-    nextEpisodeButton.type = "button";
-    nextEpisodeButton.dataset.episodeDirection = "1";
-    nextEpisodeButton.setAttribute("aria-label", "播放下一集");
-    listen(nextEpisodeButton, "click", () => void playAdjacentEpisode(1));
-    episodeNav.append(previousEpisode, episodePickerButton, nextEpisodeButton);
-    const episodePicker = makeElement("div", "emby-episode-picker");
+    episodeNav.setAttribute("role", "group");
+    episodeNav.setAttribute("aria-label", "切换剧集");
+    const makeEpisodeNavButton = (direction, label, icon) => {
+      const button = makeElement("button", "emby-episode-nav-button");
+      button.type = "button";
+      button.dataset.episodeDirection = String(direction);
+      button.setAttribute("aria-label", `播放${label}`);
+      const text = makeElement("span", "", label);
+      button.append(...(direction < 0 ? [makeToolbarIcon(icon), text] : [text, makeToolbarIcon(icon)]));
+      listen(button, "click", () => void playAdjacentEpisode(direction));
+      return button;
+    };
+    episodeNav.append(
+      makeEpisodeNavButton(-1, "上一集", "previous"),
+      makeEpisodeNavButton(1, "下一集", "next")
+    );
+    info.append(episodeNav);
+    // 选集直接内嵌在信息区：季切换 + 横滑集数，不再弹出遮挡画面的对话框。
+    const episodePicker = makeElement("section", "emby-episode-picker");
     episodePicker.hidden = true;
-    episodePicker.setAttribute("role", "dialog");
     episodePicker.setAttribute("aria-label", "剧集与选集");
+    const pickerTitle = makeElement("div", "emby-section-title");
+    pickerTitle.append(
+      makeElement("span", "", "选集"),
+      makeElement("span", "emby-episode-picker-button", "")
+    );
     episodePicker.append(
+      pickerTitle,
       makeElement("div", "emby-episode-picker-header"),
       makeElement("div", "emby-episode-picker-grid")
     );
-    listen(episodePickerButton, "click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const willOpen = episodePicker.hidden;
-      if (willOpen && subtitleMenu && !subtitleMenu.hidden) {
-        subtitleMenu.hidden = true;
-        chrome.querySelector(".emby-subtitle-button")?.setAttribute("aria-expanded", "false");
-      }
-      episodePicker.hidden = !willOpen;
-      episodePickerButton.setAttribute("aria-expanded", String(willOpen));
-      view.dataset.episodePickerOpen = String(willOpen);
-      if (!willOpen) return;
-      syncPlaybackEpisodeNavigation(view);
-      const playback = embyState.playback;
-      if (playback?.item?.seriesId && !episodeContextMatches(playback.item)) {
-        void loadPlaybackSeason(playback.item.seasonId, playback);
-      } else {
-        episodePicker.querySelector('[aria-current="true"]')?.focus({ preventScroll: true });
-      }
-    });
+    const settingsGroup = makeElement("div", "emby-playback-settings");
     if (subtitles.length > 0) {
-      const subtitleButton = makeElement("button", "emby-icon-button emby-subtitle-button");
+      const subtitleButton = makeElement("button", "emby-playback-row emby-subtitle-button");
       subtitleButton.type = "button";
-      subtitleButton.append(makeToolbarIcon("subtitles"));
+      subtitleButton.append(
+        makeToolbarIcon("subtitles"),
+        makeElement("span", "emby-playback-row-label", "字幕"),
+        makeElement("span", "emby-playback-row-value emby-subtitle-value", ""),
+        makeToolbarIcon("chevron")
+      );
       subtitleButton.setAttribute("aria-haspopup", "menu");
       subtitleButton.setAttribute("aria-expanded", "false");
       subtitleMenu = makeElement("div", "emby-subtitle-menu");
@@ -2041,15 +2071,17 @@ export function mount(ctx) {
         option.type = "button";
         option.setAttribute("role", "menuitemradio");
         option.dataset.subtitleIndex = subtitle ? String(subtitle.index) : "off";
+        const check = makeToolbarIcon("check");
+        check.classList.add("emby-subtitle-check");
         option.append(
-          makeElement("span", "", subtitle?.label || "关闭字幕"),
+          check,
+          makeElement("span", "emby-subtitle-label", subtitle?.label || "关闭字幕"),
           makeElement("span", "emby-subtitle-meta", subtitleDescription(subtitle))
         );
         listen(option, "click", (event) => {
           event.preventDefault();
           event.stopPropagation();
-          subtitleMenu.hidden = true;
-          subtitleButton.setAttribute("aria-expanded", "false");
+          closeSubtitleMenu();
           void switchEmbySubtitle(subtitle?.index ?? null);
         });
         return option;
@@ -2058,7 +2090,6 @@ export function mount(ctx) {
       listen(subtitleButton, "click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        closePlaybackEpisodePicker(view);
         subtitleMenu.hidden = !subtitleMenu.hidden;
         subtitleButton.setAttribute("aria-expanded", String(!subtitleMenu.hidden));
         if (!subtitleMenu.hidden) subtitleMenu.querySelector('[aria-checked="true"]')?.focus();
@@ -2077,27 +2108,105 @@ export function mount(ctx) {
           next.focus();
         }
       });
-      chrome.append(subtitleButton);
+      const subtitleAnchor = makeElement("div", "emby-playback-menu-anchor");
+      subtitleAnchor.append(subtitleButton, subtitleMenu);
+      settingsGroup.append(subtitleAnchor);
     }
+    if (settingsGroup.childElementCount) info.append(settingsGroup);
+    info.append(episodePicker);
+    const closeSubtitleMenu = ({ focus = false } = {}) => {
+      if (!subtitleMenu || subtitleMenu.hidden) return false;
+      subtitleMenu.hidden = true;
+      const subtitleButton = info.querySelector(".emby-subtitle-button");
+      subtitleButton?.setAttribute("aria-expanded", "false");
+      if (focus) subtitleButton?.focus();
+      return true;
+    };
     chrome.append(makeFullscreenButton(view, "emby-icon-button emby-playback-fullscreen"));
     const subtitleStatus = makeElement("div", "emby-subtitle-status");
     subtitleStatus.hidden = true;
+    // 播完：有下一集时显示带倒计时圆环的「下一集」卡片，倒计时结束自动续播；
+    // 用户点取消或重播后不再自动跳转。电影只保留重播。
     const ended = makeElement("div", "emby-ended");
     ended.hidden = true;
-    const replay = makeElement("button", "emby-button", "重播");
+    const endedCard = makeElement("div", "emby-ended-card");
+    const endedCopy = makeElement("div", "emby-ended-copy");
+    endedCopy.append(
+      makeElement("span", "emby-ended-label", "即将播放"),
+      makeElement("span", "emby-ended-name", "")
+    );
+    const endedNext = makeElement("button", "emby-ended-next");
+    endedNext.type = "button";
+    endedNext.hidden = true;
+    endedNext.setAttribute("aria-label", "立即播放下一集");
+    const ring = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    ring.setAttribute("viewBox", "0 0 36 36");
+    ring.setAttribute("aria-hidden", "true");
+    ring.classList.add("emby-ended-ring");
+    for (const className of ["emby-ended-ring-track", "emby-ended-ring-value"]) {
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("cx", "18");
+      circle.setAttribute("cy", "18");
+      circle.setAttribute("r", "16");
+      circle.setAttribute("pathLength", "100");
+      circle.classList.add(className);
+      ring.append(circle);
+    }
+    const nextIcon = makeToolbarIcon("next");
+    nextIcon.classList.add("emby-ended-next-icon");
+    endedNext.append(ring, nextIcon);
+    const endedActions = makeElement("div", "emby-ended-actions");
+    const cancelAutoNext = makeElement("button", "emby-ended-action emby-ended-cancel", "取消");
+    cancelAutoNext.type = "button";
+    const replay = makeElement("button", "emby-ended-action", "重播");
     replay.type = "button";
+    replay.prepend(makeToolbarIcon("replay"));
+    endedActions.append(cancelAutoNext, replay);
+    endedCard.append(endedNext, endedCopy, endedActions);
+    ended.append(endedCard);
+    let autoNextTimer = null;
+    const stopAutoNext = () => {
+      clearTimeout(autoNextTimer);
+      autoNextTimer = null;
+      delete ended.dataset.countdown;
+      cancelAutoNext.hidden = true;
+    };
+    const showEnded = () => {
+      stopAutoNext();
+      const playback = embyState.playback;
+      const nextEpisode = playback?.item && episodeContextMatches(playback.item)
+        ? adjacentEpisodeInSeason(playback.itemId, 1)
+        : null;
+      const canAdvance = !endedNext.hidden && !endedNext.disabled;
+      ended.dataset.hasNext = String(canAdvance);
+      endedCopy.querySelector(".emby-ended-name").textContent = nextEpisode
+        ? [playbackEpisodeLabel(nextEpisode), /^第\s*\d+\s*集$/.test(nextEpisode.name || "") ? "" : nextEpisode.name].filter(Boolean).join(" · ")
+        : adjacentSeason(1) && playback?.item && episodeContextMatches(playback.item) ? "下一季第一集" : "下一集";
+      ended.hidden = false;
+      if (!canAdvance) return;
+      cancelAutoNext.hidden = false;
+      // 圆环动画与 CSS 同步：data-countdown 触发 8s 的 stroke-dashoffset 过渡。
+      ended.dataset.countdown = "running";
+      autoNextTimer = setTimeout(() => {
+        autoNextTimer = null;
+        if (embyState.playback === playback && !ended.hidden) void playAdjacentEpisode(1);
+      }, AUTO_NEXT_SECONDS * 1000);
+    };
+    const hideEnded = () => {
+      stopAutoNext();
+      ended.hidden = true;
+    };
+    listen(cancelAutoNext, "click", stopAutoNext);
+    listen(endedNext, "click", () => {
+      stopAutoNext();
+      void playAdjacentEpisode(1);
+    });
     listen(replay, "click", () => {
       if (!embyVideo) return;
-      ended.hidden = true;
+      hideEnded();
       embyVideo.currentTime = 0;
       embyVideo.play().catch(() => {});
     });
-    ended.append(replay);
-    const endedNext = makeElement("button", "emby-button emby-ended-next", "下一集");
-    endedNext.type = "button";
-    endedNext.hidden = true;
-    listen(endedNext, "click", () => void playAdjacentEpisode(1));
-    ended.append(endedNext);
     const wirePlaybackVideo = () => {
       if (!embyVideo) return;
       // 暂停状态同步到 view.dataset.paused：CSS 据此常显 chrome（初始 paused 时
@@ -2131,8 +2240,22 @@ export function mount(ctx) {
         clearInterval(progressTimer);
         progressTimer = null;
         reportProgress("ended");
-        ended.hidden = false;
+        showEnded();
       });
+      // 播完界面里直接拖进度条重新播放时，收起播完卡片并取消自动下一集。
+      listen(embyVideo, "play", () => {
+        if (!ended.hidden) hideEnded();
+      });
+      // 舞台按片源真实比例显示：竖屏/超宽片源也不留上下黑边（受 max-height 约束时
+      // 才由 object-fit 留边）。
+      const syncAspect = () => {
+        const width = Number(embyVideo.videoWidth);
+        const height = Number(embyVideo.videoHeight);
+        if (width > 0 && height > 0) stage.style.setProperty("--emby-aspect", `${width} / ${height}`);
+      };
+      listen(embyVideo, "loadedmetadata", syncAspect);
+      listen(embyVideo, "resize", syncAspect);
+      syncAspect();
     };
     wirePlaybackVideo();
     listen(view, "keydown", (event) => {
@@ -2158,33 +2281,19 @@ export function mount(ctx) {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        if (subtitleMenu && !subtitleMenu.hidden) {
-          subtitleMenu.hidden = true;
-          const subtitleButton = chrome.querySelector(".emby-subtitle-button");
-          subtitleButton?.setAttribute("aria-expanded", "false");
-          subtitleButton?.focus();
-        } else if (!episodePicker.hidden) {
-          closePlaybackEpisodePicker(view);
-          episodePickerButton.focus();
-        } else {
-          stopPlayback(true);
+        if (closeSubtitleMenu({ focus: true })) return;
+        if (autoNextTimer) {
+          stopAutoNext();
+          return;
         }
+        stopPlayback(true);
       }
     });
     listen(view, "click", (event) => {
-      if (subtitleMenu && !subtitleMenu.hidden) {
-        if (!subtitleMenu.contains(event.target) && !chrome.querySelector(".emby-subtitle-button")?.contains(event.target)) {
-          subtitleMenu.hidden = true;
-          chrome.querySelector(".emby-subtitle-button")?.setAttribute("aria-expanded", "false");
-        }
-      }
-      if (!episodePicker.hidden && !episodePicker.contains(event.target) && !episodePickerButton.contains(event.target)) {
-        closePlaybackEpisodePicker(view);
-      }
+      if (subtitleMenu && !subtitleMenu.hidden && !subtitleMenu.parentNode.contains(event.target)) closeSubtitleMenu();
     });
-    view.append(mediaElement, chrome, episodeNav);
-    if (subtitleMenu) view.append(subtitleMenu);
-    view.append(episodePicker, subtitleStatus, ended);
+    stage.append(embyVideo, chrome, subtitleStatus, ended);
+    view.append(stage, info);
     setTimeout(() => {
       if (!view.isConnected) return;
       view.focus({ preventScroll: true });
@@ -2193,9 +2302,21 @@ export function mount(ctx) {
       if (!embyState.playback?.preview) {
         const playback = embyState.playback;
         const start = async () => {
-          if (directProxyUrl && mediaElement instanceof HTMLIFrameElement) {
-            embyVideo = await configureLoopbackVideoFrame(mediaElement, playback, directProxyUrl);
-            wirePlaybackVideo();
+          let nativeReady = false;
+          if (directMediaUrl && !playback.nativeFallback) {
+            try {
+              await configureNativeVideo(embyVideo, playback, directMediaUrl);
+              nativeReady = true;
+            } catch (errorValue) {
+              if (toRpcError(errorValue).code === "ABORTED") throw errorValue;
+              // 原生解码不了（容器/编码不支持）或拦截通道失效：同一会话改走 MSE。
+              playback.nativeFallback = true;
+              embyVideo.removeAttribute("src");
+              embyVideo.load();
+            }
+          }
+          if (nativeReady) {
+            if (embyState.playback !== playback || embyState.view !== "playback") return;
             activatePlaybackState(embyVideo, playback);
           } else if (["direct-mp4", "ffmpeg-fmp4"].includes(playback.streamMode)) {
             await configureDirectMp4(embyVideo, playback);
@@ -2621,7 +2742,12 @@ export function mount(ctx) {
   return {
     api,
     updateSettings() {},
-    visibilityChanged(state) { if (state?.visible && !isDisposed()) refreshEmbyImages(); },
+    visibilityChanged(state) {
+      if (isDisposed()) return;
+      cardVisible = state?.visible === true;
+      if (state?.visible) refreshEmbyImages();
+      else if (ctx.environment?.kind === "plugin") currentEmbyVideo()?.pause();
+    },
     dispose: scope.dispose,
   };
 }

@@ -1,3 +1,5 @@
+import { createSettingsPanel } from "./settings-panel.mjs";
+
 // 外框属于平台；业务只能在内层 ShadowRoot 内渲染。
 export function createCardShell({ document: doc = document, hostId = "codex-companion-root" } = {}) {
   const host = doc.createElement("div");
@@ -10,20 +12,57 @@ export function createCardShell({ document: doc = document, hostId = "codex-comp
     :host { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     .stack { display:flex;flex-direction:column;gap:24px;min-width:0;reading-flow:flex-visual; }
     .slot { display:block;flex:none;min-width:0;width:100%;box-sizing:border-box;
-      border:1px solid var(--cc-card-border,rgba(128,128,128,.22));border-radius:24px;
+      border:0;border-radius:var(--hg-panel-radius,20px);
       background:var(--cc-card-bg,Canvas);color:var(--cc-card-fg,CanvasText);
-      box-shadow:0 3px 18px rgba(0,0,0,.06);overflow:clip;contain:layout style; }
+      box-shadow:var(--hg-panel-shadow,var(--elevation-prominent,0 0 0 .5px rgba(26,28,31,.117),0 3px 7.5px #0000000a,0 0 20px #0000000d));
+      overflow:clip;contain:layout style; }
     .slot[hidden] { display:none; }
     .content { display:block;min-width:0; }
     .error { padding:28px 18px;min-height:160px;box-sizing:border-box; }
     .error[hidden],.content[hidden] { display:none; }
     .error p { font-size:13px;line-height:1.6;overflow-wrap:anywhere; }
     .error button { font:inherit;cursor:pointer;padding:8px 14px;border:0;border-radius:10px; }
+    .platform-bar { display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:8px;
+      min-width:0;color:var(--cc-card-fg,CanvasText); }
+    .platform-bar[hidden], .platform-bar [hidden] { display:none; }
+    .platform-bar p { margin:0 auto 0 0;font-size:12px;opacity:.7; }
+    .settings-entry { display:flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;
+      border:0;border-radius:12.5px;cursor:pointer;background:transparent;
+      color:var(--color-token-text-tertiary,color-mix(in srgb,currentColor 50%,transparent));transition:background-color .15s,color .15s; }
+    .settings-entry:hover, .settings-entry[aria-expanded="true"] {
+      background:var(--color-token-list-hover-background,color-mix(in srgb,currentColor 7%,transparent));
+      color:var(--color-token-text-primary,currentColor); }
+    .settings-entry:focus-visible { outline:2px solid var(--color-token-focus-border,#3a83f7);outline-offset:2px; }
+    .settings-entry svg { width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.1;stroke-linecap:round; }
   `;
+  const platformBar = doc.createElement("div");
+  platformBar.className = "platform-bar";
+  platformBar.hidden = true;
+  const empty = doc.createElement("p");
+  empty.hidden = true;
+  const settingsButton = doc.createElement("button");
+  settingsButton.className = "settings-entry";
+  settingsButton.type = "button";
+  settingsButton.setAttribute("aria-label", "Companion 设置");
+  settingsButton.setAttribute("aria-expanded", "false");
+  settingsButton.setAttribute("aria-controls", "companion-settings");
+  settingsButton.title = "Companion 设置";
+  settingsButton.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 5h5.25m3.5 0h2.25M2.5 11h2.25m3.5 0h5.25"/><circle cx="9.5" cy="5" r="1.75"/><circle cx="6.5" cy="11" r="1.75"/></svg>';
+  platformBar.append(empty, settingsButton);
   const stack = doc.createElement("div");
   stack.className = "stack";
-  root.append(style, stack);
+  root.append(style, platformBar, stack);
   const slots = new Map();
+  let settings;
+  const toggleSettings = () => {
+    if (!settings) return;
+    if (!settings.element.hidden) settings.close();
+    else {
+      settingsButton.setAttribute("aria-expanded", "true");
+      void settings.open();
+    }
+  };
+  settingsButton.addEventListener("click", toggleSettings);
 
   function add(manifest, retry) {
     const outer = doc.createElement("section");
@@ -83,8 +122,28 @@ export function createCardShell({ document: doc = document, hostId = "codex-comp
 
   return {
     host, root, add, reorder,
+    configureSettings({ call }) {
+      if (settings) return;
+      settings = createSettingsPanel({ document: doc, call, onClose() {
+        settingsButton.setAttribute("aria-expanded", "false");
+        settingsButton.focus({ preventScroll: true });
+      } });
+      settings.element.id = "companion-settings";
+      root.insertBefore(settings.element, stack);
+      platformBar.hidden = false;
+    },
+    setEmptyState({ enabled, count }) {
+      empty.hidden = count > 0;
+      empty.textContent = enabled ? "暂无启用的卡片" : "卡片已关闭";
+    },
+    isSettingsOpen: () => Boolean(settings && !settings.element.hidden),
     get: (id) => slots.get(id),
     diagnostics: () => ({ count: slots.size, ids: [...slots.keys()] }),
-    dispose() { for (const slot of [...slots.values()]) slot.remove(); host.remove(); }
+    dispose() {
+      settingsButton.removeEventListener("click", toggleSettings);
+      settings?.destroy();
+      for (const slot of [...slots.values()]) slot.remove();
+      host.remove();
+    }
   };
 }
