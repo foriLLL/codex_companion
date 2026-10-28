@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, stat, rm, readdir, rename } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, stat, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -9,6 +9,7 @@ import { CompanionConfig, normalizeCompanionConfigV2, toLegacyCompanionConfig } 
 import { CARD_MANIFESTS } from "../src/card-registry.mjs";
 import { watchCompanionConfig } from "../src/platform/config/watcher.mjs";
 import { assertMode } from "./helpers/permissions.mjs";
+import { replaceFile } from "../src/platform/replace-file.mjs";
 
 const createConfig = options => new CompanionConfig({ execFileImpl: async () => ({ stdout: "" }), ...options });
 
@@ -137,7 +138,7 @@ test("实际目录 watcher 覆盖四卡与第五卡的 enabled/settings、顺序
   assert.equal(seen.length, count);
   const restored = { ...next, enabled: true, revision: next.revision + 1 };
   await writeFile(`${path}.replacement`, JSON.stringify(restored));
-  await rename(`${path}.replacement`, path);
+  await replaceFile(`${path}.replacement`, path);
   await eventually(() => latest.revision === restored.revision);
   assert.equal(latest.enabled, true);
   await watcher.close();
