@@ -3,10 +3,25 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import { CdpConnection } from "../src/cdp-connection.mjs";
 import { reserveLoopbackPort } from "../src/launcher.mjs";
 import { listCdpTargets } from "../src/targets.mjs";
 import { createCodexAdapter } from "../src/renderer/adapters/codex.mjs";
+
+// 原生 thread-summary-panel-layout chunk 的同构替身：函数体照抄原生，导出名故意打乱，
+// 验证适配器按行为而非导出名识别。
+const nativeLayoutSource = `function a(e,t=300){let n=(e-736)/2,r=t-300;return n<180+r/2?"overlay":n<400+r?"shift":"gutter"}
+function b({displayMode:e,isPinned:t,isPopoverOpen:n}){let r=t&&e!=="overlay",i=null;return r?i="inline":e==="overlay"&&n&&(i="popover"),{displayMode:e,shouldHideInlineImmediately:e==="overlay"&&n,shouldShow:r,visibleSurface:i}}
+function c({displayMode:e,isPinned:t,panelWidth:n=300}){return t&&e==="shift"?-(308+n-300)/2:0}
+function d(){}
+export { d as q, c as w, a as k, b as z };`;
+const layoutServer = http.createServer((request, response) => {
+  if (!request.url?.startsWith("/assets/thread-summary-panel-layout-")) { response.writeHead(404).end(); return; }
+  response.writeHead(200, { "content-type": "text/javascript", "access-control-allow-origin": "*" }).end(nativeLayoutSource);
+});
+await new Promise((resolve) => layoutServer.listen(0, "127.0.0.1", resolve));
+const layoutUrl = `http://127.0.0.1:${layoutServer.address().port}/assets/thread-summary-panel-layout-0a1b2c3d.js`;
 
 // 只启动独立临时 Chrome profile；不访问用户 Codex 的 CDP 端口或配置。
 const port = await reserveLoopbackPort();
@@ -78,8 +93,8 @@ try {
   await evaluate(`adapter.setOpen(true)`);
   await waitFor(`adapter.isOpen()`, "独立面板未打开");
   await waitFor(`video.currentTime > .1`, "测试媒体未播放");
-  assert.equal(await evaluate(`getComputedStyle(document.getElementById('frame')).transform`), "none", "独立模式撤销原生平移");
-  assert.ok(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width < innerWidth - 300`), "对话为卡片让位");
+  assert.equal(await evaluate(`getComputedStyle(document.getElementById('frame')).transform`), "matrix(1, 0, 0, 1, -80, 0)", "不改写原生自己的平移");
+  assert.equal(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width === innerWidth && adapter.getDiagnostics().drawerSurface`), "floating", "无原生布局模块时浮在会话上方，不收窄");
   const beforeHide = await evaluate(`video.currentTime`);
   await evaluate(`adapter.setOpen(false)`);
   await waitFor(`!adapter.isOpen() && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').hidden`, "关闭动画未结束");
@@ -223,36 +238,78 @@ try {
   assert.equal(await evaluate(`!!document.getElementById('codex-companion-root-toolbar')`), false, "dispose 移除顶栏入口");
   assert.deepEqual(await evaluate(`errors`), []);
 
-  // 内容列居中且留白足够：与原生 Summary 一样平移而非收窄，宽度不变、开合有逐帧动画、中途反向不跳变。
+  // 原生 Summary 布局：判定来自原生 layout chunk（这里用导出名打乱的同构替身），
+  // 平移只写原生的 --thread-content-x，由原生 _shiftWithTranscript_* 样式完成。
+  // gutter 留白=(宽度-736)/2：<180 overlay，<400 shift（平移 154px），其余 gutter。
   await connection.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "no-preference" }] });
   await evaluate(`(() => {
-    document.body.innerHTML='<header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="margin-left:auto;display:flex;gap:6px"><div><button aria-label="New tab" style="width:28px;height:28px">+</button></div></div></header>'
-      + '<div class="thread-scroll-container" style="position:absolute;inset:48px 0 0;height:700px;overflow:auto"><div id="shift-frame" style="--thread-wide-block-inline-shift: 0px; transform: none;"><div id="shift-column" data-thread-user-message-navigation-content style="max-width:600px;margin:0 auto">Conversation</div></div>'
-      + '<div id="shift-footer" data-thread-scroll-footer style="position:absolute;left:0;right:0;bottom:0">Input</div></div>';
+    document.body.innerHTML='<style>._shiftWithTranscript_t_2{translate:var(--thread-content-x,none);--thread-wide-block-inline-shift:max(var(--thread-content-x,0px), calc(-1 * var(--thread-content-x,0px)))}</style>'
+      + '<link rel="modulepreload" href="${layoutUrl}">'
+      + '<header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="margin-left:auto;display:flex;gap:6px"><div><button aria-label="New tab" style="width:28px;height:28px">+</button></div></div></header>'
+      + '<div id="layout-root" data-request-input-activity-root style="position:absolute;top:48px;left:0;width:1280px;height:700px;--thread-content-x: initial;">'
+      + '<div class="thread-scroll-container" style="height:100%;overflow:auto"><div id="shift-column" class="_shiftWithTranscript_t_2"><div data-thread-user-message-navigation-content style="max-width:736px;margin:0 auto">Conversation</div></div></div>'
+      + '<div id="shift-footer" class="_shiftWithTranscript_t_2" style="position:absolute;left:0;right:0;bottom:0">Input</div></div>';
     globalThis.shiftAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
-    globalThis.shiftOf=(id)=>{const m=getComputedStyle(document.getElementById(id)).transform;return m==='none'?0:-new DOMMatrix(m).m41;};
-    globalThis.sampleShift=(ms)=>new Promise(resolve=>{const out=[],start=performance.now();const tick=()=>{out.push(Math.round(shiftOf('shift-frame')*10)/10);if(performance.now()-start<ms)requestAnimationFrame(tick);else resolve(out);};requestAnimationFrame(tick);});
+    globalThis.shiftOf=(id)=>{const t=getComputedStyle(document.getElementById(id)).translate;return t==='none'?0:-parseFloat(t);};
+    globalThis.drawerOf=()=>document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer');
+    globalThis.setRootWidth=(width)=>new Promise(resolve=>{document.getElementById('layout-root').style.width=width+'px';requestAnimationFrame(()=>requestAnimationFrame(resolve));});
+    globalThis.sampleShift=(ms)=>new Promise(resolve=>{const out=[],start=performance.now();const tick=()=>{out.push(Math.round(shiftOf('shift-column')*10)/10);if(performance.now()-start<ms)requestAnimationFrame(tick);else resolve(out);};requestAnimationFrame(tick);});
   })()`);
-  const shiftWidths = await evaluate(`({scroller:document.querySelector('.thread-scroll-container').getBoundingClientRect().width,column:document.getElementById('shift-column').getBoundingClientRect().width})`);
+  await waitFor(`shiftAdapter.getDiagnostics().nativeLayout && shiftAdapter.getDiagnostics().displayMode === 'shift'`, "加载原生布局模块并判定 shift 档");
+  const expectedShift = 154;
   const opening = await evaluate(`(async()=>{shiftAdapter.setOpen(true);return sampleShift(500);})()`);
-  const expectedShift = Math.round(Math.min(348, shiftWidths.scroller * 0.45) / 2);
-  assert.equal(opening.at(-1), expectedShift, "平移量为抽屉宽度一半");
+  assert.equal(opening.at(-1), expectedShift, "平移量取自原生模块");
   assert.ok(opening.filter((value) => value > 0 && value < expectedShift).length >= 5, `打开需逐帧平移：${opening.join(",")}`);
   assert.ok(opening.every((value, index) => index === 0 || value >= opening[index - 1] - 0.5), "打开平移单调");
-  assert.deepEqual(await evaluate(`({scroller:document.querySelector('.thread-scroll-container').getBoundingClientRect().width,column:document.getElementById('shift-column').getBoundingClientRect().width,
-    footer:Math.round(shiftOf('shift-footer')),wide:getComputedStyle(document.getElementById('shift-frame')).getPropertyValue('--thread-wide-block-inline-shift').trim()})`),
-    { ...shiftWidths, footer: expectedShift, wide: `${expectedShift}px` }, "平移不改宽度，输入框与宽块同步");
+  assert.deepEqual(await evaluate(`({footer:Math.round(shiftOf('shift-footer')),surface:shiftAdapter.getDiagnostics().drawerSurface,width:Math.round(drawerOf().getBoundingClientRect().width)})`),
+    { footer: expectedShift, surface: "inline", width: 324 }, "输入框同步平移，抽屉与原生面板同宽");
   const reversed = await evaluate(`(async()=>{shiftAdapter.setOpen(false);const head=await sampleShift(90);shiftAdapter.setOpen(true);const tail=await sampleShift(500);return {head,tail};})()`);
   const jump = Math.abs(reversed.tail[0] - reversed.head.at(-1));
   assert.ok(reversed.head.at(-1) < expectedShift && reversed.head.at(-1) > 0, `关闭中途：${reversed.head.join(",")}`);
   assert.ok(jump < 40, `中途反向必须从当前帧继续，跳变 ${jump}px`);
   assert.equal(reversed.tail.at(-1), expectedShift);
-  const closing = await evaluate(`(async()=>{shiftAdapter.setOpen(false);return sampleShift(500);})()`);
-  assert.ok(closing.filter((value) => value > 0 && value < expectedShift).length >= 5, `关闭需逐帧回位：${closing.join(",")}`);
-  await waitFor(`!document.querySelector('[data-companion-dock]') && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').hidden`, "关闭后撤销平移标记");
-  assert.equal(await evaluate(`document.getElementById('shift-frame').getAttribute('style')`), "--thread-wide-block-inline-shift: 0px; transform: none;", "原生 inline style 原样保留");
-  assert.equal(await evaluate(`shiftOf('shift-frame')`), 0);
+
+  // 常驻打开时拖窄到 overlay 档：与原生一样直接消失、会话回位；拖回宽档后重新出现。
+  await evaluate(`setRootWidth(1000)`);
+  await waitFor(`shiftAdapter.getDiagnostics().displayMode === 'overlay' && drawerOf().dataset.state === 'closed'`, "overlay 档常驻抽屉应消失");
+  assert.deepEqual(await evaluate(`({shift:shiftOf('shift-column'),open:shiftAdapter.isOpen()})`), { shift: 0, open: false }, "overlay 档不平移");
+  await evaluate(`setRootWidth(1280)`);
+  await waitFor(`shiftAdapter.isOpen() && drawerOf().dataset.state === 'open' && shiftOf('shift-column') === ${expectedShift}`, "回到 shift 档常驻抽屉重新出现");
+
+  // overlay 档点入口：浮在会话上方不平移；拖回宽档时浮层收起，常驻开关不受影响。
+  await evaluate(`shiftAdapter.setOpen(false)`);
+  await waitFor(`drawerOf().dataset.state === 'closed' && !document.querySelector('[data-companion-dock]')`, "关闭后撤销平移标记");
+  assert.equal(await evaluate(`document.getElementById('layout-root').getAttribute('style').includes('--thread-content-x: initial')`), true, "原生 inline style 原样保留");
+  await evaluate(`setRootWidth(1000)`);
+  await waitFor(`shiftAdapter.getDiagnostics().displayMode === 'overlay'`, "切到 overlay 档");
+  await evaluate(`document.getElementById('codex-companion-root-toolbar').shadowRoot.querySelector('button').click()`);
+  await waitFor(`shiftAdapter.isOpen() && drawerOf().dataset.state === 'open'`, "overlay 档点入口浮出抽屉");
+  assert.deepEqual(await evaluate(`({surface:shiftAdapter.getDiagnostics().drawerSurface,shift:shiftOf('shift-column'),marks:document.querySelectorAll('[data-companion-dock]').length})`),
+    { surface: "popover", shift: 0, marks: 0 }, "浮层不推会话");
+  await evaluate(`setRootWidth(1280)`);
+  await waitFor(`shiftAdapter.getDiagnostics().displayMode === 'shift' && !shiftAdapter.isOpen()`, "离开 overlay 档浮层收起");
+
+  // gutter 档（留白足够）：常驻打开但不平移。
+  await evaluate(`setRootWidth(1600)`);
+  await evaluate(`shiftAdapter.setOpen(true)`);
+  await waitFor(`shiftAdapter.getDiagnostics().displayMode === 'gutter' && shiftAdapter.isOpen()`, "gutter 档打开");
+  assert.deepEqual(await evaluate(`({surface:shiftAdapter.getDiagnostics().drawerSurface,shift:shiftOf('shift-column')})`), { surface: "inline", shift: 0 }, "gutter 档不平移");
   await evaluate(`shiftAdapter.dispose()`);
+  assert.equal(await evaluate(`!!document.querySelector('[data-companion-dock]') || !!document.getElementById('codex-companion-root-dock-style')`), false, "dispose 撤销平移");
+  assert.deepEqual(await evaluate(`errors`), []);
+
+  // 没有原生布局模块：不自行判定、不平移，抽屉浮在会话上方。
+  await evaluate(`(() => {
+    document.querySelector('link[rel=modulepreload]').remove();
+    performance.clearResourceTimings();
+    document.getElementById('layout-root').style.width='1280px';
+    globalThis.bareAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+  })()`);
+  await evaluate(`bareAdapter.setOpen(true)`);
+  await waitFor(`bareAdapter.isOpen() && drawerOf().dataset.state === 'open'`, "无原生模块时仍可打开");
+  assert.deepEqual(await evaluate(`({native:bareAdapter.getDiagnostics().nativeLayout,surface:bareAdapter.getDiagnostics().drawerSurface,shift:shiftOf('shift-column')})`),
+    { native: false, surface: "floating", shift: 0 }, "无原生模块时只浮层");
+  await evaluate(`bareAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
   // 侧聊关闭确认等 Codex 模态弹窗：遮罩（z-50）与确认框必须盖过已打开的抽屉，关闭后抽屉恢复置顶。
@@ -284,6 +341,7 @@ try {
   console.log("Codex adapter smoke passed:", JSON.stringify(evidence));
 } finally {
   connection?.close();
+  layoutServer.close();
   chrome.kill("SIGTERM");
   await new Promise((resolve) => { chrome.once("exit", resolve);setTimeout(resolve, 2000).unref(); });
   await rm(profile, { recursive: true, force: true });
