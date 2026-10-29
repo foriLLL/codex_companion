@@ -386,7 +386,7 @@ test("legacy getter/setter 兼容，配置与 getter 不共享可变 settings", 
   const settings = { nested: { value: 1 } };
   const injector = new CodexInjector(9222, { cards: { emby: false }, cardOrder: ["emby"] });
   assert.equal(injector.cards.emby, false);
-  assert.deepEqual(injector.cardOrder, ["proxy", "games", "hongguo", "emby"]);
+  assert.deepEqual(injector.cardOrder, ["proxy", "tasks", "games", "hongguo", "emby"]);
   injector.setConfig({ cards: { emby: { settings } } });
   settings.nested.value = 99;
   assert.equal(injector.cards.emby, false);

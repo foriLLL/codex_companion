@@ -157,7 +157,7 @@ test("大响应经真实传输分块恢复，页面、卡片和代际均隔离",
 test("配置更新使用白名单和 revision，并继续写入原 config-v2 文件0600", async t => {
   const { backend, configStore } = await fixture(t);
   const initial = await backend.config({ operation: "get" });
-  assert.deepEqual(initial.manifests.map(card => card.id), ["proxy", "games", "hongguo", "emby"]);
+  assert.deepEqual(initial.manifests.map(card => card.id), ["proxy", "tasks", "games", "hongguo", "emby"]);
   const revision = initial.config.revision;
   assert.equal((await backend.config({ operation: "get", knownRevision: revision })).unchanged, true);
   const next = await backend.config({ operation: "update", expectedRevision: revision, patch: { cards: { emby: { enabled: false } }, order: ["emby", "games"] } });
@@ -217,7 +217,7 @@ test("真实 MCP initialize/list/read/call 跑通且私有工具全部 app-only"
     availableDisplayModes: ["inline", "fullscreen"], preferredDisplayMode: "fullscreen"
   });
   const config = await client.callTool({ name: "companion.config", arguments: { operation: "get" } });
-  assert.equal(config.structuredContent.manifests.length, 4);
+  assert.equal(config.structuredContent.manifests.length, 5);
   assert.deepEqual(config.content, []);
   const called = await client.callTool({ name: "companion.rpc", arguments: rpc(randomUUID()) });
   assert.equal(called.structuredContent.ok, true);

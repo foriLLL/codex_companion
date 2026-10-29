@@ -188,16 +188,18 @@ test("requireEntries 要求 renderer.mjs，service.mjs 可选", async () => {
 test("仓库内置卡片可被发现且能力符合冻结枚举", async () => {
   const cardsDir = fileURLToPath(new URL("../src/cards/", import.meta.url));
   const discovered = await discoverCards({ cardsDir });
-  assert.deepEqual(discovered.cards.map((card) => card.manifest.id), ["proxy", "games", "hongguo", "emby"]);
-  assert.deepEqual(discovered.cards.map((card) => card.manifest.defaultOrder), [0, 10, 20, 40]);
+  assert.deepEqual(discovered.cards.map((card) => card.manifest.id), ["proxy", "tasks", "games", "hongguo", "emby"]);
+  assert.deepEqual(discovered.cards.map((card) => card.manifest.defaultOrder), [0, 5, 10, 20, 40]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "proxy").manifest.capabilities, ["rpc"]);
+  assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "tasks").manifest.capabilities, ["rpc", "threads"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "games").manifest.capabilities, ["storage"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "hongguo").manifest.capabilities, ["rpc", "storage"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "emby").manifest.capabilities, ["rpc", "storage"]);
   for (const card of discovered.cards) {
     // 代理轮询在收起时暂停，其余卡片保留媒体或存档。
     assert.equal(card.manifest.lifecycle.hidden, card.manifest.id === "proxy" ? "suspend" : "retain");
-    assert.equal(card.manifest.lifecycle.start, "first-visible");
+    // 任务看板一启动就要给侧栏会话上色，不等面板首次打开。
+    assert.equal(card.manifest.lifecycle.start, card.manifest.id === "tasks" ? "immediate" : "first-visible");
     assert.equal(card.entries.renderer, true);
     assert.equal(card.entries.service, card.manifest.capabilities.includes("rpc"));
   }

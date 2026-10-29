@@ -4,14 +4,22 @@ const SILENT_CODES = new Set(["ABORTED", "RPC_CANCELLED", "RPC_STALE_GENERATION"
 
 export function mount({ root, rpc, effects, signal }) {
   root.innerHTML = `<style>
-    :host{display:block}*{box-sizing:border-box}
-    .row{display:flex;align-items:center;gap:10px;padding:12px 14px 12px 18px;font-size:13px;line-height:1.35}
-    .dot{flex:none;width:8px;height:8px;border-radius:50%;background:rgba(128,128,128,.55)}
-    .dot[data-tone=ok]{background:#2f9e6e}.dot[data-tone=warn]{background:#d9822b}
-    .text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
-    strong{font-weight:600;overflow-wrap:anywhere}.detail{font-size:12px;opacity:.65;overflow-wrap:anywhere}
+    :host{display:block;--text:color-mix(in srgb,currentColor 64%,transparent);--line:color-mix(in srgb,currentColor 10%,transparent);
+      font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif;letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
+    *{box-sizing:border-box}
+    .row{display:flex;align-items:center;gap:11px;padding:12px 12px 12px 14px;font-size:13.5px;line-height:1.4}
+    /* 状态放在小方块里：浅底、细描边，中间一个状态点。 */
+    .dot{--tone:#8b8d98;flex:none;display:grid;place-items:center;width:28px;height:28px;border-radius:8px;
+      background:color-mix(in srgb,var(--tone) 12%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--tone) 26%,transparent),0 1px 2px rgba(0,0,0,.05)}
+    .dot::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--tone)}
+    .dot[data-tone=ok]{--tone:#2f9e6e}.dot[data-tone=warn]{--tone:#d9661b}
+    .dot[data-tone=ok]::after{box-shadow:0 0 0 3px color-mix(in srgb,var(--tone) 22%,transparent)}
+    .text{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+    strong{font-weight:600;overflow-wrap:anywhere}.detail{font-size:12px;color:var(--text);overflow-wrap:anywhere}
     .detail:empty{display:none}
-    button{flex:none;font:inherit;font-size:12px;border:0;border-radius:8px;padding:5px 10px;cursor:pointer;color:inherit;background:rgba(128,128,128,.12)}
+    button{flex:none;font:inherit;font-size:12px;letter-spacing:inherit;border:0;border-radius:8px;padding:4px 10px;cursor:pointer;color:inherit;
+      background:color-mix(in srgb,currentColor 5%,transparent);box-shadow:inset 0 0 0 1px var(--line);transition:background-color .16s ease}
+    button:hover{background:color-mix(in srgb,currentColor 9%,transparent)}
     button:disabled{opacity:.5;cursor:default}
   </style><div class="row"><span class="dot" aria-hidden="true"></span><div class="text" role="status"><strong>正在读取代理状态…</strong><span class="detail"></span></div><button type="button" aria-label="刷新代理状态">刷新</button></div>`;
   const dot = root.querySelector(".dot");

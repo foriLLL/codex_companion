@@ -1,6 +1,6 @@
 import "./schema-policy.mjs";
 import { App } from "@modelcontextprotocol/ext-apps";
-import { CARD_MANIFESTS } from "../card-registry.mjs";
+import { CARD_MANIFESTS as ALL_MANIFESTS } from "../card-registry.mjs";
 import { RENDERER_REGISTRY } from "../cards/renderer-registry.generated.mjs";
 import { createCardRuntime, normalizeRuntimeConfig } from "../renderer/runtime/card-runtime.mjs";
 import { createPluginShell } from "./shell.mjs";
@@ -8,6 +8,8 @@ import { createPluginAdapter } from "./adapter.mjs";
 import { createPluginTransport, createPluginStorage } from "./transport.mjs";
 import { PLUGIN_VERSION } from "./metadata.mjs";
 
+// 插件 iframe 访问不到宿主左侧会话列表，依赖它的卡片（任务看板）只在注入模式提供。
+const CARD_MANIFESTS = ALL_MANIFESTS.filter((card) => !card.capabilities.includes("threads"));
 const app = new App({ name: "Companion", version: PLUGIN_VERSION }, {}, { autoResize: true });
 let runtime;
 let transport;

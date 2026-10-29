@@ -3,7 +3,7 @@
  *
  * 允许字段且仅允许这些字段：
  * id, title, version, defaultEnabled, defaultOrder, layout, lifecycle, state, capabilities。
- * capabilities 只能是不重复的 storage / rpc。
+ * capabilities 只能是不重复的 storage / rpc / threads（threads：读取与标记宿主左侧会话列表，仅注入模式提供）。
  */
 
 export const MANIFEST_FIELDS = Object.freeze([
@@ -29,7 +29,7 @@ export const LIFECYCLE_STARTS = Object.freeze(["immediate", "first-visible"]);
 export const STATE_FIELDS = Object.freeze(["scope", "version"]);
 export const STATE_SCOPES = Object.freeze(["global", "target", "session"]);
 
-export const CAPABILITIES = Object.freeze(["storage", "rpc"]);
+export const CAPABILITIES = Object.freeze(["storage", "rpc", "threads"]);
 
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 

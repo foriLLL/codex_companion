@@ -1,5 +1,5 @@
 {
-  "hash": "8e645683a1d39455cb9c0622be1fb70bd388db9d373376b63561c9f05e5bc2b2",
+  "hash": "c7af35f82ae6ae1e0dbf9d144190a729123d17a6f06019acd1524d97fa49881d",
   "cards": [
     {
       "id": "proxy",
@@ -22,6 +22,34 @@
       },
       "capabilities": [
         "rpc"
+      ],
+      "entries": {
+        "renderer": true,
+        "service": true
+      }
+    },
+    {
+      "id": "tasks",
+      "title": "任务看板",
+      "version": 1,
+      "defaultEnabled": true,
+      "defaultOrder": 5,
+      "layout": {
+        "height": "content",
+        "minHeight": 0,
+        "scroll": "outer"
+      },
+      "lifecycle": {
+        "hidden": "retain",
+        "start": "immediate"
+      },
+      "state": {
+        "scope": "global",
+        "version": 1
+      },
+      "capabilities": [
+        "rpc",
+        "threads"
       ],
       "entries": {
         "renderer": true,

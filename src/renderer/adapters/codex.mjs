@@ -274,33 +274,38 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
 
   const findFloatingSummary = () => {
     const pinnedToggle = findSummaryToggle("pinned");
-    const floatingRoot = Array.from(document.querySelectorAll("div")).find((element) => {
+    const summaryIsOpen = pinnedToggle?.getAttribute("aria-pressed") === "true";
+    // 多标签页时每个标签都有一份浮层根节点，后台标签的排在前面且不可见；
+    // 逐个尝试，取第一个能定位到可见纵列的。
+    const floatingRoots = Array.from(document.querySelectorAll("div")).filter((element) => {
       const className = typeof element.className === "string" ? element.className : "";
       return className.includes("thread-floating-content-top-inset") && className.includes("right-0");
     });
-    if (!floatingRoot) return null;
-    const summaryIsOpen = pinnedToggle?.getAttribute("aria-pressed") === "true";
-    const nativeColumn = Array.from(floatingRoot.querySelectorAll("div")).find((element) => {
-      const className = typeof element.className === "string" ? element.className : "";
-      const style = getComputedStyle(element);
-      const bounds = element.getBoundingClientRect();
-      return className.includes("origin-top-right")
-        && style.display !== "none"
-        && style.visibility !== "hidden"
-        && (summaryIsOpen || Number.parseFloat(style.opacity) > 0)
-        && bounds.width > 0
-        && bounds.height > 0;
-    }) ?? findVariantColumn(floatingRoot, summaryIsOpen);
-    if (!nativeColumn) return null;
-    const nativePanel = findSummarySurface(nativeColumn);
-    return nativePanel ? {
-      mode: "animated-summary",
-      mountParent: nativeColumn,
-      floatingRoot,
-      nativePanel,
-      styleRoot: nativeColumn,
-      trigger: pinnedToggle
-    } : null;
+    for (const floatingRoot of floatingRoots) {
+      const nativeColumn = Array.from(floatingRoot.querySelectorAll("div")).find((element) => {
+        const className = typeof element.className === "string" ? element.className : "";
+        const style = getComputedStyle(element);
+        const bounds = element.getBoundingClientRect();
+        return className.includes("origin-top-right")
+          && style.display !== "none"
+          && style.visibility !== "hidden"
+          && (summaryIsOpen || Number.parseFloat(style.opacity) > 0)
+          && bounds.width > 0
+          && bounds.height > 0;
+      }) ?? findVariantColumn(floatingRoot, summaryIsOpen);
+      const nativePanel = nativeColumn ? findSummarySurface(nativeColumn) : null;
+      if (nativePanel) {
+        return {
+          mode: "animated-summary",
+          mountParent: nativeColumn,
+          floatingRoot,
+          nativePanel,
+          styleRoot: nativeColumn,
+          trigger: pinnedToggle
+        };
+      }
+    }
+    return null;
   };
 
   const setHostVariable = (name, value) => {

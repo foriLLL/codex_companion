@@ -28,7 +28,7 @@ function fixture() {
 }
 
 test("生成服务目录用于真实路由；Emby 仅接受有限全名和旧别名", async () => {
-  assert.deepEqual(Object.keys(SERVICE_REGISTRY), ["proxy", "hongguo", "emby"]);
+  assert.deepEqual(Object.keys(SERVICE_REGISTRY), ["proxy", "tasks", "hongguo", "emby"]);
   const { service, calls } = fixture();
   for (const method of EMBY_OPERATIONS.filter(value => !value.startsWith("playback."))) {
     await service.handleRpc(method, {}, { targetId: "legacy" });

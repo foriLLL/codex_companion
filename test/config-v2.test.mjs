@@ -52,7 +52,7 @@ test("v1 迁移保留原文件与精确备份，v2 0600，旧窗口写入不再�
   assert.equal(config.cards.emby.enabled, false);
   // v1 的未知顶层字段不迁移。
   assert.equal(Object.hasOwn(config, "retiredUrl"), false);
-  assert.deepEqual(config.order, ["proxy", "games", "emby", "hongguo"]);
+  assert.deepEqual(config.order, ["proxy", "tasks", "games", "emby", "hongguo"]);
   assert.equal(await readFile(oldPath, "utf8"), original);
   assert.equal(await readFile(`${oldPath}.v1.bak`, "utf8"), original);
   assertMode(await stat(path), 0o600);

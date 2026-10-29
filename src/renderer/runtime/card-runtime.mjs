@@ -3,6 +3,7 @@ import { createStore, resolveScopeId } from "../platform/storage.mjs";
 import { createRpcClient } from "../platform/rpc-client.mjs";
 import { createCardShell } from "../shell/card-shell.mjs";
 import { createCodexAdapter } from "../adapters/codex.mjs";
+import { createCodexThreads } from "../adapters/codex-threads.mjs";
 
 import { normalizeRuntimeConfig } from "../../platform/config/runtime-config.mjs";
 export { normalizeRuntimeConfig };
@@ -24,7 +25,7 @@ function safeBackend(name, onError) {
 
 export function createCardRuntime({
   manifests, renderers, config: initialConfig = {}, artifactHash,
-  shellFactory = createCardShell, adapterFactory = createCodexAdapter,
+  shellFactory = createCardShell, adapterFactory = createCodexAdapter, threadsFactory = createCodexThreads,
   localStorage: localBackend, sessionStorage: sessionBackend,
   rpcClient = createRpcClient(), onError = () => {}
 }) {
@@ -44,6 +45,8 @@ export function createCardRuntime({
   // 独立插件页面可以逐卡切换；旧注入入口未设置覆盖值时保持原有行为。
   const cardVisibility = new Map();
   let config = normalizeRuntimeConfig(initialConfig, manifests);
+  // 会话列表属于宿主原生界面，只由平台创建；没有声明 threads 能力的卡片拿不到它。
+  let threads = null;
 
   const effectiveVisibility = (id) => ({ ...visibility, visible: visibility.visible && cardVisibility.get(id) !== false });
 
@@ -129,6 +132,7 @@ export function createCardRuntime({
           storage: makeStorage(manifest, signal), rpc, effects,
           reportError: (error) => report(error, { cardId: manifest.id, phase: "card" }),
           isVisible: () => effectiveVisibility(manifest.id).visible,
+          ...(manifest.capabilities.includes("threads") ? { threads } : {}),
           // 只有平台负责可见性；业务可以申请展开，不能操作原生 DOM。
           requestOpen: () => adapter?.setOpen(true)
         };
@@ -172,6 +176,10 @@ export function createCardRuntime({
     return record.lifecycle.visibilityChanged(effective).catch((error) => report(error, { cardId: id }));
   }
 
+  if (threadsFactory && manifests.some((manifest) => manifest.capabilities.includes("threads"))) {
+    try { threads = threadsFactory({ document: shell.host.ownerDocument, onError: (error) => report(error, { phase: "threads" }) }); }
+    catch (error) { report(error, { phase: "threads" }); }
+  }
   const adapter = adapterFactory({
     host: shell.host, placement: config.placement, hasCards: false, hasSettings,
     onVisibilityChange: visibilityChanged,
@@ -234,6 +242,7 @@ export function createCardRuntime({
     platformController.abort();
     const jobs = [...records.values()].map((record) => remove(record, "unmounted"));
     adapter.dispose();
+    threads?.dispose();
     shell.dispose();
     disposal = Promise.allSettled(jobs).then(() => rpcClient.dispose());
     return disposal;

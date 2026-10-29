@@ -3,11 +3,13 @@
 // 无 service.mjs，未注册：games
 
 import * as service0 from "./proxy/service.mjs";
-import * as service1 from "./hongguo/service.mjs";
-import * as service2 from "./emby/service.mjs";
+import * as service1 from "./tasks/service.mjs";
+import * as service2 from "./hongguo/service.mjs";
+import * as service3 from "./emby/service.mjs";
 
 export const SERVICE_REGISTRY = Object.freeze({
   "proxy": service0,
-  "hongguo": service1,
-  "emby": service2,
+  "tasks": service1,
+  "hongguo": service2,
+  "emby": service3,
 });

@@ -1,0 +1,11 @@
+{
+  "id": "tasks",
+  "title": "任务看板",
+  "version": 1,
+  "defaultEnabled": true,
+  "defaultOrder": 5,
+  "layout": { "height": "content", "minHeight": 0, "scroll": "outer" },
+  "lifecycle": { "hidden": "retain", "start": "immediate" },
+  "state": { "scope": "global", "version": 1 },
+  "capabilities": ["rpc", "threads"]
+}

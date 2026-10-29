@@ -2,7 +2,7 @@
 // 静态元数据，供 Node 与 bundle 直接 import；运行时不读文件系统。
 import { validateCatalog } from "./platform/registry/manifest.mjs";
 
-export const CARD_REGISTRY_HASH = "8e645683a1d39455cb9c0622be1fb70bd388db9d373376b63561c9f05e5bc2b2";
+export const CARD_REGISTRY_HASH = "c7af35f82ae6ae1e0dbf9d144190a729123d17a6f06019acd1524d97fa49881d";
 
 export const CARD_MANIFESTS = validateCatalog([
   {
@@ -26,6 +26,30 @@ export const CARD_MANIFESTS = validateCatalog([
     },
     "capabilities": [
       "rpc"
+    ]
+  },
+  {
+    "id": "tasks",
+    "title": "任务看板",
+    "version": 1,
+    "defaultEnabled": true,
+    "defaultOrder": 5,
+    "layout": {
+      "height": "content",
+      "minHeight": 0,
+      "scroll": "outer"
+    },
+    "lifecycle": {
+      "hidden": "retain",
+      "start": "immediate"
+    },
+    "state": {
+      "scope": "global",
+      "version": 1
+    },
+    "capabilities": [
+      "rpc",
+      "threads"
     ]
   },
   {
