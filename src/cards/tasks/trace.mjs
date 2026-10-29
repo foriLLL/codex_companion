@@ -118,6 +118,7 @@ const clockSec = (ms) => new Date(ms).toLocaleTimeString("zh-CN", { hour12: fals
 export function createTraceView({ rpc, effects, signal, threads, element, fail, isVisible }) {
   const root = element("div", "trace");
   let threadId = null;
+  let threadTitle = null;
   let data = null;
   let receivedAt = 0;
   let scale = null;
@@ -245,7 +246,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     if (!active) return;
     live = [];
     if (!threadId) {
-      root.replaceChildren(element("p", "trace-empty", "打开一个会话，这里会显示它的 Trace：思考、回复、工具调用各用了多久、输出了多少 token。"));
+      root.replaceChildren(element("p", "trace-empty", "把鼠标停在看板的任务上，这里会显示它的 Trace：思考、回复、工具调用各用了多久、输出了多少 token。"));
       return;
     }
     if (!data || data.threadId !== threadId) {
@@ -253,7 +254,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
       return;
     }
     const turns = data.turns ?? [];
-    const title = threads?.title(threadId) ?? "当前会话";
+    const title = threadTitle ?? threads?.title(threadId) ?? "会话";
     if (!turns.length) {
       root.replaceChildren(element("p", "trace-empty", `「${title}」最近没有可展示的回合。`));
       return;
@@ -447,9 +448,9 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     if (want) tick();
   }
 
-  // 跟随 Codex 当前打开的会话。
-  function follow() {
-    const id = threads?.current()?.id ?? null;
+  // 切换到看板上指向的会话；同一会话只更新标题，不重连。
+  function show(id, title = null) {
+    threadTitle = title;
     if (id === threadId) return;
     threadId = id;
     stopLoop();
@@ -460,11 +461,12 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
   effects.add(() => { stopLoop(); liveTimer?.(); });
   return {
     root,
+    show,
     setActive(next) {
+      if (active === next) return;
       active = next;
-      if (active) { follow(); draw(); startLoop(); } else { stopLoop(); syncTicker(); }
+      if (active) { draw(); startLoop(); } else { stopLoop(); syncTicker(); }
     },
-    follow() { if (active) follow(); },
     visibilityChanged(visible) {
       if (!active) return;
       if (visible) startLoop(); else stopLoop();

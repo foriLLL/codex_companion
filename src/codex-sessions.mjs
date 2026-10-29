@@ -9,6 +9,8 @@ import { isAbsolute, join } from "node:path";
 export const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{7,127}$/;
 const TAIL_BYTES = [128 * 1024, 2 * 1024 * 1024];
 const INDEX_FILE_LIMIT = 16 * 1024 * 1024;
+const STATE_FILE_LIMIT = 32 * 1024 * 1024;
+const CLIENT_PREFIX = "client-new-thread:";
 // 回合开始后长时间没有任何写入（进程退出、崩溃），不再当作进行中。
 export const STALLED_AFTER_MS = 15 * 60_000;
 const MISS_CACHE_MS = 60_000;
@@ -106,14 +108,24 @@ export function describeTool(name, input) {
  * 回合以问句结束，或回合中有尚未得到回答的 request_user_input 调用时，状态为 asking。
  * activity：进行中时最近的动作；summary：回合结束时的回复摘要（提问时是问题本身）。
  */
-export function lastLifecycle(text) {
+// inTurn：调用方确认这段文字只是文件尾部窗口。窗口里有回合内条目却没有任何回合事件，
+// 说明回合开始在窗口之前且尚未结束（长回合的 task_started 可能在几 MB 之前）。
+export function lastLifecycle(text, { inTurn = false } = {}) {
   let last = null;
+  let sawItem = false;
   let activity = null;
   // 本回合 Codex 最近一次的进度说明；思考间隙显示它，比「思考中」更能看出做到哪了。
   let note = null;
   const pending = new Set();
+  // 异步提问（request_user_input_async）的工具输出立即返回 accepted，
+  // 要等用户回答（send_user_message_question_reply 消息里带着 call_id）才算答完。
+  const asking = new Set();
   for (const line of text.split("\n")) {
     if (line.includes("\"response_item\"")) {
+      sawItem = true;
+      if (asking.size && line.includes("send_user_message_question_reply")) {
+        for (const callId of asking) if (line.includes(callId)) asking.delete(callId);
+      }
       // 工具输出可能很大，只抠 call_id，不整行解析。
       if (line.includes("_call_output\"")) {
         const callId = line.match(/"call_id":"([^"]+)"/)?.[1];
@@ -129,7 +141,8 @@ export function lastLifecycle(text) {
         note = firstLine((payload.content ?? []).map((part) => part?.text ?? "").join("\n")) ?? note;
         activity = note ?? activity;
       } else if (payload.type === "function_call" || payload.type === "custom_tool_call") {
-        if (/request_user_input/.test(payload.name ?? "")) pending.add(payload.call_id);
+        if (/request_user_input_async/.test(payload.name ?? "")) asking.add(payload.call_id);
+        else if (/request_user_input/.test(payload.name ?? "")) pending.add(payload.call_id);
         activity = describeTool(payload.name, payload.arguments ?? payload.input);
       }
       continue;
@@ -140,14 +153,16 @@ export function lastLifecycle(text) {
     const payload = record?.payload;
     let status = record?.type === "event_msg" ? LIFECYCLE[payload?.type] : undefined;
     if (!status) continue;
-    if (status === "running") { pending.clear(); activity = "思考中"; note = null; }
+    if (status === "running") { pending.clear(); asking.clear(); activity = "思考中"; note = null; }
     if (status === "idle" && endsWithQuestion(payload.last_agent_message)) status = "asking";
     const at = Date.parse(record.timestamp);
     last = { status, at: Number.isFinite(at) ? at : null, summary: replySummary(payload.last_agent_message, status === "asking") };
   }
+  if (!last && inTurn && sawItem) last = { status: "running", at: null, summary: null };
   if (last?.status === "running") {
-    if (pending.size) last.status = "asking";
-    last.activity = pending.size ? "在等你回答" : activity === "思考中" && note ? note : activity;
+    const waiting = pending.size + asking.size > 0;
+    if (waiting) last.status = "asking";
+    last.activity = waiting ? "在等你回答" : activity === "思考中" && note ? note : activity;
   }
   return last;
 }
@@ -292,9 +307,48 @@ export class CodexSessions {
     this.paths = new Map();
     this.misses = new Map();
     this.index = { mtimeMs: -1, size: -1, titles: new Map() };
+    this.state = { mtimeMs: -1, size: -1, real: new Map(), client: new Map() };
   }
 
-  async locate(id) {
+  /**
+   * 新建会话在本次运行中，侧栏条目一直用客户端临时 id（local:client-new-thread:<uuid>），
+   * 真实会话 id 在发出第一条消息后才分配；两者的绑定由 Codex 存在 .codex-global-state.json。
+   * 返回 { real: 客户端 id → 真实 id, client: 真实 id → 客户端 id }，按文件变化缓存。
+   */
+  async bindings() {
+    const path = join(this.codexHome, ".codex-global-state.json");
+    let info;
+    try { info = await stat(path); } catch { return this.state; }
+    if (info.mtimeMs === this.state.mtimeMs && info.size === this.state.size) return this.state;
+    if (info.size > STATE_FILE_LIMIT) return this.state;
+    const real = new Map();
+    const client = new Map();
+    try {
+      const bound = JSON.parse(await readFile(path, "utf8"))?.["electron-persisted-atom-state"]?.["client-thread-bindings-v1"];
+      for (const [key, value] of Object.entries(bound ?? {})) {
+        const clientId = key.startsWith(CLIENT_PREFIX) ? key.slice(CLIENT_PREFIX.length) : null;
+        if (!THREAD_ID_PATTERN.test(clientId ?? "") || typeof value !== "string" || !THREAD_ID_PATTERN.test(value)) continue;
+        real.set(clientId, value);
+        client.set(value, clientId);
+      }
+    } catch { return this.state; }
+    this.state = { mtimeMs: info.mtimeMs, size: info.size, real, client };
+    return this.state;
+  }
+
+  /** 客户端临时 id 换成真实会话 id；没有绑定时原样返回。 */
+  async canonicalId(id) {
+    return (await this.bindings()).real.get(id) ?? id;
+  }
+
+  /** 同一会话的另一个 id（真实 id ↔ 客户端临时 id），侧栏可能用任一个。 */
+  async aliases(id) {
+    const { real, client } = await this.bindings();
+    return [real.get(id), client.get(id)].filter(Boolean);
+  }
+
+  async locate(rawId) {
+    const id = await this.canonicalId(rawId);
     const cached = this.paths.get(id);
     if (cached) {
       try { await stat(cached); return cached; } catch { this.paths.delete(id); }
@@ -316,7 +370,8 @@ export class CodexSessions {
     return found;
   }
 
-  async isArchived(id) {
+  async isArchived(rawId) {
+    const id = await this.canonicalId(rawId);
     try {
       return (await readdir(join(this.codexHome, "archived_sessions"))).some((name) => name.includes(`-${id}.jsonl`));
     } catch { return false; }
@@ -331,8 +386,9 @@ export class CodexSessions {
     if (!path) return { status: (await this.isArchived(id)) ? "archived" : "missing", updatedAt: null, turnAt: null, activity: null, summary: null };
     const info = await stat(path);
     let last = null;
-    for (const bytes of TAIL_BYTES) {
-      last = lastLifecycle(await readTail(path, info.size, bytes));
+    for (const [index, bytes] of TAIL_BYTES.entries()) {
+      const final = index === TAIL_BYTES.length - 1;
+      last = lastLifecycle(await readTail(path, info.size, bytes), { inTurn: final && bytes < info.size });
       if (last || bytes >= info.size) break;
     }
     const updatedAt = Math.round(info.mtimeMs);

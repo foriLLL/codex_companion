@@ -4,7 +4,11 @@ import { TRACE_STYLE, createTraceView } from "./trace.mjs";
 const WATCH_WAIT_MS = 20_000;
 const WATCH_RETRY_MS = 3000;
 const UNDO_MS = 6000;
-const VIEW_KEY = "codex-companion.tasks.view";
+// 悬停多久打开 Trace 浮层、离开多久关闭；离开后的宽限让鼠标能移进浮层里滚动和缩放。
+const PEEK_OPEN_MS = 350;
+const PEEK_CLOSE_MS = 220;
+const PEEK_MAX_WIDTH = 720;
+const PEEK_MIN_WIDTH = 420;
 const SILENT_CODES = new Set(["ABORTED", "RPC_CANCELLED", "RPC_STALE_GENERATION", "CARD_DISABLED", "STATE_DISPOSED"]);
 // 左侧状态图标。需要人处理的（提问、中断、无响应）排最前，没看过的会跳动提醒；
 // 其次是没看过的新回复，进行中的放后面。
@@ -29,35 +33,30 @@ function statusLabel(task) {
   if (task.status === "idle" && task.unread) return "有新回复，还没看";
   return STATUS[task.status]?.label ?? task.status;
 }
-// 看板颜色名，与 threads.colors 下标一一对应；最后一个是深色，文字改用浅色。
+// 看板颜色名，与 threads.colors 下标一一对应。
 const COLOR_NAMES = ["薄荷", "天空蓝", "杏橙", "樱粉", "薰衣草", "湖青", "柠檬黄", "深靛"];
-const DEEP_COLORS = new Set([7]);
 const ICONS = {
   plus: '<path d="M8 3.5v9M3.5 8h9"/>',
   edit: '<path d="M10.6 3.2l2.2 2.2-7 7H3.6v-2.2z"/>',
   done: '<path d="M3.5 8.4l2.9 2.9 6.1-6.6"/>',
-  list: '<path d="M3 4.5h10M3 8h10M3 11.5h10"/>',
-  trace: '<path d="M2.5 4.5h5M5.5 8h8M3.5 11.5h4.5"/>',
   color: '<path d="M8 2.6s4 4.2 4 6.9a4 4 0 0 1-8 0c0-2.7 4-6.9 4-6.9z"/>'
 };
-// 状态图标 20×20：问号/叹号是实心圆上用遮罩挖出符号，透出条目底色，深浅色条目都清楚。
-const BUBBLE = '<path d="M3.5 6A2.5 2.5 0 0 1 6 3.5h8A2.5 2.5 0 0 1 16.5 6v5.2a2.5 2.5 0 0 1-2.5 2.5H9.4L6 16.4v-2.7A2.5 2.5 0 0 1 3.5 11.2z"/><path d="M7 7.4h6M7 10h3.6"/>';
-const punched = (id, glyph) => `<mask id="${id}"><circle cx="10" cy="10" r="8.4" fill="#fff"/><g stroke="#000" fill="#000">${glyph}</g></mask><circle cx="10" cy="10" r="8.4" fill="currentColor" stroke="none" mask="url(#${id})"/>`;
+// 状态图标 20×20，彩色渐变实心：状态色与任务色分开，条目底色表示是哪个任务，图标表示它在干什么。
+// 渐变 id 带 cc-task- 前缀，渲染时替换成每个图标唯一的 id。
+const gradient = (id, from, to) => `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="${to}"/></linearGradient></defs>`;
+const BUBBLE = '<path d="M3 6.2A3.2 3.2 0 0 1 6.2 3h7.6A3.2 3.2 0 0 1 17 6.2v4.6a3.2 3.2 0 0 1-3.2 3.2H9.6l-3.4 2.7c-.4.3-.9 0-.9-.5V14h-.1A2.2 2.2 0 0 1 3 11.8z" fill="url(#cc-task-reply)" stroke="none"/><path d="M7 7.6h6M7 10.2h3.8" stroke="#fff" stroke-width="1.5"/>';
+const disc = (id) => `<circle cx="10" cy="10" r="7.6" fill="url(#${id})" stroke="none"/>`;
 const STATUS_ICONS = {
-  ask: punched("cc-task-ask", '<path d="M7.7 7.7a2.4 2.4 0 1 1 3.4 2.2c-.7.35-1.1.8-1.1 1.55v.35" fill="none" stroke-width="1.9"/><circle cx="10" cy="14.4" r="1.15" stroke="none"/>'),
-  alert: punched("cc-task-alert", '<path d="M10 5.6v5.4" stroke-width="2"/><circle cx="10" cy="14.2" r="1.15" stroke="none"/>'),
-  // 八道光芒依次点亮的转圈，比整圈旋转更轻。
-  spin: Array.from({ length: 8 }, (_, index) => {
-    const angle = (index * Math.PI) / 4;
-    const point = (radius) => `${(10 + Math.sin(angle) * radius).toFixed(2)} ${(10 - Math.cos(angle) * radius).toFixed(2)}`;
-    return `<path d="M${point(3.4)}L${point(7)}" style="animation-delay:${index * 100 - 800}ms"/>`;
-  }).join(""),
-  reply: BUBBLE,
-  unread: `${BUBBLE}<circle cx="15.8" cy="4.2" r="2.9" fill="#ff4d4f" stroke="none"/>`,
-  gone: '<circle cx="10" cy="10" r="7" stroke-dasharray="2.2 2.6" opacity=".55"/>'
+  ask: `${gradient("cc-task-ask", "#ffb347", "#f07c1e")}${disc("cc-task-ask")}<path d="M8 8a2.1 2.1 0 1 1 2.9 1.9c-.6.3-.9.7-.9 1.3v.2" stroke="#fff" stroke-width="1.7"/><circle cx="10" cy="13.7" r="1" fill="#fff" stroke="none"/>`,
+  alert: `${gradient("cc-task-alert", "#ff7b72", "#e2443a")}${disc("cc-task-alert")}<path d="M10 6.2v4.6" stroke="#fff" stroke-width="1.9"/><circle cx="10" cy="13.6" r="1.05" fill="#fff" stroke="none"/>`,
+  // 一段渐变弧线旋转，比实心图标轻，进行中的条目不抢眼。
+  spin: `${gradient("cc-task-spin", "#6aa8ff", "#3b6ff0")}<circle cx="10" cy="10" r="6.8" stroke="color-mix(in srgb,#3b82f6 16%,transparent)" stroke-width="2.2"/><path class="arc" d="M10 3.2a6.8 6.8 0 0 1 6.8 6.8" stroke="url(#cc-task-spin)" stroke-width="2.2"/>`,
+  reply: `${gradient("cc-task-reply", "#8fb4ff", "#5b7cf0")}${BUBBLE}`,
+  unread: `${gradient("cc-task-reply", "#8fb4ff", "#5b7cf0")}${BUBBLE}<circle cx="16" cy="4.4" r="3" fill="#ff4d4f" stroke="var(--cc-card-bg,#fff)" stroke-width="1.4"/>`,
+  gone: '<circle cx="10" cy="10" r="6.8" stroke-dasharray="2.2 2.6" opacity=".45"/>'
 };
 const SPARKLE = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M7 1.5c.3 2.9 1.6 4.2 4.5 4.5-2.9.3-4.2 1.6-4.5 4.5C6.7 7.6 5.4 6.3 2.5 6c2.9-.3 4.2-1.6 4.5-4.5Z"/><circle cx="12.3" cy="12.3" r="1.3" fill="currentColor" opacity=".7"/></svg>';
-let maskSeq = 0;
+let gradientSeq = 0;
 const icon = (name) => `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
 
 function ago(ms, now = Date.now()) {
@@ -80,8 +79,8 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
       --attention:#d9661b;--danger:#d4483e;--running:#3b82f6;--ease:cubic-bezier(.22,1,.36,1);
       font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif;letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
     *{box-sizing:border-box}
-    .board{padding:14px 10px 10px;font-size:13.5px;line-height:1.4}
-    header{display:flex;align-items:center;gap:10px;padding:0 4px 10px 6px;min-height:22px}
+    .board{padding:14px 0 0;font-size:13.5px;line-height:1.4}
+    header{display:flex;align-items:center;gap:10px;padding:0 14px 10px 16px;min-height:22px}
     h2{flex:none;display:flex;align-items:center;gap:7px;margin:0;font-size:14px;font-weight:600;white-space:nowrap}
     h2 svg{color:#5b8def}
     .chips{min-width:0;display:flex;gap:9px;overflow:hidden;font-size:12px;color:var(--text);font-variant-numeric:tabular-nums}
@@ -90,32 +89,25 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     .chip[data-kind=running]{--dot:var(--running)}
     .chip[data-kind=human]{--dot:var(--attention);color:var(--attention)}
     button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer;letter-spacing:inherit}
-    .add{display:flex;align-items:center;gap:9px;width:100%;margin-bottom:6px;padding:9px 11px;border-radius:12px;
-      box-shadow:inset 0 0 0 1px var(--line);color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
+    .add{display:flex;align-items:center;gap:9px;width:100%;padding:9px 16px;
+      box-shadow:inset 0 1px 0 var(--line);color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
     .add:hover{background:var(--hover);color:var(--text)}
     .add svg{flex:none}
     .add .title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .add b{font-weight:500;color:currentColor}
-    ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}
-    /* 条目是中性底色的细描边卡片；任务颜色只落在左侧状态小方块上，和侧栏标记呼应。 */
-    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;border-radius:12px;background:color-mix(in srgb,currentColor 1.5%,transparent);
-      box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.04);transition:background-color .16s ease,box-shadow .16s ease;transform-origin:50% 60%}
-    .task:hover,.task:focus-within{background:var(--hover);box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 14%,transparent),0 1px 2px rgba(0,0,0,.05)}
-    .task[data-status=running]{box-shadow:inset 0 0 0 1px var(--line),inset -2.5px 0 0 var(--running),0 1px 2px rgba(0,0,0,.04)}
-    .main{flex:1;min-width:0;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:9px 11px 9px 9px;text-align:left;border-radius:12px}
+    ul{list-style:none;margin:0;padding:0;display:grid}
+    /* 条目紧挨着铺满卡片宽度，底色取任务色，和左侧侧栏条目的标记一致；状态只看左侧彩色图标。
+       相邻条目之间只有一道很淡的分隔，同色条目挨着也分得清。 */
+    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;background:color-mix(in srgb,var(--task) 10%,transparent);
+      transition:background-color .16s ease;transform-origin:50% 60%}
+    .task+.task{box-shadow:inset 0 1px 0 color-mix(in srgb,currentColor 6%,transparent)}
+    .task:hover,.task:focus-within,.task[data-peek]{background:color-mix(in srgb,var(--task) 17%,transparent)}
+    .main{flex:1;min-width:0;display:grid;grid-template-columns:20px 1fr;column-gap:11px;align-items:center;padding:10px 16px;text-align:left}
     .main:focus-visible{outline:2px solid color-mix(in srgb,var(--task) 55%,transparent);outline-offset:-2px}
-    /* 状态图标放在任务色的小方块里：浅底、同色细描边、轻投影；深色方块用白色图标。 */
-    .status{position:relative;z-index:2;display:grid;place-items:center;width:28px;height:28px;border-radius:8px;transform-origin:50% 100%;
-      background:color-mix(in srgb,var(--task) 18%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--task) 34%,transparent),0 1px 2px rgba(0,0,0,.05);
-      color:color-mix(in srgb,var(--task) 70%,currentColor)}
-    .task.deep .status{background:var(--task);box-shadow:0 1px 2px rgba(0,0,0,.12);color:#fff}
-    .status svg{display:block;overflow:visible;width:17px;height:17px}
-    .status[data-icon=spin] path{opacity:.18;animation:ray .8s linear infinite}
-    .status[data-icon=reply]{color:var(--muted)}
-    .status[data-icon=ask],.status[data-icon=alert]{color:var(--attention)}
-    .status[data-icon=alert]{color:var(--danger)}
-    .task.deep .status[data-icon]{color:#fff}
-    .task.deep .status[data-icon=ask],.task.deep .status[data-icon=alert]{color:#fff}
+    .status{position:relative;z-index:2;display:grid;place-items:center;width:20px;height:20px;transform-origin:50% 100%;color:var(--muted)}
+    .status svg{display:block;overflow:visible;width:20px;height:20px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.08))}
+    .status[data-icon=spin] svg{filter:none}
+    .status[data-icon=spin] .arc{transform-origin:10px 10px;animation:turn .9s linear infinite}
     .text{min-width:0}
     .title{display:flex;align-items:center;gap:6px;min-width:0}
     .name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
@@ -136,34 +128,37 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     /* 需要人处理且还没看过：图标跳出条目，落下时砸得条目轻晃一下。常驻动画只动 transform，交给合成器。 */
     .task[data-hop]{animation:knock 3.2s infinite;will-change:transform}
     .task[data-hop] .status{animation:hop 3.2s infinite;will-change:transform}
-    .actions{position:absolute;right:6px;top:50%;display:flex;gap:2px;transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .16s ease}
+    .actions{position:absolute;right:10px;top:50%;display:flex;gap:2px;transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .16s ease}
     .task:hover .actions,.task:focus-within .actions{opacity:1;pointer-events:auto}
     .task:hover .text,.task:focus-within .text{padding-right:86px}
     .icon{display:grid;place-items:center;width:26px;height:26px;border-radius:7px;color:var(--text);
       background:var(--cc-card-bg,transparent);box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.05)}
     .icon:hover{color:currentColor;background:color-mix(in srgb,currentColor 9%,transparent)}
-    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px;min-height:58px}
+    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 16px;min-height:60px}
     .palette button{width:22px;height:22px;border-radius:50%;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.08);transition:transform .2s var(--ease)}
     .palette button:hover{transform:scale(1.15)}
     .palette button[aria-checked=true]{box-shadow:0 0 0 2px currentColor}
-    .editor{flex:1;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:9px 11px 9px 9px}
+    .editor{flex:1;display:grid;grid-template-columns:20px 1fr;column-gap:11px;align-items:center;padding:10px 16px}
     input{width:100%;font:inherit;font-weight:500;color:inherit;background:transparent;border:0;border-radius:6px;padding:2px 6px;margin:-2px -6px;
       outline:none;box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 30%,transparent)}
-    .empty{margin:6px 8px 2px;font-size:12.5px;line-height:1.55;color:var(--muted)}
-    .note{margin:6px 8px 0;font-size:12.5px;color:var(--danger)}
-    .toast{display:flex;align-items:center;gap:10px;margin:8px 2px 0;padding:7px 8px 7px 12px;border-radius:12px;font-size:12.5px;
+    .empty{margin:6px 16px 14px;font-size:12.5px;line-height:1.55;color:var(--muted)}
+    .note{margin:6px 16px 10px;font-size:12.5px;color:var(--danger)}
+    .toast{display:flex;align-items:center;gap:10px;margin:8px 10px 10px;padding:7px 8px 7px 12px;border-radius:12px;font-size:12.5px;
       background:color-mix(in srgb,currentColor 90%,transparent);color:var(--cc-card-bg,Canvas);box-shadow:0 6px 20px rgba(0,0,0,.14)}
     .toast span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .toast button{font-weight:600;padding:3px 8px;border-radius:7px}
     .toast button:hover{background:color-mix(in srgb,var(--cc-card-bg,Canvas) 18%,transparent)}
     [hidden]{display:none!important}
-    .seg{flex:none;margin-left:auto;display:flex;padding:2px;border-radius:9px;background:color-mix(in srgb,currentColor 5%,transparent);
-      box-shadow:inset 0 0 0 1px var(--line)}
-    .seg button{display:grid;place-items:center;width:26px;height:22px;border-radius:7px;color:var(--muted);transition:color .16s ease,background-color .16s ease}
-    .seg button:hover{color:var(--text)}
-    .seg button[aria-pressed=true]{color:inherit;background:color-mix(in srgb,currentColor 11%,transparent);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+    /* Trace 浮层放在顶层（popover），不受卡片宽度和裁剪限制，贴在看板左侧展开。 */
+    .peek{position:fixed;inset:auto;margin:0;padding:14px 12px 12px;border:0;border-radius:14px;overflow:auto;max-height:calc(100vh - 24px);
+      color:inherit;background:var(--cc-card-bg,Canvas);font:inherit;font-size:13.5px;line-height:1.4;
+      box-shadow:0 0 0 .5px rgba(0,0,0,.14),0 12px 32px rgba(0,0,0,.16),0 2px 6px rgba(0,0,0,.06);
+      opacity:0;transform:translateX(6px);transition:opacity .16s ease,transform .2s var(--ease),overlay .2s allow-discrete,display .2s allow-discrete}
+    .peek:popover-open{opacity:1;transform:none}
+    @starting-style{.peek:popover-open{opacity:0;transform:translateX(6px)}}
 ${TRACE_STYLE}
     @keyframes ray{0%{opacity:1}100%{opacity:.18}}
+    @keyframes turn{to{transform:rotate(360deg)}}
     @keyframes sweep{from{-webkit-mask-position:100% 0;mask-position:100% 0}to{-webkit-mask-position:0 0;mask-position:0 0}}
     @keyframes roll-in{from{opacity:0;transform:translateY(70%);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
     @keyframes roll-out{from{opacity:1;transform:none;filter:none}to{opacity:0;transform:translateY(-70%);filter:blur(3px)}}
@@ -181,13 +176,12 @@ ${TRACE_STYLE}
       42%{transform:translateY(-.4px) rotate(.55deg)}
       48%{transform:rotate(-.3deg)}
       54%{transform:rotate(.12deg)}}
-    @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.status[data-icon=spin] path{opacity:.6}}
+    @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
   </style><section class="board" aria-label="任务看板">
-    <header><h2>${SPARKLE}任务看板</h2><span class="chips"></span>
-      <span class="seg" role="group" aria-label="视图"><button type="button" data-view="list" title="列表" aria-label="列表">${icon("list")}</button><button type="button" data-view="trace" title="当前会话的 Trace" aria-label="当前会话的 Trace">${icon("trace")}</button></span></header>
+    <header><h2>${SPARKLE}任务看板</h2><span class="chips"></span></header>
     <button type="button" class="add" hidden>${icon("plus")}<span class="title">加入当前会话 · <b></b></span></button>
     <ul></ul>
-    <div class="trace-slot" hidden></div>
+    <div class="peek" popover="manual" aria-label="会话 Trace"></div>
     <p class="empty" hidden></p>
     <p class="note" hidden></p>
     <div class="toast" role="status" hidden><span></span><button type="button">撤销</button></div>
@@ -196,11 +190,10 @@ ${TRACE_STYLE}
   const addButton = root.querySelector(".add");
   const addTitle = addButton.querySelector("b");
   const list = root.querySelector("ul");
-  const traceSlot = root.querySelector(".trace-slot");
-  const viewButtons = [...root.querySelectorAll(".seg button")];
-  let mode = "list";
+  const peek = root.querySelector(".peek");
   let trace = null;
-  try { if (doc.defaultView?.localStorage.getItem(VIEW_KEY) === "trace") mode = "trace"; } catch {}
+  let peekTimer = null;
+  let peekItem = null;
   const empty = root.querySelector(".empty");
   const note = root.querySelector(".note");
   const toast = root.querySelector(".toast");
@@ -224,12 +217,15 @@ ${TRACE_STYLE}
     showNote(error?.message || "操作失败，请稍后重试");
   }
 
+  // 新建会话在本次运行中，侧栏条目用客户端临时 id；服务端给出别名，两个都认。
+  const idsOf = (task) => [task.threadId, ...(task.aliases ?? [])];
+  const taskFor = (id) => board?.tasks.find((task) => idsOf(task).includes(id));
   // 未自定义名字时，优先用左侧条目上的实时标题（Codex 起名或 rename 后会立即更新）。
-  const displayName = (task) => task.customName ?? threads?.title(task.threadId) ?? task.name;
+  const displayName = (task) => task.customName ?? idsOf(task).map((id) => threads?.title(id)).find(Boolean) ?? task.name;
 
   function renderHeader() {
     const current = threads?.current();
-    const added = current && board?.tasks.some((task) => task.threadId === current.id);
+    const added = current && taskFor(current.id);
     addButton.hidden = !board || !current || added;
     addTitle.textContent = current?.title ?? "未命名会话";
     addButton.title = current?.title ?? "";
@@ -322,8 +318,8 @@ ${TRACE_STYLE}
     node.title = statusLabel(task);
     node.setAttribute("role", "img");
     node.setAttribute("aria-label", statusLabel(task));
-    // 遮罩 id 每个图标唯一：同名 id 只认第一个，列表隐藏时泳道里的问号会丢。
-    const glyph = STATUS_ICONS[node.dataset.icon].replaceAll("cc-task-", `cc-task-${++maskSeq}-`);
+    // 渐变 id 每个图标唯一：同名 id 只认第一个，所在节点隐藏后其它图标会丢失填色。
+    const glyph = STATUS_ICONS[node.dataset.icon].replaceAll("cc-task-", `cc-task-${++gradientSeq}-`);
     node.innerHTML = `<svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${glyph}</svg>`;
     return node;
   }
@@ -369,7 +365,6 @@ ${TRACE_STYLE}
     item.dataset.status = task.status;
     item.dataset.id = task.threadId;
     if (colors[task.color]) item.style.setProperty("--task", colors[task.color]);
-    item.classList.toggle("deep", DEEP_COLORS.has(task.color));
     if (STATUS[task.status]?.human && task.unread) item.dataset.hop = "";
     if (editing === task.threadId) {
       renderEditor(task, item);
@@ -395,7 +390,9 @@ ${TRACE_STYLE}
     setLabel(meta, metaOf(task));
     text.append(title, meta);
     main.append(statusIcon(task), text);
-    main.addEventListener("click", () => { void reveal(task, item); });
+    main.addEventListener("click", () => { closePeek(); void reveal(task, item); });
+    item.addEventListener("pointerenter", () => hoverPeek(task, item));
+    item.addEventListener("pointerleave", schedulePeekClose);
     const actions = element("span", "actions");
     actions.append(
       colorToggle(iconButton("color", "换颜色", () => { picking = picking === task.threadId ? null : task.threadId; render(); })),
@@ -409,7 +406,7 @@ ${TRACE_STYLE}
   // 用户正停在某个任务的会话里，就当作已经看过这次结果。
   function markSeen() {
     const current = threads?.current();
-    const task = current && board?.tasks.find((item) => item.threadId === current.id);
+    const task = current && taskFor(current.id);
     if (!task?.unread || !Number.isSafeInteger(task.turnAt) || seeing.has(task.threadId)) return;
     seeing.add(task.threadId);
     void mutate("seen", { threadId: task.threadId, at: task.turnAt }).finally(() => seeing.delete(task.threadId));
@@ -418,10 +415,6 @@ ${TRACE_STYLE}
   function render() {
     renderHeader();
     markSeen();
-    for (const button of viewButtons) button.setAttribute("aria-pressed", String(button.dataset.view === mode));
-    list.hidden = mode !== "list";
-    traceSlot.hidden = mode !== "trace";
-    trace?.follow();
     if (!board || editing && root.activeElement?.tagName === "INPUT") return;
     const ordered = board.tasks.map((task, index) => ({ task, index }))
       .sort((a, b) => rankOf(a.task) - rankOf(b.task) || a.index - b.index).map(({ task }) => task);
@@ -440,12 +433,18 @@ ${TRACE_STYLE}
       return node;
     });
     if (nodes.length !== list.children.length || nodes.some((node, index) => list.children[index] !== node)) list.replaceChildren(...nodes);
+    // 条目重建后把浮层的锚点换到新节点上；任务已移出就关掉浮层。
+    if (peekItem && !peekItem.isConnected) {
+      const next = nodes.find((node) => node.dataset.id === peekItem.dataset.id);
+      if (!next || editing || picking) closePeek();
+      else { peekItem = next; next.setAttribute("data-peek", ""); }
+    }
   }
 
   function accept(next) {
     if (signal.aborted || !next) return;
     board = next;
-    threads?.setMarks(board.tasks.map((task) => ({ id: task.threadId, color: task.color })));
+    threads?.setMarks(board.tasks.flatMap((task) => idsOf(task).map((id) => ({ id, color: task.color }))));
     render();
   }
 
@@ -490,9 +489,55 @@ ${TRACE_STYLE}
     watching = null;
   }
 
+  // 悬停在任务上一会儿，在看板左侧弹出这个会话的 Trace；鼠标移进浮层不关，离开后稍等再关。
+  function cancelPeek() { peekTimer?.(); peekTimer = null; }
+  function closePeek() {
+    cancelPeek();
+    peekItem?.removeAttribute("data-peek");
+    peekItem = null;
+    if (peek.matches(":popover-open")) peek.hidePopover();
+    trace?.setActive(false);
+  }
+  function schedulePeekClose() {
+    cancelPeek();
+    if (peekItem) peekTimer = effects.timeout(closePeek, PEEK_CLOSE_MS);
+  }
+  function placePeek(item) {
+    const view = doc.defaultView;
+    const card = root.host?.getBoundingClientRect?.() ?? item.getBoundingClientRect();
+    const row = item.getBoundingClientRect();
+    const room = card.left - 20;
+    // 左侧放得下就贴在看板左边；放不下（窗口很窄）就盖在看板上方，宽度取窗口宽。
+    const width = room >= PEEK_MIN_WIDTH ? Math.min(PEEK_MAX_WIDTH, room) : Math.min(PEEK_MAX_WIDTH, view.innerWidth - 24);
+    const left = room >= PEEK_MIN_WIDTH ? card.left - 8 - width : Math.max(12, view.innerWidth - 12 - width);
+    peek.style.width = `${width}px`;
+    peek.style.left = `${left}px`;
+    const height = peek.offsetHeight;
+    peek.style.top = `${Math.max(12, Math.min(row.top - 14, view.innerHeight - 12 - height))}px`;
+  }
+  function openPeek(task, item) {
+    if (!item.isConnected || editing || picking) return;
+    peekItem?.removeAttribute("data-peek");
+    peekItem = item;
+    item.setAttribute("data-peek", "");
+    // 先定宽再画：Trace 按可视宽度挑时间比例。
+    if (!peek.matches(":popover-open")) peek.showPopover();
+    placePeek(item);
+    trace.show(task.threadId, displayName(task));
+    trace.setActive(true);
+  }
+  function hoverPeek(task, item) {
+    cancelPeek();
+    // 浮层已经开着时，在条目间移动直接切换，不再等待。
+    if (peekItem && peekItem !== item) { openPeek(task, item); return; }
+    if (peekItem === item) return;
+    peekTimer = effects.timeout(() => { peekTimer = null; openPeek(task, item); }, PEEK_OPEN_MS);
+  }
+
   async function reveal(task, item) {
     if (!threads) return;
-    const result = await threads.reveal(task.threadId, { source: item.querySelector(".status") ?? item, projectId: task.projectId });
+    const id = idsOf(task).find((item) => threads.has(item)) ?? task.threadId;
+    const result = await threads.reveal(id, { source: item.querySelector(".status") ?? item, projectId: task.projectId });
     if (signal.aborted || result.ok) return;
     // 侧栏里找不到（例如会话不在当前列表中）时，交给 Codex 深链打开。
     try { await rpc("open", { threadId: task.threadId }); } catch (error) { fail(error); }
@@ -533,28 +578,27 @@ ${TRACE_STYLE}
     picking = null;
     render();
   });
-  for (const button of viewButtons) {
-    effects.listen(button, "click", () => {
-      if (mode === button.dataset.view) return;
-      mode = button.dataset.view;
-      try { doc.defaultView?.localStorage.setItem(VIEW_KEY, mode); } catch {}
-      render();
-      trace.setActive(mode === "trace");
-    });
-  }
+  effects.listen(doc, "keydown", (event) => { if (event.key === "Escape") closePeek(); });
+  effects.listen(peek, "pointerenter", () => cancelPeek());
+  effects.listen(peek, "pointerleave", () => schedulePeekClose());
   if (threads) effects.add(threads.subscribe(render));
   // 卡片收起时不必刷新状态；颜色标记由平台在侧栏重绘时自行补回。
   effects.add(stopWatch);
   effects.add(() => threads?.setMarks([]));
   trace = createTraceView({ rpc, effects, signal, threads, element, fail, isVisible });
-  traceSlot.append(trace.root);
+  peek.append(trace.root);
+  effects.add(closePeek);
+  // Trace 读到数据后浮层会变高，重新贴位置，避免超出窗口底部。
+  const peekResize = new doc.defaultView.ResizeObserver(() => { if (peekItem?.isConnected) placePeek(peekItem); });
+  peekResize.observe(peek);
+  effects.add(() => peekResize.disconnect());
   render();
   void refresh();
   if (isVisible()) startWatch();
-  trace.setActive(mode === "trace");
   return {
     visibilityChanged({ visible }) {
       if (visible) { void refresh(); startWatch(); } else stopWatch();
+      if (!visible) closePeek();
       trace.visibilityChanged(visible);
     },
     dispose() { root.replaceChildren(); }

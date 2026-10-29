@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { appendFile, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CodexSessions, parseTrace, STALLED_AFTER_MS, defaultCodexHome, endsWithQuestion, lastLifecycle, threadCreatedAt } from "../src/codex-sessions.mjs";
 import { TaskBoardStorage, pickColor } from "../src/task-board-storage.mjs";
 import { createService } from "../src/cards/tasks/service.mjs";
@@ -60,11 +60,24 @@ test("以问句收尾或有未回答的提问时为 asking", () => {
   assert.equal(endsWithQuestion(null), false);
   const asked = [event("2026-10-28T10:00:00Z", "task_started"), event("2026-10-28T10:01:00Z", "task_complete", { last_agent_message: "选 A 还是 B？" })];
   assert.deepEqual(pick(lastLifecycle(asked.join("\n"))), { status: "asking", at: Date.parse("2026-10-28T10:01:00Z") });
+  const started = event("2026-10-28T10:00:00Z", "task_started");
+  // 同步提问：工具输出就是回答。
+  const sync = item("2026-10-28T10:00:30Z", { type: "function_call", name: "request_user_input", call_id: "s1" });
+  assert.equal(lastLifecycle([started, sync].join("\n")).status, "asking");
+  const syncAnswer = item("2026-10-28T10:00:40Z", { type: "function_call_output", call_id: "s1", output: "A" });
+  assert.equal(lastLifecycle([started, sync, syncAnswer].join("\n")).status, "running");
+  // 异步提问：输出立即返回 accepted，用户回答以 question_reply 消息回来才算答完。
   const call = item("2026-10-28T10:00:30Z", { type: "function_call", name: "request_user_input_async", call_id: "c1" });
-  assert.equal(lastLifecycle([event("2026-10-28T10:00:00Z", "task_started"), call].join("\n")).status, "asking");
-  const answered = item("2026-10-28T10:00:40Z", { type: "function_call_output", call_id: "c1", output: "A" });
-  assert.equal(lastLifecycle([event("2026-10-28T10:00:00Z", "task_started"), call, answered].join("\n")).status, "running");
+  const accepted = item("2026-10-28T10:00:31Z", { type: "function_call_output", call_id: "c1", output: "{\"accepted\":true}" });
+  const working = item("2026-10-28T10:00:35Z", { type: "reasoning" });
+  assert.deepEqual([lastLifecycle([started, call, accepted, working].join("\n"))].map(({ status, activity }) => [status, activity]), [["asking", "在等你回答"]]);
+  const reply = item("2026-10-28T10:01:00Z", { type: "message", role: "user", content: [{ type: "input_text", text: "<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"c1\\\",0]\",\"answer\":\"A\"}]" }] });
+  assert.equal(lastLifecycle([started, call, accepted, working, reply].join("\n")).status, "running");
   assert.equal(lastLifecycle([call, event("2026-10-28T10:02:00Z", "task_started")].join("\n")).status, "running", "新回合清掉旧提问");
+  // 尾部窗口里只有回合内条目：回合开始在窗口之前，仍在进行；异步提问照样识别。
+  assert.equal(lastLifecycle([working].join("\n")), null, "不确定是窗口时不猜");
+  assert.equal(lastLifecycle([working].join("\n"), { inTurn: true }).status, "running");
+  assert.equal(lastLifecycle([call, accepted].join("\n"), { inTurn: true }).status, "asking");
 });
 
 test("按创建日期定位 rollout，并区分进行中、等你回复、中断与无响应", async (t) => {
@@ -298,4 +311,28 @@ test("看板文件只含白名单字段", async (t) => {
   const saved = JSON.parse(await readFile(taskBoard.path, "utf8"));
   assert.deepEqual(Object.keys(saved), ["version", "revision", "tasks"]);
   assert.deepEqual(Object.keys(saved.tasks[0]).sort(), ["addedAt", "color", "customName", "projectId", "seenAt", "suggestedName", "threadId"]);
+});
+
+test("新建会话的客户端临时 id 按 Codex 绑定换成真实 id，看板两个 id 都认", async (t) => {
+  const CLIENT = "55df1b41-eb1f-4317-a606-7543ae182ba0";
+  const { call, opened, taskBoard } = await serviceFixture(t);
+  const codexHome = join(dirname(taskBoard.path), "codex");
+  const statePath = join(codexHome, ".codex-global-state.json");
+  // 还没绑定：按原 id 存，状态为缺失。
+  let board = await call("add", { threadId: CLIENT, title: "新会话" });
+  assert.deepEqual(board.tasks.map((task) => [task.threadId, task.status, task.aliases]), [[CLIENT, "missing", []]]);
+  // 发出第一条消息后 Codex 写入绑定：存量任务按真实 id 读状态，并带上别名。
+  await writeFile(statePath, JSON.stringify({ "electron-persisted-atom-state": {
+    "client-thread-bindings-v1": { [`client-new-thread:${CLIENT}`]: ID, "client-new-thread:bad id": ID }
+  } }));
+  board = await call("list");
+  assert.deepEqual(board.tasks.map((task) => [task.threadId, task.status, task.name, task.aliases]), [[CLIENT, "idle", "Codex 起的名字", [ID]]]);
+  assert.equal((await call("trace", { threadId: CLIENT })).turns.length > 0, true, "Trace 也能按客户端 id 读到记录");
+  await call("open", { threadId: CLIENT });
+  assert.deepEqual(opened, [ID], "深链用真实 id");
+  // 已绑定时加入：存真实 id；客户端 id 与真实 id 都视为同一任务。
+  await call("remove", { threadId: CLIENT });
+  board = await call("add", { threadId: CLIENT, title: "新会话" });
+  assert.deepEqual(board.tasks.map((task) => [task.threadId, task.aliases]), [[ID, [CLIENT]]]);
+  assert.equal((await call("add", { threadId: ID })).tasks.length, 1);
 });

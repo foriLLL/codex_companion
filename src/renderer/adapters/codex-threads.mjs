@@ -326,6 +326,7 @@ export function createCodexThreads({ document, onError } = {}) {
       const row = rows().find((item) => item.getAttribute(ATTR.active) === "true");
       return row ? describe(row) : null;
     },
+    has(id) { return Boolean(rowFor(id)); },
     title(id) {
       const row = rowFor(id);
       return row ? titleOf(row) : null;

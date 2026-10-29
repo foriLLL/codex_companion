@@ -257,10 +257,18 @@ try {
   await screenshot("task-board-2-dark.png");
   await evaluate(`delete document.documentElement.dataset.theme`);
 
-  // Trace 视图：当前会话的模型与工具段排在时间轴上，进行中的最后一段随时间生长。
-  await evaluate(`card.querySelector('.seg [data-view=trace]').click()`);
-  await waitFor(`card.querySelectorAll('.seg-bar').length === 18`, "Trace 渲染");
-  assert.equal(await evaluate(`card.querySelector('ul').hidden`), true);
+  // Trace 浮层：悬停任务一会儿，在看板左侧弹出该会话的 Trace；进行中的最后一段随时间生长。
+  const pointAt = async (expression) => {
+    const { x, y } = await evaluate(`(() => { const rect = ${expression}.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; })()`);
+    await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  };
+  await pointAt(`${task("a3")}.querySelector('.name')`);
+  await waitFor(`card.querySelector('.peek').matches(':popover-open') && card.querySelectorAll('.seg-bar').length === 18`, "悬停打开 Trace 浮层");
+  assert.deepEqual(await evaluate(`(() => {
+    const peek = card.querySelector('.peek').getBoundingClientRect();
+    const board = document.getElementById('companion').getBoundingClientRect();
+    return { leftOfBoard: peek.right <= board.left, wide: peek.width >= 600, inView: peek.top >= 0 && peek.bottom <= innerHeight, title: card.querySelector('.trace-title')?.textContent };
+  })()`), { leftOfBoard: true, wide: true, inView: true, title: "接入任务看板" }, "浮层在看板左侧、足够宽、不出窗口");
   assert.deepEqual(await evaluate(`[...card.querySelectorAll('.tl-lane')].map((lane) => lane.dataset.lane)`), ["model", "shell", "edit", "agent", "you"]);
   assert.equal(await evaluate(`card.querySelectorAll('.seg-bar[data-failed]').length`), 1, "失败的工具标红");
   assert.equal(await evaluate(`card.querySelectorAll('.needs').length`), 1, "以提问结束的回合标出「需要你」");
@@ -271,10 +279,17 @@ try {
   await screenshot("task-board-3-trace-light.png");
   await evaluate(`document.documentElement.dataset.theme = 'dark'`);
   await screenshot("task-board-4-trace-dark.png");
+  await evaluate(`delete document.documentElement.dataset.theme`);
+  // 鼠标移进浮层不关；移到别的任务直接切换；移出后关闭。
+  await pointAt(`card.querySelector('.tl-scroll')`);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(await evaluate(`card.querySelector('.peek').matches(':popover-open')`), true, "移进浮层保持打开");
   await evaluate(`card.querySelector('.tl-scroll').scrollLeft = 0`);
   await screenshot("task-board-5-trace-scrolled.png");
-  await evaluate(`delete document.documentElement.dataset.theme; card.querySelector('.seg [data-view=list]').click()`);
-  await waitFor(`!card.querySelector('ul').hidden`, "切回列表");
+  await pointAt(`${task("a24")}.querySelector('.name')`);
+  await waitFor(`card.querySelector('.trace-title')?.textContent === ${task("a24")}.querySelector('.name').textContent && ${task("a24")}.hasAttribute('data-peek')`, "移到别的任务直接切换");
+  await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 600, y: 700 });
+  await waitFor(`!card.querySelector('.peek').matches(':popover-open') && !card.querySelector('[data-peek]')`, "移出后关闭浮层");
 
   // 底部条目：先滚动到可视，再播放指向动画，最后打开。
   await evaluate(`document.querySelector('[data-app-action-sidebar-scroll]').scrollTop = 0`);
@@ -328,13 +343,13 @@ try {
   await evaluate(`(() => { const input = ${task("a3")}.querySelector('input'); input.value = ''; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
   await waitFor(`${task("a3")}.querySelector('.name')?.textContent === '接入任务看板'`, "留空回到推荐名");
 
-  // 换颜色：色板选深靛，条目改为深底浅字，侧栏标记同步。
+  // 换颜色：色板选深靛，条目底色随任务色，侧栏标记同步。
   await evaluate(`${task("a24")}.querySelectorAll('.icon')[0].click()`);
   await waitFor(`${task("a24")}?.querySelectorAll('.palette button').length === 8`, "打开色板");
   await screenshot("task-board-6-palette.png");
   await evaluate(`${task("a24")}.querySelectorAll('.palette button')[7].click()`);
-  await waitFor(`${task("a24")}?.classList.contains('deep') && ${marked("a24")} === '7' && !card.querySelector('.palette')`, "换成深色");
-  assert.equal(await evaluate(`getComputedStyle(${task("a24")}.querySelector('.status')).color`), "rgb(255, 255, 255)", "深色方块用白色图标");
+  await waitFor(`${marked("a24")} === '7' && !card.querySelector('.palette')`, "换成深靛");
+  assert.equal(await evaluate(`${task("a24")}.style.getPropertyValue('--task')`), "#3f3ca8", "条目底色取任务色");
   await screenshot("task-board-7-deep.png");
 
   // 完成即移出，可撤销。

@@ -36,10 +36,12 @@ export function createService({ taskBoard = new TaskBoardStorage(), codexSession
     const tasks = await Promise.all(board.tasks.map(async (task) => {
       const { status, updatedAt, turnAt, activity = null, summary = null } = await codexSessions.status(task.threadId)
         .catch(() => ({ status: "missing", updatedAt: null, turnAt: null }));
-      const suggestedName = titles.get(task.threadId) ?? task.suggestedName;
+      const suggestedName = titles.get(await codexSessions.canonicalId(task.threadId)) ?? task.suggestedName;
       // unread：回合结束（回复、提问、中断）之后用户还没在 Codex 里看过。
       const unread = status !== "running" && Number.isFinite(turnAt) && turnAt > task.seenAt;
-      return { ...task, suggestedName, name: task.customName ?? suggestedName ?? "未命名会话", status, updatedAt, turnAt, unread, activity, summary };
+      // 侧栏条目可能用真实 id，也可能用新建时的客户端临时 id，看板两个都认。
+      const aliases = await codexSessions.aliases(task.threadId);
+      return { ...task, aliases, suggestedName, name: task.customName ?? suggestedName ?? "未命名会话", status, updatedAt, turnAt, unread, activity, summary };
     }));
     signal?.throwIfAborted();
     // sig 只覆盖界面上会变的内容；mtime 每次写入都变，不放进来，免得进行中的任务每次都触发重绘。
@@ -104,9 +106,11 @@ export function createService({ taskBoard = new TaskBoardStorage(), codexSession
       },
       async add(input, { signal }) {
         const { threadId: rawId, title, projectId } = params(input, ["threadId", "title", "projectId"]);
-        const id = threadId(rawId);
+        // 新建会话的侧栏条目给的是客户端临时 id，已绑定真实 id 时存真实 id。
+        const id = await codexSessions.canonicalId(threadId(rawId));
+        const aliases = new Set([id, ...await codexSessions.aliases(id)]);
         const board = await taskBoard.mutate((tasks) => {
-          if (tasks.some((task) => task.threadId === id)) return null;
+          if (tasks.some((task) => aliases.has(task.threadId))) return null;
           if (tasks.length >= MAX_TASKS) throw rpcError("TASK_BOARD_FULL", `看板最多保留 ${MAX_TASKS} 个任务，请先完成一些`);
           const task = normalizeTask({ threadId: id, suggestedName: title, customName: null, color: pickColor(tasks), projectId, addedAt: Date.now() });
           return [task, ...tasks];
@@ -175,7 +179,7 @@ export function createService({ taskBoard = new TaskBoardStorage(), codexSession
         return view(board, signal);
       },
       async open(input) {
-        await openThread(threadId(params(input, ["threadId"]).threadId));
+        await openThread(await codexSessions.canonicalId(threadId(params(input, ["threadId"]).threadId)));
         return { opened: true };
       }
     }
