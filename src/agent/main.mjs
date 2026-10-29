@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import packageInfo from "../../package.json" with { type: "json" };
 import { CompanionConfig, defaultCompanionConfigPath } from "../companion-config.mjs";
-import { DEFAULT_CODEX_EXECUTABLE } from "../launcher.mjs";
+import { DEFAULT_CODEX_EXECUTABLE, defaultCodexExecutable } from "../launcher.mjs";
 import { RuntimeState, defaultRuntimeStatePath, pidIsAlive } from "../runtime-state.mjs";
 import { watchCompanionConfig } from "../platform/config/watcher.mjs";
 import { AgentController } from "./controller.mjs";
@@ -14,13 +14,14 @@ import { createNativeBridge, resolveNativeHelperPath } from "./native-bridge.mjs
 import { createAgentAdapter } from "./adapter.mjs";
 import { createAgentFileLogger } from "./logger.mjs";
 import { companionDataDir } from "../platform/paths.mjs";
+import { findLinuxCodexProcesses } from "../platform/processes.mjs";
 
 const execFileAsync = promisify(execFile);
 export const AGENT_VERSION = packageInfo.version;
 export const defaultAgentLockPath = (home = homedir()) => join(companionDataDir(home), "agent.lock");
 
 export function resolveCodexAppPath({ env = process.env } = {}) {
-  return resolve(env.CODEX_COMPANION_CODEX_APP || DEFAULT_CODEX_EXECUTABLE.replace(/\/Contents\/MacOS\/[^/]+$/, ""));
+  return resolve(env.CODEX_COMPANION_CODEX_APP || defaultCodexExecutable("darwin").replace(/\/Contents\/MacOS\/[^/]+$/, ""));
 }
 
 // lockf/flock 锁随父进程 FD 的关闭自动释放。文件不删除，避免并发打开不同 inode。
@@ -66,7 +67,15 @@ export async function acquireAgentLock({
   } catch (error) { await file.close().catch(() => {}); throw error; }
 }
 
-export function createPollingSnapshot({ executable = DEFAULT_CODEX_EXECUTABLE, execFileImpl = execFileAsync, now = Date.now } = {}) {
+export function createPollingSnapshot({ executable = DEFAULT_CODEX_EXECUTABLE, execFileImpl = execFileAsync, now = Date.now,
+  platform = process.platform, findLinuxImpl = findLinuxCodexProcesses } = {}) {
+  if (platform === "linux") {
+    // Linux 没有原生助手：不判断前台与输入，只用于识别与 attach，不自动重开。
+    return async () => ({
+      apps: (await findLinuxImpl(executable)).map(app => ({ ...app, finishedLaunching: true })),
+      frontmostPid: 0, inputStamp: "0:0:0:0:0", inputIdleMs: 0, now: now()
+    });
+  }
   return async () => {
     const { stdout } = await execFileImpl("/bin/ps", ["-axo", "pid=,lstart=,command="], { timeout: 2000, encoding: "utf8" });
     const apps = [];
@@ -90,34 +99,41 @@ export function createPollingSnapshot({ executable = DEFAULT_CODEX_EXECUTABLE, e
 export function createAgentDependencies(options = {}) {
   const home = options.home ?? homedir();
   const env = options.env ?? process.env;
+  // options.platform 是给页面的 RPC 平台对象，宿主操作系统单独用 hostPlatform。
+  const platform = options.hostPlatform ?? process.platform;
   const appPath = options.appPath ?? resolveCodexAppPath({ env });
-  const executable = options.executable ?? `${appPath}/Contents/MacOS/${DEFAULT_CODEX_EXECUTABLE.split("/").at(-1)}`;
-  const helperPath = options.helperPath === undefined ? resolveNativeHelperPath({
-    env, execPath: options.execPath, cwd: options.cwd, arch: options.arch
-  }) : options.helperPath;
+  const executable = options.executable ?? (platform === "linux"
+    ? resolve(env.CODEX_COMPANION_CODEX_EXECUTABLE || defaultCodexExecutable("linux"))
+    : `${appPath}/Contents/MacOS/${DEFAULT_CODEX_EXECUTABLE.split("/").at(-1)}`);
+  // 原生助手（NSWorkspace）只存在于 macOS，其它平台不自动查找。
+  const helperPath = options.helperPath !== undefined ? options.helperPath : platform !== "darwin" ? null
+    : resolveNativeHelperPath({ env, execPath: options.execPath, cwd: options.cwd, arch: options.arch });
   const nativeBridge = options.nativeBridge ?? (helperPath ? createNativeBridge({
     helperPath, appPath, execFileImpl: options.execFileImpl, spawnImpl: options.spawnImpl
   }) : null);
   return {
-    home, executable, helperPath, nativeBridge,
+    home, hostPlatform: platform, executable, helperPath, nativeBridge,
     lockPath: options.lockPath ?? defaultAgentLockPath(home),
     configStore: options.configStore ?? new CompanionConfig({
       path: options.configPath ?? env.CODEX_COMPANION_CONFIG_PATH ?? defaultCompanionConfigPath(home), execFileImpl: options.execFileImpl
     }),
     runtimeState: options.runtimeState ?? new RuntimeState({ path: options.runtimePath ?? defaultRuntimeStatePath(home) }),
-    fallbackSnapshot: options.fallbackSnapshot ?? createPollingSnapshot({ executable, execFileImpl: options.execFileImpl, now: options.now })
+    fallbackSnapshot: options.fallbackSnapshot ?? createPollingSnapshot({ executable, execFileImpl: options.execFileImpl, now: options.now, platform })
   };
 }
 
-export function getAgentStatus({ available = true, pid = process.pid, config, snapshot, attachment, lastEvent = null, nativeHelper = "missing" } = {}) {
+// Linux 不自动重开，卡片只在经应用菜单打开时加载：状态带 reopen: "menu" 供设置页改提示。
+export function getAgentStatus({ available = true, pid = process.pid, config, snapshot, attachment, lastEvent = null, nativeHelper = "missing",
+  hostPlatform = process.platform } = {}) {
+  const linux = hostPlatform === "linux";
   const apps = snapshot?.apps ?? [];
   const app = apps.find(app => app.key === attachment?.key) ?? apps[0];
   const parsed = parseCodexDebugArgs(app?.arguments);
   const attached = Boolean(available && attachment && app?.key === attachment.key
     && isCompanionDebugInstance(parsed) && parsed.debugPort === attachment.port);
-  return { available, version: AGENT_VERSION, pid: available ? pid : null, autoRelaunch: config?.agent?.autoRelaunch === true,
+  return { available, version: AGENT_VERSION, pid: available ? pid : null, autoRelaunch: !linux && config?.agent?.autoRelaunch === true,
     codex: { running: apps.length > 0, pid: app?.pid ?? null, attached, port: parsed.debugPort, proxyPort: parsed.proxyPort },
-    lastEvent, nativeHelper };
+    lastEvent, nativeHelper, ...(linux ? { reopen: "menu" } : {}) };
 }
 
 export async function readAgentStatus(options = {}) {
@@ -133,7 +149,7 @@ export async function readAgentStatus(options = {}) {
     && (options.isAlive ?? pidIsAlive)(owner.pid));
   return getAgentStatus({ available, pid: owner?.pid, config, snapshot,
     attachment: state?.codexKey ? { key: state.codexKey, port: state.port } : null,
-    lastEvent: state?.lastEvent ?? null, nativeHelper: deps.nativeBridge ? "ok" : "missing" });
+    lastEvent: state?.lastEvent ?? null, nativeHelper: deps.nativeBridge ? "ok" : "missing", hostPlatform: deps.hostPlatform });
 }
 
 export async function runAgent(options = {}) {
@@ -167,7 +183,7 @@ export async function runAgent(options = {}) {
   const platform = {
     getAgentStatus: () => getAgentStatus({ available: !stopped, pid: processRef.pid, config,
       snapshot: adapter.snapshotValue, attachment: adapter.attachment, lastEvent: adapter.state.lastEvent,
-      nativeHelper: deps.nativeBridge ? "ok" : "missing" }),
+      nativeHelper: deps.nativeBridge ? "ok" : "missing", hostPlatform: deps.hostPlatform }),
     requestCodexRestart: params => deps.nativeBridge ? controller.requestUserRestart(params)
       : Promise.resolve({ accepted: false, reason: "native-helper-missing" })
   };
@@ -274,7 +290,8 @@ export async function runAgent(options = {}) {
     await adapter.initialize(lock.startedAt);
     controller = new AgentController({ adapter, now, sleep: pause,
       lastAttemptAt: initialState?.lastAttemptAt ?? 0,
-      autoRelaunch: () => Boolean(deps.nativeBridge && config.agent.autoRelaunch) });
+      autoRelaunch: () => Boolean(deps.nativeBridge && config.agent.autoRelaunch),
+      notifyWhenManual: deps.hostPlatform === "linux" });
     for (const signal of ["SIGTERM", "SIGINT"]) processRef.once(signal, onSignal);
     watcher = await (options.watchConfig ?? watchCompanionConfig)({ config: deps.configStore,
       onChange: async next => {

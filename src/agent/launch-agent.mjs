@@ -10,6 +10,7 @@ import { createAgentAdapter } from "./adapter.mjs";
 import { createAgentDependencies, readAgentStatus, runAgent } from "./main.mjs";
 import { isCompanionDebugInstance, parseCodexDebugArgs } from "./codex-args.mjs";
 import { resolveNativeHelperPath } from "./native-bridge.mjs";
+import { installLinuxAgent, uninstallLinuxAgent } from "./linux-service.mjs";
 
 const execFileAsync = promisify(execFile);
 export const AGENT_LABEL = "com.codexcompanion.agent";
@@ -19,6 +20,19 @@ export function agentProgramArguments({ execPath = process.execPath,
   cliPath = fileURLToPath(new URL("../cli.mjs", import.meta.url)), isBun = typeof Bun !== "undefined" } = {}) {
   const compiled = isBun && !/^(?:node|nodejs|bun)(?:\.exe)?$/.test(basename(execPath));
   return compiled ? [resolve(execPath), "agent"] : [resolve(execPath), resolve(cliPath), "agent"];
+}
+
+// Linux 应用菜单入口执行的命令：与常驻 agent 同一程序，子命令换成 open-codex。
+export function launcherProgramArguments(options = {}) {
+  return [...agentProgramArguments(options).slice(0, -1), "open-codex"];
+}
+
+// 安装时显式指定的目标应用与配置路径要带给 agent 和菜单入口，否则它们会回到默认位置。
+function linuxEnvironment(options, env) {
+  const environment = {};
+  if (env.CODEX_COMPANION_CODEX_EXECUTABLE) environment.CODEX_COMPANION_CODEX_EXECUTABLE = resolve(env.CODEX_COMPANION_CODEX_EXECUTABLE);
+  if (options.configPath ?? env.CODEX_COMPANION_CONFIG_PATH) environment.CODEX_COMPANION_CONFIG_PATH = resolve(options.configPath ?? env.CODEX_COMPANION_CONFIG_PATH);
+  return environment;
 }
 
 function location({ home = homedir(), plistDir = join(home, "Library", "LaunchAgents"), label = AGENT_LABEL,
@@ -56,6 +70,15 @@ async function bootoutAgent(options, { uid, label }) {
 }
 
 export async function installAgent(options = {}) {
+  if ((options.hostPlatform ?? process.platform) === "linux") {
+    const env = options.env ?? process.env;
+    const environment = linuxEnvironment(options, env);
+    const launcher = launcherProgramArguments(options);
+    return installLinuxAgent({ home: options.home, env: options.env, execFileImpl: options.execFileImpl,
+      programArguments: agentProgramArguments(options), environment,
+      launcherArguments: Object.keys(environment).length
+        ? ["/usr/bin/env", ...Object.entries(environment).map(([key, value]) => `${key}=${value}`), ...launcher] : launcher });
+  }
   const { plistDir, label, uid, logDir, plistPath } = location(options);
   const env = options.env ?? process.env;
   const helperPath = options.helperPath === undefined ? resolveNativeHelperPath({
@@ -81,12 +104,18 @@ export async function installAgent(options = {}) {
 }
 
 export async function uninstallAgent(options = {}) {
-  const { label, uid, plistPath } = location(options);
+  const linux = (options.hostPlatform ?? process.platform) === "linux";
   const deps = createAgentDependencies(options);
-  // bootout 会触发 agent 清空 attachment，因此提前保留端口，并在卸载前重新核对实例。
+  // 停止服务会触发 agent 清空 attachment，因此提前保留端口，并在卸载前重新核对实例。
   const state = await deps.runtimeState.load();
-  await bootoutAgent(options, { uid, label });
-  await unlink(plistPath).catch(error => { if (error.code !== "ENOENT") throw error; });
+  let removed;
+  if (linux) removed = await uninstallLinuxAgent({ home: options.home, env: options.env, execFileImpl: options.execFileImpl });
+  else {
+    const { label, uid, plistPath } = location(options);
+    await bootoutAgent(options, { uid, label });
+    await unlink(plistPath).catch(error => { if (error.code !== "ENOENT") throw error; });
+    removed = { label };
+  }
   let unmounted = false;
   let unmountError;
   if (state?.port) {
@@ -103,7 +132,7 @@ export async function uninstallAgent(options = {}) {
     } catch (error) { unmountError = String(error.message ?? error); }
     finally { injector?.stop(); }
   }
-  return { uninstalled: true, label, unmounted, ...(unmountError ? { unmountError } : {}) };
+  return { uninstalled: true, ...removed, unmounted, ...(unmountError ? { unmountError } : {}) };
 }
 
 export async function restartCodex(options = {}) {

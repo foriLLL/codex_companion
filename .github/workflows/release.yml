@@ -130,16 +130,6 @@ jobs:
           xcrun stapler validate "$APP"
           spctl --assess --type execute --verbose=2 "$APP"
 
-      - name: Prepare signer-pinned installer
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          sed "s/__APPLE_TEAM_ID__/$APPLE_TEAM_ID/g" packaging/install.sh > dist/install.sh
-          chmod 0755 dist/install.sh
-          bash -n dist/install.sh
-          grep -F "EXPECTED_TEAM_ID=\"$APPLE_TEAM_ID\"" dist/install.sh
-
       - name: Package tarball and checksum
         working-directory: dist
         run: |
@@ -161,7 +151,6 @@ jobs:
           files: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
-            dist/install.sh
 
       - name: Delete temporary keychain
         if: always() && startsWith(github.ref, 'refs/tags/')
@@ -169,3 +158,114 @@ jobs:
           if test -n "${KEYCHAIN_PATH:-}" && test -f "$KEYCHAIN_PATH"; then
             security delete-keychain "$KEYCHAIN_PATH"
           fi
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PACKAGE_VERSION="$(node -p 'require("./package.json").version')"
+          test "${GITHUB_REF_NAME#v}" = "$PACKAGE_VERSION" || {
+            echo "tag $GITHUB_REF_NAME 与 package.json $PACKAGE_VERSION 不一致" >&2
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build binaries
+        run: |
+          node scripts/build-linux.mjs --target linux-x64 --out dist
+          node scripts/build-linux.mjs --target linux-arm64 --out dist
+
+      - name: Smoke test x64 binary
+        run: |
+          dist/linux-x64/codex-companion/codex-companion --help | grep -F "open-codex"
+          dist/linux-x64/codex-companion/codex-companion cards list | node -e 'JSON.parse(require("fs").readFileSync(0, "utf8"))'
+
+      # 固定属主与排序，归档内只有普通文件和目录，满足 install.sh 的条目校验。
+      - name: Package tarballs and checksums
+        working-directory: dist
+        run: |
+          for target in linux-x64 linux-arm64; do
+            tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -czf "codex-companion-$target.tar.gz" -C "$target" codex-companion
+            sha256sum "codex-companion-$target.tar.gz" > "codex-companion-$target.tar.gz.sha256"
+          done
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-companion-linux
+          path: |
+            dist/codex-companion-linux-*.tar.gz
+            dist/codex-companion-linux-*.tar.gz.sha256
+
+      - name: Attach Linux binaries to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.4.1
+        with:
+          files: |
+            dist/codex-companion-linux-*.tar.gz
+            dist/codex-companion-linux-*.tar.gz.sha256
+
+  # 所有平台都构建成功后才发布 install.sh：脚本写入 Team ID、tag 与 Linux 归档的 SHA256。
+  publish-installer:
+    name: Publish installer
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-companion-linux
+          path: dist
+
+      - name: Prepare pinned installer
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_TEAM_ID" || {
+            echo "缺少 release secret: APPLE_TEAM_ID；拒绝发布未固定签名团队的安装脚本。" >&2
+            exit 1
+          }
+          node scripts/prepare-installer.mjs --team-id "$APPLE_TEAM_ID" --tag "$GITHUB_REF_NAME" \
+            --linux-x64 dist/codex-companion-linux-x64.tar.gz \
+            --linux-arm64 dist/codex-companion-linux-arm64.tar.gz \
+            --out dist/install.sh
+          bash -n dist/install.sh
+          shellcheck dist/install.sh
+          grep -F "EXPECTED_TEAM_ID=\"$APPLE_TEAM_ID\"" dist/install.sh
+          grep -F "RELEASE_TAG=\"$GITHUB_REF_NAME\"" dist/install.sh
+
+      - name: Attach installer to release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.4.1
+        with:
+          files: dist/install.sh

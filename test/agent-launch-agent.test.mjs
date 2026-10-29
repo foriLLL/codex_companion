@@ -10,6 +10,9 @@ import { defaultAgentLockPath } from "../src/agent/main.mjs";
 import { app, clock, configStore, nativeBridge, ours, snapshot, stateStore, temporary } from "./helpers/agent.mjs";
 import { assertMode } from "./helpers/permissions.mjs";
 
+// 本文件测试 launchd 分支；Linux 的 systemd 分支见 agent-linux.test.mjs。
+const installMac = options => installAgent({ hostPlatform: "darwin", ...options });
+const uninstallMac = options => uninstallAgent({ hostPlatform: "darwin", ...options });
 const validatePlist = promisify(execFile);
 // LaunchAgent 只存在于 macOS；plist 校验依赖系统自带的 plutil。
 const macOnly = { skip: process.platform !== "darwin" && "LaunchAgent 仅适用于 macOS" };
@@ -27,7 +30,7 @@ test("install 在临时目录生成有效 plist，绝对助手路径/PATH，无�
   const calls = [];
   const helper = join(home, "helper");
   await writeFile(helper, "fake native helper");
-  const result = await installAgent({ home, plistDir: join(home, "LaunchAgents & test"), uid: 501, label: "local.test.agent",
+  const result = await installMac({ home, plistDir: join(home, "LaunchAgents & test"), uid: 501, label: "local.test.agent",
     execPath: "/fake/node", cliPath: "/repo/CLI & test.mjs", isBun: false, cwd: home,
     env: { CODEX_COMPANION_NATIVE_HELPER: "helper", CODEX_COMPANION_CODEX_APP: "/test/Dummy.app", HTTP_PROXY: "secret", ALL_PROXY: "secret" },
     configPath: join(home, "config.json"), execFileImpl: async (...args) => { calls.push(args); return { stdout: "" }; }
@@ -54,7 +57,7 @@ test("install 在临时目录生成有效 plist，绝对助手路径/PATH，无�
 
 test("install Bun 编译产物不携带脚本路径，缺少助手也可安装", macOnly, async t => {
   const home = await temporary(t);
-  const result = await installAgent({ home, helperPath: null, env: {}, execPath: "/test/companion", isBun: true, uid: 505,
+  const result = await installMac({ home, helperPath: null, env: {}, execPath: "/test/companion", isBun: true, uid: 505,
     execFileImpl: async () => ({ stdout: "" }) });
   const { stdout } = await validatePlist("/usr/bin/plutil", ["-convert", "json", "-o", "-", result.plistPath]);
   const plist = JSON.parse(stdout);
@@ -70,7 +73,7 @@ test("uninstall 先 bootout 再删除 plist，并验证同一实例端口后执�
   const target = ours();
   const runtimeState = stateStore({ port: 51234, codexPid: target.pid, codexKey: target.key, agentPid: 700 });
   const calls = [];
-  const result = await uninstallAgent({ home, label: "local.test.agent", uid: 501, helperPath: null,
+  const result = await uninstallMac({ home, label: "local.test.agent", uid: 501, helperPath: null,
     runtimeState, nativeBridge: nativeBridge(snapshot([target])),
     execFileImpl: async (...args) => { await access(plistPath); calls.push(args); runtimeState.value = null; },
     injectorFactory: port => { assert.equal(port, 51234); return { injectOnce: async action => calls.push([action]), stop: () => calls.push(["stop"]) }; }
@@ -87,9 +90,9 @@ test("uninstall 过期端口不连接；未注册可幂等删除，bootout 权�
   await writeFile(plistPath, "test");
   const options = { home, helperPath: null, uid: 501, runtimeState: stateStore({ port: 51234, codexKey: "stale" }),
     nativeBridge: nativeBridge(snapshot([ours()])), injectorFactory: () => { throw new Error("must not connect"); } };
-  await assert.rejects(uninstallAgent({ ...options, execFileImpl: async () => { throw Object.assign(new Error("denied"), { code: 1 }); } }), /denied/);
+  await assert.rejects(uninstallMac({ ...options, execFileImpl: async () => { throw Object.assign(new Error("denied"), { code: 1 }); } }), /denied/);
   assert.equal(await readFile(plistPath, "utf8"), "test");
-  const result = await uninstallAgent({ ...options, execFileImpl: async () => { throw Object.assign(new Error("not loaded"), { code: 3 }); } });
+  const result = await uninstallMac({ ...options, execFileImpl: async () => { throw Object.assign(new Error("not loaded"), { code: 3 }); } });
   assert.equal(result.unmounted, false);
   await assert.rejects(access(plistPath), { code: "ENOENT" });
 });
@@ -196,9 +199,9 @@ test("install 支持首次安装和重装：bootout 完成后才替换 plist，�
       }
     }
   };
-  assert.equal((await installAgent({ ...options, execPath: expectedExecutable })).installed, true);
+  assert.equal((await installMac({ ...options, execPath: expectedExecutable })).installed, true);
   expectedExecutable = "/fake/companion-v2";
-  assert.equal((await installAgent({ ...options, execPath: expectedExecutable })).installed, true);
+  assert.equal((await installMac({ ...options, execPath: expectedExecutable })).installed, true);
   assert.deepEqual(calls, ["bootout", "bootstrap", "bootout", "bootstrap"]);
   assert.equal(loaded, true);
 });
@@ -212,13 +215,13 @@ test("install 仅容忍未加载的 bootout 错误，其他错误不覆盖旧 pl
     await writeFile(plistPath, "previous plist");
     const error = Object.assign(new Error("bootout failed"), { code });
     const calls = [];
-    await assert.rejects(installAgent({ ...options, execFileImpl: async (_command, args) => { calls.push(args[0]); throw error; } }), caught => caught === error);
+    await assert.rejects(installMac({ ...options, execFileImpl: async (_command, args) => { calls.push(args[0]); throw error; } }), caught => caught === error);
     assert.deepEqual(calls, ["bootout"]);
     assert.equal(await readFile(plistPath, "utf8"), "previous plist");
   }
   for (const code of [3, "3", "ESRCH"]) {
     const calls = [];
-    assert.equal((await installAgent({ ...options, execFileImpl: async (_command, args) => {
+    assert.equal((await installMac({ ...options, execFileImpl: async (_command, args) => {
       calls.push(args[0]);
       if (args[0] === "bootout") throw Object.assign(new Error("not loaded"), { code });
     } })).installed, true);
@@ -230,7 +233,7 @@ test("install 不吞掉 bootstrap 错误，也不按错误码把失败当成已�
   const home = await temporary(t);
   const error = Object.assign(new Error("bootstrap failed"), { code: 37 });
   const calls = [];
-  await assert.rejects(installAgent({ home, helperPath: null, env: {}, isBun: true, execPath: "/fake/companion", uid: 501,
+  await assert.rejects(installMac({ home, helperPath: null, env: {}, isBun: true, execPath: "/fake/companion", uid: 501,
     execFileImpl: async (_command, args) => {
       calls.push(args[0]);
       if (args[0] === "bootstrap") { await access(args[2]); throw error; }

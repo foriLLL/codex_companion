@@ -21,6 +21,20 @@ export async function notifyMacos(title, message, { execFileImpl = execFileAsync
 }
 
 /**
+ * 按平台发桌面通知：macOS 用 osascript，Linux 用 notify-send（libnotify，未安装时静默失败）。
+ */
+export async function notifyDesktop(title, message, { platform = process.platform, execFileImpl = execFileAsync } = {}) {
+  if (platform === "darwin") return notifyMacos(title, message, { execFileImpl });
+  if (platform !== "linux") return false;
+  try {
+    await execFileImpl("notify-send", ["--app-name=Codex Companion", "--", String(title), String(message)]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 单次评估 Codex 运行状态，返回应采取的动作，不产生副作用（便于测试）。
  *   - "healthy"：Codex 在跑且带 CDP flag；
  *   - "needs-restart"：Codex 在跑但无 flag（用户从 Dock 点了官方 ChatGPT）；

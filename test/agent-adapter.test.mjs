@@ -6,7 +6,7 @@ import { clock, deferred, flush, logger, nativeBridge, stateStore } from "./help
 
 function adapter(options = {}) {
   return createAgentAdapter({ nativeBridge: nativeBridge(), initialConfig: normalizeCompanionConfigV2({}),
-    runtimeState: stateStore(), pid: 7, logger, notifyImpl: async () => {}, ...options });
+    runtimeState: stateStore(), pid: 7, logger, notifyImpl: async () => {}, hostPlatform: "darwin", ...options });
 }
 
 test("adapter launch 使用随机 loopback 端口，正确覆盖/删除全部代理环境键", async () => {

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "在 Codex 桌面端（macOS）注入红果短剧、Emby、小游戏、代理状态与任务看板卡片",
+  "description": "在 Codex 桌面端（macOS；Linux 预览）注入红果短剧、Emby、小游戏、代理状态与任务看板卡片",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/foriLLL/codex_companion.git"
@@ -16,7 +16,8 @@
   "keywords": [
     "codex",
     "emby",
-    "macos"
+    "macos",
+    "linux"
   ],
   "packageManager": "npm@11.6.0",
   "scripts": {
@@ -30,6 +31,7 @@
     "smoke:placement": "node scripts/smoke-placement.mjs",
     "probe:emby": "node scripts/probe-emby.mjs",
     "build:app": "node scripts/build-app.mjs",
+    "build:linux": "node scripts/build-linux.mjs",
     "test": "node --test",
     "generate:renderer": "node scripts/generate-renderer.mjs",
     "prestart:legacy": "npm run generate:renderer",

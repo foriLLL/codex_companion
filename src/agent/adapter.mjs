@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { buildCodexLaunchArgs, DEFAULT_CODEX_EXECUTABLE, reserveLoopbackPort } from "../launcher.mjs";
-import { notifyMacos } from "../daemon.mjs";
+import { notifyDesktop } from "../daemon.mjs";
 import { RuntimeState } from "../runtime-state.mjs";
 import { waitForCodexTargets } from "../targets.mjs";
 import { createCodexSession } from "./session.mjs";
@@ -10,6 +10,10 @@ export const AGENT_NOTIFICATIONS = Object.freeze({
   "needs-restart": "Companion 未加载：退出并重新打开 Codex 即可显示卡片。",
   skipped: "本次未自动加载 Companion，下次打开 Codex 时生效。",
   "relaunch-failed": "Codex 自动重开失败，请手动打开 Codex。"
+});
+// Linux 不自动重开：卡片只在经应用菜单（Companion 覆盖的启动入口）打开时加载。
+const LINUX_NOTIFICATIONS = Object.freeze({
+  "needs-restart": "Companion 未加载：退出 ChatGPT 后从应用菜单重新打开即可显示卡片（终端直接运行 chatgpt 不会加载）。"
 });
 
 // 即使注入的等待实现尚未响应取消，也不允许过期结果启动新的会话。
@@ -25,10 +29,10 @@ function abortable(operation, signal) {
 export function createAgentAdapter({
   nativeBridge = null, fallbackSnapshot, configStore, initialConfig, initialState = {},
   runtimeState = new RuntimeState(), executable = DEFAULT_CODEX_EXECUTABLE, platform,
-  logger = console, now = Date.now, pid = process.pid,
+  logger = console, now = Date.now, pid = process.pid, hostPlatform = process.platform,
   reservePort = reserveLoopbackPort, sessionFactory = createCodexSession,
   waitForTargets = waitForCodexTargets, execFileImpl,
-  notifyImpl = (title, message) => notifyMacos(title, message, { execFileImpl }),
+  notifyImpl = (title, message) => notifyDesktop(title, message, { platform: hostPlatform, execFileImpl }),
   sleepImpl = (ms, signal) => sleep(ms, undefined, { signal }),
   retryMs = 300, maxRetryMs = 5000
 } = {}) {
@@ -139,7 +143,7 @@ export function createAgentAdapter({
       logger.info?.(`[codex-companion] ${event} ${JSON.stringify(details)}`);
     },
     async notify(kind) {
-      const message = AGENT_NOTIFICATIONS[kind];
+      const message = (hostPlatform === "linux" ? LINUX_NOTIFICATIONS[kind] : null) ?? AGENT_NOTIFICATIONS[kind];
       const previous = notifications.get(kind);
       if (closed || !message || (previous !== undefined && now() - previous < 600_000)) return;
       notifications.set(kind, now());
