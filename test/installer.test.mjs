@@ -6,7 +6,8 @@ import test from "node:test";
 import { renderInstaller } from "../scripts/prepare-installer.mjs";
 
 const installerPath = fileURLToPath(new URL("../packaging/install.sh", import.meta.url));
-const installer = readFileSync(installerPath, "utf8");
+// Windows 检出可能是 CRLF，按 LF 统一后再按行切分。
+const installer = readFileSync(installerPath, "utf8").replace(/\r\n/g, "\n");
 // 按函数切出各平台流程，分别断言。
 const section = (name) => {
   const start = installer.indexOf(`\n${name}() {`);
