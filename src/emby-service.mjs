@@ -799,7 +799,6 @@ export class EmbyService {
       const session = {
         playbackId,
         targetId,
-        mediaTransport,
         itemId,
         userId: config.userId,
         mediaSourceId,
@@ -975,9 +974,7 @@ export class EmbyService {
       }
       if (transcodingSource) {
         result.hlsUrl = client.hlsUrl(itemId, session);
-        const hlsProxySession = mediaTransport === "rpc"
-          ? null
-          : await this.#registerMediaProxySession(client, result.hlsUrl);
+        const hlsProxySession = await this.#registerMediaProxySession(client, result.hlsUrl);
         if (hlsProxySession) {
           session.hlsProxySession = hlsProxySession;
           result.hlsProxyUrl = hlsProxySession.urlFor(result.hlsUrl);
@@ -1702,13 +1699,8 @@ export class EmbyService {
     const openRangeStream = !preferChunkedRange && typeof session.openRangeStream === "function"
       ? (options) => session.openRangeStream({ ...options, refreshPositionTicks: session.positionTicks })
       : null;
-    // MCP Apps 沙箱禁止 HTTP loopback。插件按需拉取小批次并直接写入 MSE，
-    // 不向页面暴露代理地址，也不为一次播放持续堆积未消费的媒体数据。
-    const limits = session.mediaTransport === "rpc"
-      ? { maxBatchBytes: 128 * 1024, maxQueueBytes: 8 * 1024 * 1024, resumeQueueBytes: 4 * 1024 * 1024 }
-      : {};
     if (session.streamMode === "direct-mp4") {
-      return this.directSessionFactory({ readRange, openRangeStream, ...limits });
+      return this.directSessionFactory({ readRange, openRangeStream });
     }
     return this.ffmpegSessionFactory({
       readRange,
@@ -1716,8 +1708,7 @@ export class EmbyService {
       mediaSource: session.mediaSource,
       durationSeconds: session.durationSeconds,
       subtitleTrack: subtitle?.mode === "burn-in" ? subtitle : null,
-      subtitleData: subtitle?.mode === "burn-in" ? session.subtitleData : null,
-      ...limits
+      subtitleData: subtitle?.mode === "burn-in" ? session.subtitleData : null
     });
   }
 

@@ -60,7 +60,6 @@ export function mount(ctx) {
   const subtitleObjectUrls = new Set();
   let subtitlePreference = null;
   let subtitleSwitching = false;
-  let cardVisible = true;
   // 按 seriesId 记住用户选中的源（sourceKey），会话级，退出 Codex 不保留（与字幕偏好一致）。
   const sourcePreferences = new Map();
   let episodeContextRequestId = null;
@@ -1553,7 +1552,7 @@ export function mount(ctx) {
     }
     delete playback.restorePlaybackState;
     playback.mediaReady = true;
-    if (!restore?.paused && (ctx.environment?.kind !== "plugin" || cardVisible)) video.play().catch(() => {});
+    if (!restore?.paused) video.play().catch(() => {});
     if (Object.prototype.hasOwnProperty.call(playback, "pendingSubtitleSelection")) {
       const pendingSubtitleSelection = playback.pendingSubtitleSelection;
       delete playback.pendingSubtitleSelection;
@@ -2744,9 +2743,7 @@ export function mount(ctx) {
     updateSettings() {},
     visibilityChanged(state) {
       if (isDisposed()) return;
-      cardVisible = state?.visible === true;
       if (state?.visible) refreshEmbyImages();
-      else if (ctx.environment?.kind === "plugin") currentEmbyVideo()?.pause();
     },
     dispose: scope.dispose,
   };

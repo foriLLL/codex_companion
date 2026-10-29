@@ -1,15 +1,20 @@
 import { execFile, spawn } from "node:child_process";
 import net from "node:net";
 import { promisify } from "node:util";
+import { findLinuxCodexProcesses } from "./platform/processes.mjs";
 
 const execFileAsync = promisify(execFile);
-export const DEFAULT_CODEX_EXECUTABLE = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
 
-// 由 Companion 识别、退出并带参数重启 Codex 桌面端目前只在 macOS 上实现：
-// 其它平台的安装位置与进程模型（如 Windows 的打包应用）不同，相关功能降级为不可用，
-// 插件的卡片与媒体能力不受影响。
-export function codexLaunchSupported(platform = process.platform) {
-  return platform === "darwin";
+// Codex 桌面端主程序：macOS 为 ChatGPT.app，Linux 为官方 deb/rpm 的安装位置
+// （/usr/bin/chatgpt 只是 exec 到这里的脚本）。
+export function defaultCodexExecutable(platform = process.platform) {
+  return platform === "linux" ? "/usr/lib/chatgpt/ChatGPT" : "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+}
+export const DEFAULT_CODEX_EXECUTABLE = defaultCodexExecutable();
+
+// 能从命令行识别 Codex 进程及其启动参数的平台。Windows 的打包应用进程模型不同，降级为不可用。
+export function codexProcessSupported(platform = process.platform) {
+  return platform === "darwin" || platform === "linux";
 }
 
 export async function reserveLoopbackPort() {
@@ -60,8 +65,15 @@ export function parseCodexProxyPort(command) {
  * execFileImpl 可注入以便测试。
  */
 export async function inspectRunningCodex(executable = DEFAULT_CODEX_EXECUTABLE, {
-  execFileImpl = execFileAsync
+  execFileImpl = execFileAsync, platform = process.platform, findLinuxImpl = findLinuxCodexProcesses
 } = {}) {
+  if (platform === "linux") {
+    // Chromium 子进程与主进程同一可执行文件，靠 /proc 的 cmdline 排除 --type= 子进程。
+    return (await findLinuxImpl(executable)).map(({ pid, command }) => ({
+      pid, command, hasCdpFlag: command.includes(`${CDP_PORT_FLAG}=`) || command.includes(`${CDP_PORT_FLAG} `),
+      cdpPort: parseCdpPort(command), proxyPort: parseCodexProxyPort(command)
+    }));
+  }
   const { stdout } = await execFileImpl("/bin/ps", ["ax", "-o", "pid=,command="]);
   const matches = [];
 
@@ -97,7 +109,7 @@ export async function detectCodexProxy({
   inspectImpl = inspectRunningCodex,
   platform = process.platform
 } = {}) {
-  if (!codexLaunchSupported(platform)) return { supported: false, running: null, proxyPort: null };
+  if (!codexProcessSupported(platform)) return { supported: false, running: null, proxyPort: null };
   const processes = await inspectImpl(executable);
   const codex = processes.find((entry) => cdpPort !== null && entry.cdpPort === cdpPort)
     ?? processes.find((entry) => entry.hasCdpFlag)

@@ -9,7 +9,8 @@ const RESTART_REFUSALS = {
   "foreign-debug": "当前 Codex 由其他工具以调试模式启动",
   unknown: "无法确认当前 Codex 进程",
   stopped: "后台服务正在停止",
-  error: "后台服务出错"
+  error: "后台服务出错",
+  "native-helper-missing": "缺少原生助手，请手动退出并重新打开 Codex"
 };
 
 // 图标沿用 Codex 顶栏的 16px 线框规格，颜色全部继承 currentColor。
@@ -31,6 +32,8 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
   let busy = false;
   let destroyed = false;
   let confirming = false;
+  // Linux 由应用菜单入口加载卡片，不能自动重开或重启 Codex。
+  let menuReopen = false;
   let busyFocus = null;
   const listeners = [];
   const controls = [];
@@ -253,6 +256,10 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
   });
   const restartButton = control(button("立即重启 Codex", () => {
     if (busy || !config || destroyed) return;
+    if (menuReopen) {
+      showMessage("请退出 ChatGPT 后从应用菜单重新打开，新的代理设置即可生效");
+      return;
+    }
     confirming = true;
     confirmation.hidden = false;
     cancelRestart.focus();
@@ -433,6 +440,8 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
   }
   function renderStatus(agent) {
     statusDetails.replaceChildren();
+    menuReopen = agent?.reopen === "menu";
+    autoSection.parentElement.hidden = menuReopen;
     if (agent?.available !== true) {
       statusText.textContent = "后台服务未运行";
       statusRow.dataset.state = "bad";
@@ -446,7 +455,7 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
       ["Codex", codex.attached ? "已连接" : codex.running ? "等待连接" : "未运行"],
       ["调试端口", codex.port],
       ["代理端口", codex.proxyPort],
-      ["原生助手", agent.nativeHelper === "ok" ? "正常" : "缺失"],
+      ["原生助手", menuReopen ? null : agent.nativeHelper === "ok" ? "正常" : "缺失"],
       ["最近事件", agent.lastEvent ? `${agent.lastEvent.event} · ${new Date(agent.lastEvent.at).toLocaleTimeString()}` : "无"]
     ];
     for (const [label, value] of details) {

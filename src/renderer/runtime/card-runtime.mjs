@@ -42,13 +42,9 @@ export function createCardRuntime({
   let disposed = false;
   let disposal;
   let visibility = { visible: false, reason: "initial", placement: initialConfig.placement };
-  // 独立插件页面可以逐卡切换；旧注入入口未设置覆盖值时保持原有行为。
-  const cardVisibility = new Map();
   let config = normalizeRuntimeConfig(initialConfig, manifests);
   // 会话列表属于宿主原生界面，只由平台创建；没有声明 threads 能力的卡片拿不到它。
   let threads = null;
-
-  const effectiveVisibility = (id) => ({ ...visibility, visible: visibility.visible && cardVisibility.get(id) !== false });
 
   function report(error, details = {}) {
     failures.push({ message: error?.message || String(error), code: error?.code, ...details });
@@ -123,7 +119,7 @@ export function createCardRuntime({
     record.lifecycle = createCardLifecycle({
       createContext({ signal, effects, settings }) {
         record.effects = effects;
-        effects.setSuspended?.(manifest.lifecycle.hidden === "suspend" && !effectiveVisibility(manifest.id).visible);
+        effects.setSuspended?.(manifest.lifecycle.hidden === "suspend" && !visibility.visible);
         const generation = allocateGeneration();
         record.generation = generation;
         const rpc = rpcClient.scoped(manifest.id, generation, signal);
@@ -131,7 +127,7 @@ export function createCardRuntime({
           root: record.slot.root, manifest, settings,
           storage: makeStorage(manifest, signal), rpc, effects,
           reportError: (error) => report(error, { cardId: manifest.id, phase: "card" }),
-          isVisible: () => effectiveVisibility(manifest.id).visible,
+          isVisible: () => visibility.visible,
           ...(manifest.capabilities.includes("threads") ? { threads } : {}),
           // 只有平台负责可见性；业务可以申请展开，不能操作原生 DOM。
           requestOpen: () => adapter?.setOpen(true)
@@ -151,29 +147,18 @@ export function createCardRuntime({
       }
     });
     records.set(manifest.id, record);
-    record.lifecycle.visibilityChanged(effectiveVisibility(manifest.id));
-    if (manifest.lifecycle.start === "immediate" || effectiveVisibility(manifest.id).visible) start(record);
+    record.lifecycle.visibilityChanged(visibility);
+    if (manifest.lifecycle.start === "immediate" || visibility.visible) start(record);
     return record;
   }
 
   function visibilityChanged(state) {
     visibility = typeof state === "boolean" ? { visible: state, placement: config.placement } : state;
     for (const record of records.values()) {
-      const effective = effectiveVisibility(record.manifest.id);
-      record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !effective.visible);
-      if (effective.visible) start(record);
-      record.lifecycle.visibilityChanged(effective).catch((error) => report(error, { cardId: record.manifest.id }));
+      record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !visibility.visible);
+      if (visibility.visible) start(record);
+      record.lifecycle.visibilityChanged(visibility).catch((error) => report(error, { cardId: record.manifest.id }));
     }
-  }
-
-  function setCardVisibility(id, visible) {
-    cardVisibility.set(id, Boolean(visible));
-    const record = records.get(id);
-    if (!record || disposed) return;
-    const effective = effectiveVisibility(id);
-    record.effects?.setSuspended?.(record.manifest.lifecycle.hidden === "suspend" && !effective.visible);
-    if (effective.visible) start(record);
-    return record.lifecycle.visibilityChanged(effective).catch((error) => report(error, { cardId: id }));
   }
 
   if (threadsFactory && manifests.some((manifest) => manifest.capabilities.includes("threads"))) {
@@ -250,7 +235,7 @@ export function createCardRuntime({
 
   void applyConfig(initialConfig);
   return {
-    artifactHash, applyConfig, receiveRpc: rpcClient.receiveRpc, retry, dispose, setCardVisibility,
+    artifactHash, applyConfig, receiveRpc: rpcClient.receiveRpc, retry, dispose,
     getCardApi: (id) => records.get(id)?.handle?.api,
     isMounted: () => !disposed,
     isPlaced: () => adapter.isPlaced(),

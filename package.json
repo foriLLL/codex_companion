@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "在 Codex 官方插件页面中使用红果短剧、Emby、小游戏与常用工具（macOS / Windows / Linux）",
+  "description": "在 Codex 桌面端（macOS；Linux 预览）注入红果短剧、Emby、小游戏、代理状态与任务看板卡片",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/foriLLL/codex_companion.git"
@@ -15,17 +15,14 @@
   },
   "keywords": [
     "codex",
-    "codex-plugin",
-    "mcp",
-    "mcp-apps",
     "emby",
     "macos",
-    "windows",
     "linux"
   ],
   "packageManager": "npm@11.6.0",
   "scripts": {
-    "start": "node scripts/install-plugin.mjs",
+    "start": "node src/cli.mjs agent install",
+    "prestart": "npm run generate:renderer",
     "start:legacy": "node src/cli.mjs launch",
     "attach": "node src/cli.mjs attach",
     "inject": "node src/cli.mjs inject",
@@ -34,12 +31,7 @@
     "smoke:placement": "node scripts/smoke-placement.mjs",
     "probe:emby": "node scripts/probe-emby.mjs",
     "build:app": "node scripts/build-app.mjs",
-    "build:plugin": "node scripts/build-plugin.mjs",
-    "plugin:install": "node scripts/install-plugin.mjs",
-    "plugin:probe": "node scripts/probe-plugin.mjs",
-    "plugin:probe:host": "node scripts/probe-plugin-host.mjs",
-    "smoke:plugin": "node scripts/smoke-plugin.mjs",
-    "smoke:plugin:backend": "node scripts/smoke-plugin-backend.mjs",
+    "build:linux": "node scripts/build-linux.mjs",
     "test": "node --test",
     "generate:renderer": "node scripts/generate-renderer.mjs",
     "prestart:legacy": "npm run generate:renderer",
@@ -55,12 +47,9 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "1.7.5",
-    "@modelcontextprotocol/sdk": "1.32.1",
     "hls.js": "1.6.16",
     "mp4box": "2.4.1",
-    "undici": "7.28.0",
-    "zod": "4.3.6"
+    "undici": "7.28.0"
   },
   "devDependencies": {
     "bun": "1.3.14"

@@ -11,7 +11,7 @@ function fakePs(lines) {
 
 test("inspectRunningCodex 识别带 CDP flag 的进程", async () => {
   const exe = DEFAULT_CODEX_EXECUTABLE;
-  const processes = await inspectRunningCodex(exe, {
+  const processes = await inspectRunningCodex(exe, { platform: "darwin",
     execFileImpl: fakePs([
       `  100 ${exe} --remote-debugging-address=127.0.0.1 --remote-debugging-port=51234`,
       `  200 ${exe}`,
@@ -32,14 +32,14 @@ test("inspectRunningCodex 识别带 CDP flag 的进程", async () => {
 
 test("findRunningCodex 保持只返回 pid 数组的旧行为", async () => {
   const exe = DEFAULT_CODEX_EXECUTABLE;
-  const pids = await findRunningCodex(exe, {
+  const pids = await findRunningCodex(exe, { platform: "darwin",
     execFileImpl: fakePs([`  100 ${exe}`, `  200 ${exe} --remote-debugging-port=6000`])
   });
   assert.deepEqual(pids, [100, 200]);
 });
 
 test("无匹配进程返回空", async () => {
-  const processes = await inspectRunningCodex(DEFAULT_CODEX_EXECUTABLE, {
+  const processes = await inspectRunningCodex(DEFAULT_CODEX_EXECUTABLE, { platform: "darwin",
     execFileImpl: fakePs(["  300 /usr/bin/other", ""])
   });
   assert.deepEqual(processes, []);
@@ -92,7 +92,7 @@ test("只从 Companion 写入的 loopback --proxy-server 读出代理端口", ()
 
 test("detectCodexProxy 优先选择本 Companion CDP 端口对应的 Codex", async () => {
   const exe = DEFAULT_CODEX_EXECUTABLE;
-  const inspectImpl = (executable) => inspectRunningCodex(executable, {
+  const inspectImpl = (executable) => inspectRunningCodex(executable, { platform: "darwin",
     execFileImpl: fakePs([
       `  100 ${exe} --remote-debugging-port=5000`,
       `  200 ${exe} --remote-debugging-port=6000 --proxy-server=http://127.0.0.1:7890`
@@ -101,8 +101,20 @@ test("detectCodexProxy 优先选择本 Companion CDP 端口对应的 Codex", asy
   assert.deepEqual(await detectCodexProxy({ executable: exe, cdpPort: 6000, inspectImpl, platform: "darwin" }), { running: true, proxyPort: 7890 });
   assert.deepEqual(await detectCodexProxy({ executable: exe, cdpPort: 5000, inspectImpl, platform: "darwin" }), { running: true, proxyPort: null });
   assert.deepEqual(await detectCodexProxy({ executable: exe, inspectImpl: async () => [], platform: "darwin" }), { running: false, proxyPort: null });
-  for (const platform of ["linux", "win32"]) {
-    assert.deepEqual(await detectCodexProxy({ executable: exe, platform, inspectImpl: async () => { throw new Error("不应检查进程"); } }),
-      { supported: false, running: null, proxyPort: null });
-  }
+  assert.deepEqual(await detectCodexProxy({ executable: exe, platform: "win32", inspectImpl: async () => { throw new Error("不应检查进程"); } }),
+    { supported: false, running: null, proxyPort: null });
+});
+
+test("Linux 用 /proc 找到的主进程命令行判断 CDP 与代理端口", async () => {
+  const exe = "/usr/lib/chatgpt/ChatGPT";
+  const findLinuxImpl = async (executable) => {
+    assert.equal(executable, exe);
+    const args = ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=4321", "--proxy-server=http://127.0.0.1:7890", "codex://open"];
+    return [{ pid: 10, key: "10:1", launchedAt: 1, command: [exe, ...args].join(" "), arguments: args }];
+  };
+  const processes = await inspectRunningCodex(exe, { platform: "linux", findLinuxImpl, execFileImpl: async () => { throw new Error("不应调用 ps"); } });
+  assert.deepEqual(processes.map(({ pid, hasCdpFlag, cdpPort, proxyPort }) => ({ pid, hasCdpFlag, cdpPort, proxyPort })),
+    [{ pid: 10, hasCdpFlag: true, cdpPort: 4321, proxyPort: 7890 }]);
+  const inspectImpl = (executable) => inspectRunningCodex(executable, { platform: "linux", findLinuxImpl });
+  assert.deepEqual(await detectCodexProxy({ executable: exe, cdpPort: 4321, inspectImpl, platform: "linux" }), { running: true, proxyPort: 7890 });
 });

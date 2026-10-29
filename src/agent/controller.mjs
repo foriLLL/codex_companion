@@ -19,6 +19,7 @@ export class AgentController {
   #now;
   #sleep;
   #autoRelaunch;
+  #notifyWhenManual;
   #freshWindowMs;
   #cooldownMs;
   #quitTimeoutMs;
@@ -40,12 +41,14 @@ export class AgentController {
 
   constructor({ adapter, now = Date.now, sleep, lastAttemptAt = 0,
     freshWindowMs = 8000, cooldownMs = 120000, quitTimeoutMs = 10000,
-    userRestartMinIntervalMs = 10000, autoRelaunch = () => true }) {
+    userRestartMinIntervalMs = 10000, autoRelaunch = () => true, notifyWhenManual = false }) {
     if (typeof sleep !== "function") throw new TypeError("必须注入 sleep");
     this.#adapter = adapter;
     this.#now = now;
     this.#sleep = sleep;
     this.#autoRelaunch = autoRelaunch;
+    // 不能自动重开的平台（Linux）仍提示用户手动重开；macOS 关闭自动重开时保持安静。
+    this.#notifyWhenManual = notifyWhenManual;
     this.#freshWindowMs = freshWindowMs;
     this.#cooldownMs = cooldownMs;
     this.#quitTimeoutMs = quitTimeoutMs;
@@ -218,7 +221,7 @@ export class AgentController {
     for (const app of protectedApps) this.#seen.add(app.key);
     await this.#observe(snapshot, apps);
     for (const app of protectedApps) {
-      if (this.#autoRelaunch()) {
+      if (this.#autoRelaunch() || this.#notifyWhenManual) {
         await this.#call("notify", "needs-restart", { processKey: app.key });
       } else {
         await this.#record("skipped-disabled", { processKey: app.key });
@@ -231,6 +234,7 @@ export class AgentController {
       const details = { processKey: app.key };
       if (!this.#autoRelaunch()) {
         await this.#record("skipped-disabled", details);
+        if (this.#notifyWhenManual) await this.#call("notify", "needs-restart", details);
       } else if (!this.#untouched(app, snapshot)) {
         await this.#record("skipped-active", details);
         await this.#call("notify", "skipped", details);

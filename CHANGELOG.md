@@ -4,14 +4,16 @@
 
 ## Unreleased
 
-- 主入口改为官方 Codex 插件（MCP Apps），后端由 Codex 自动启动，不再依赖 CDP；
-- 插件支持 macOS、Windows 与 Linux（arm64 / x64）：数据目录遵循各平台约定，
-  Emby Token 分别存入钥匙串、DPAPI 与 Secret Service；
+- 主入口为 macOS 无感注入：launchd 后台服务在安全条件下以 loopback 随机端口重开
+  Codex 并注入卡片，崩溃后自动拉起并重新连接；
+- 移除官方 Codex 插件（MCP Apps）链路及其 Windows / Linux 插件包；
+- Linux 预览：`install.sh` 一条命令安装 x64 / ARM64 单文件后端（校验和在发布时写入脚本），
+  覆盖应用菜单的 ChatGPT 入口以 loopback 随机端口启动，systemd 用户服务经 `/proc` 发现并注入；
+  不自动退出或重启 ChatGPT，设置页相应隐藏自动加载与重启；
 - 卡片平台化：统一外框、配置 v2、生命周期、存档与 RPC，新增代理状态卡片；
-- Emby 播放界面重做，注入模式下兼容 MP4 经 CDP 媒体拦截原生播放；
-- 通过代理重启 Codex、无感注入与 `.app` 仅在 macOS 提供；
-- 新增任务看板（仅无感注入）：钉住多个 Codex 会话、实时状态与未读提醒，
-  悬停弹出单会话 Trace。
+- Emby 播放界面重做，兼容 MP4 经 CDP 媒体拦截原生播放；
+- 新增任务看板：钉住多个 Codex 会话、实时状态与未读提醒，悬停弹出单会话 Trace；
+- Codex 模态弹窗不再被卡片抽屉遮挡；Trace 收到新数据时保持滚动位置。
 
 ## 0.0.1 - 2026-07-30
 

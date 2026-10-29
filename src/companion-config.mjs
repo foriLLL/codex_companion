@@ -316,21 +316,7 @@ export class CompanionConfig {
 
   readLegacyLaunch() {
     // watcher 与并发读取共享同一次迁移，避免重复执行 defaults 或在同 revision 下漂移。
-    return this.legacyLaunchPromise ??= this.readLegacyLaunchSource();
-  }
-
-  async readLegacyLaunchSource() {
-    try {
-      const value = JSON.parse(await this.readFileImpl(join(dirname(this.path), "plugin-launcher.json"), "utf8"));
-      const preferences = value?.preferences;
-      if (value?.version === 1 && Number.isSafeInteger(value.revision) && value.revision >= 0
-        && isRecord(preferences) && Object.keys(preferences).every(key => ["launchThroughProxy", "proxyPort"].includes(key))
-        && typeof preferences.launchThroughProxy === "boolean" && validPort(preferences.proxyPort)) {
-        return { proxy: { enabled: preferences.launchThroughProxy, port: preferences.proxyPort } };
-      }
-    } catch {}
-    // 缺失、损坏或不可读的旧偏好均不改写、不删除，继续尝试旧 Swift 域。
-    return this.readLegacyLaunchDefaults();
+    return this.legacyLaunchPromise ??= this.readLegacyLaunchDefaults();
   }
 
   async readLegacyLaunchDefaults() {

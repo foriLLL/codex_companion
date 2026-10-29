@@ -266,6 +266,22 @@ test("C2.5/6：关闭自动重开时基线实例也只记录 skipped-disabled，
   }
 });
 
+test("不能自动重开的平台（Linux）对基线与新出现的普通实例提示手动重开，绝不退出", async () => {
+  const baseline = harness({ autoRelaunch: () => false, notifyWhenManual: true });
+  const old = baseline.app({ launchedAt: 1 });
+  await baseline.feed(baseline.snapshot([old]));
+  assert.deepEqual(baseline.args("notify"), [["needs-restart", { processKey: old.key }]]);
+
+  const fresh = harness({ autoRelaunch: () => false, notifyWhenManual: true });
+  await fresh.feed(fresh.snapshot());
+  const app = fresh.app();
+  await fresh.feed(fresh.snapshot([app]));
+  await fresh.feed(fresh.snapshot([app]));
+  assert.deepEqual(fresh.events(), ["skipped-disabled"]);
+  assert.deepEqual(fresh.args("notify"), [["needs-restart", { processKey: app.key }]]);
+  for (const h of [baseline, fresh]) assert.equal(h.count("quit") + h.count("launch"), 0);
+});
+
 test("C2.6：age、输入空闲时间和输入戳守卫逐项拒绝且不重试", async () => {
   for (const change of [
     { app: { launchedAt: 1000001 } },

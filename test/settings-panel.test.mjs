@@ -363,6 +363,24 @@ test("重启被拒与接受分别显示结果，不把 accepted:false 当成功"
   }
 });
 
+test("Linux（reopen: menu）隐藏自动加载与原生助手，重启只提示从应用菜单重开", async () => {
+  const f = fixture(method => {
+    if (method === "companion.settings.get") return { config: initialConfig(), catalog };
+    if (method === "companion.agent.status") return { available: true, version: "1.2.3", codex: { attached: true, port: 51234 }, nativeHelper: "missing", lastEvent: null, reopen: "menu" };
+    throw new Error(`不应调用 ${method}`);
+  });
+  await f.panel.open();
+  const text = f.panel.element.textContent;
+  assert.ok(!text.includes("原生助手"));
+  const legend = descendants(f.panel.element).find(item => item.tagName === "legend" && item.textContent === "自动加载");
+  assert.equal((legend.parentElement ?? legend.parentNode).hidden, true);
+  byText(f.panel.element, "立即重启 Codex").click();
+  assert.equal(byLabel(f.panel.element, "确认重启 Codex").hidden, true);
+  assert.ok(f.panel.element.textContent.includes("从应用菜单重新打开"));
+  assert.equal(f.calls.filter(item => item.method.endsWith("restart")).length, 0);
+  f.panel.destroy();
+});
+
 test("Esc 先取消重启确认再关闭；关闭重开会重新读取，销毁后迟到响应无效", async () => {
   const f = fixture();
   await f.panel.open();

@@ -18,7 +18,8 @@ async function fixture(t, options = {}) {
   const runtimeState = stateStore();
   const sessions = [];
   let onChange, watcherClosed = false;
-  const instance = await runAgent({ home, helperPath: "/fake/native", nativeBridge: bridge, configStore: config,
+  // 本文件按 macOS 语义测试；Linux 差异见 agent-linux.test.mjs。
+  const instance = await runAgent({ home, hostPlatform: "darwin", helperPath: "/fake/native", nativeBridge: bridge, configStore: config,
     runtimeState, logger, processRef, isAlive: () => false, lockSpawnImpl: fakeLockSpawn(),
     now: timer.now, setTimeoutImpl: timer.setTimeoutImpl, clearTimeoutImpl: timer.clearTimeoutImpl,
     waitForTargets: async () => [], notifyImpl: async () => {},
@@ -187,7 +188,7 @@ test("状态返回 C4 完整形状及 package 版本；离线 status 验证锁�
   const config = configStore();
   const target = ours();
   const runtimeState = stateStore({ agentPid: 700, startedAt: 1, codexKey: target.key, port: 51234, lastEvent: { event: "reopened", at: 2 } });
-  const options = { home, nativeBridge: nativeBridge(snapshot([target])), helperPath: "/fake/helper", configStore: config, runtimeState, isAlive: () => true };
+  const options = { home, hostPlatform: "darwin", nativeBridge: nativeBridge(snapshot([target])), helperPath: "/fake/helper", configStore: config, runtimeState, isAlive: () => true };
   const actual = await readAgentStatus(options);
   assert.deepEqual(actual, { available: true, version: AGENT_VERSION, pid: 700, autoRelaunch: true,
     codex: { running: true, pid: 42, attached: true, port: 51234, proxyPort: 7890 }, lastEvent: { event: "reopened", at: 2 }, nativeHelper: "ok" });
@@ -199,7 +200,7 @@ test("状态返回 C4 完整形状及 package 版本；离线 status 验证锁�
 test("fallback 通过假 ps 核实可执行路径/启动时间，模糊 argv 不接管；app 路径取环境优先", async () => {
   const executable = "/test/Fake Codex.app/Contents/MacOS/ChatGPT";
   const calls = [];
-  const poll = createPollingSnapshot({ executable, now: () => 1000, execFileImpl: async (...args) => {
+  const poll = createPollingSnapshot({ executable, now: () => 1000, platform: "darwin", execFileImpl: async (...args) => {
     calls.push(args);
     return { stdout: `42 Wed Oct 28 12:00:00 2026 ${executable} --remote-debugging-address=127.0.0.1 --remote-debugging-port=51234\n43 Wed Oct 28 12:00:01 2026 ${executable} --title='ambiguous value'\n44 Wed Oct 28 12:00:01 2026 ${executable}-helper\n` };
   } });

@@ -35,6 +35,7 @@ Codex Companion — CDP DOM 注入器
   node src/cli.mjs config patch [--config-path <路径>]  # stdin: {expectedRevision,patch}
   node src/cli.mjs agent [--log-dir <目录>]
   node src/cli.mjs agent <install|uninstall|status|restart-codex> [--plist-dir <目录>] [--label <label>]
+  node src/cli.mjs open-codex [参数...]
 
 命令：
   launch      启动带本机随机 CDP 端口的 Codex，并常驻维护注入（默认）；可选本机 HTTP/HTTPS 代理
@@ -44,6 +45,7 @@ Codex Companion — CDP DOM 注入器
   status      输出单行 JSON 状态（Codex 是否运行、CDP 端口、卡片配置），供配置界面调用
   stop-codex  温和退出 Codex（SIGTERM，绝不强杀），输出单行 JSON 结果
   agent       常驻监听 Codex；install/uninstall 管理后台服务，status 查询，restart-codex 正常重启一次
+  open-codex  以本机随机 CDP 端口打开 Codex 后立即返回，参数原样透传（Linux 应用菜单入口）
 `);
 }
 
@@ -65,6 +67,8 @@ export function parseArgs(argv) {
   if (args[0] && !args[0].startsWith("-")) options.command = args.shift();
 
   if (["cards", "config", "agent"].includes(options.command) && args[0] && !args[0].startsWith("-")) options.subcommand = args.shift();
+  // 菜单入口的参数属于 Codex（如 codex:// 链接或 Chromium 标志），不在这里解析。
+  if (options.command === "open-codex") return { ...options, passthrough: args };
 
   while (args.length > 0) {
     const arg = args.shift();
@@ -133,6 +137,13 @@ export async function runCli(argv = process.argv.slice(2), dependencies = {}) {
   const options = parseArgs(argv);
   if (options.help) {
     printHelp();
+    return;
+  }
+
+  if (options.command === "open-codex") {
+    const { openCodex } = await import("./agent/open-codex.mjs");
+    await openCodex({ executable: options.executable, args: options.passthrough,
+      configStore: new CompanionConfig({ path: options.configPath }) });
     return;
   }
 

@@ -3,6 +3,8 @@
 const TRACE_WAIT_MS = 20_000;
 const TRACE_RETRY_MS = 3000;
 const LIVE_TICK_MS = 250;
+// 用户滚动/拖动后这么久内不重建 Trace，避免打断手势与惯性滚动。
+const SCROLL_SETTLE_MS = 400;
 const GAP_PX = 34;
 // 段宽分档：太窄只留色块，稍窄只放图标，再宽放文字，足够宽再加秒数（进行中的段优先显示秒数）。
 const ICON_MIN_PX = 22;
@@ -127,6 +129,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
   let live = [];
   let liveTimer = null;
   let layout = null;
+  let interactedAt = -Infinity;
+  let redrawTimer = null;
 
   function stopLoop() {
     loop?.abort();
@@ -163,7 +167,14 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     data = next;
     // 用服务端时钟与本地时钟的差来推算「现在」，避免两边时钟不一致时进行中的段抖动。
     receivedAt = Date.now() - next.now;
-    draw();
+    drawWhenSettled();
+  }
+  // 新数据会整体重建时间轴；用户正在滚动时先攒着，停下后再画最新的一份。
+  function drawWhenSettled() {
+    const wait = interactedAt + SCROLL_SETTLE_MS - performance.now();
+    if (wait <= 0) { draw(); return; }
+    redrawTimer?.();
+    redrawTimer = effects.timeout(() => { redrawTimer = null; drawWhenSettled(); }, wait);
   }
   const now = () => Date.now() - receivedAt;
 
@@ -261,6 +272,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     }
     const scroller = root.querySelector(".tl-scroll");
     const pinned = !scroller || scroller.scrollLeft + scroller.clientWidth >= scroller.scrollWidth - 24;
+    // 旧容器替换后脱离文档，scrollLeft 会读成 0，必须在替换前记下。
+    const previousLeft = scroller?.scrollLeft ?? 0;
     // 可视宽度 = 卡片宽减去左侧泳道名一栏。
     const viewport = Math.max(root.getBoundingClientRect().width - 84, 160);
     scale ??= chooseScale(turns, viewport);
@@ -326,6 +339,11 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     }
 
     const scrollBox = element("div", "tl-scroll");
+    // 只记用户输入（滚轮/触控板、拖滚动条）；跟随最新进度时的程序滚动不算。
+    const markInteraction = (event) => {
+      if (event.type !== "pointermove" || event.buttons) interactedAt = performance.now();
+    };
+    for (const type of ["wheel", "pointerdown", "pointermove"]) scrollBox.addEventListener(type, markInteraction, { passive: true });
     const track = element("div", "tl-track");
     track.style.width = `${layout.width}px`;
     const axis = element("div", "tl-axis");
@@ -419,7 +437,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     root.replaceChildren(head, stats, timeline);
     // 停在最右边时跟随最新进度；用户往回翻看时不打扰。
     if (pinned) scrollBox.scrollLeft = scrollBox.scrollWidth;
-    else if (scroller) scrollBox.scrollLeft = scroller.scrollLeft;
+    else scrollBox.scrollLeft = previousLeft;
     syncTicker();
   }
 
@@ -458,7 +476,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     startLoop();
   }
 
-  effects.add(() => { stopLoop(); liveTimer?.(); });
+  effects.add(() => { stopLoop(); liveTimer?.(); redrawTimer?.(); });
   return {
     root,
     show,

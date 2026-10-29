@@ -76,7 +76,7 @@ test("Linux 精简 PATH 下发现发行版与 Snap 安装的 FFmpeg", () => {
   assert.equal(resolveFfmpegPath({
     platform: "linux",
     env: { PATH: "/bin" },
-    execPath: "/opt/plugin/companion-backend",
+    execPath: "/opt/companion/codex-companion",
     fileExists: (p) => p === "/snap/bin/ffmpeg"
   }), "/snap/bin/ffmpeg");
 });
@@ -85,13 +85,13 @@ test("Windows 按 Path 查找 ffmpeg.exe，并识别 winget/Scoop 安装位置",
   assert.equal(resolveFfmpegPath({
     platform: "win32",
     env: { Path: "C:\\Windows\\System32;\"C:\\Tools\\ffmpeg\\bin\"" },
-    execPath: "C:\\Plugin\\companion-backend.exe",
+    execPath: "C:\\Companion\\codex-companion.exe",
     fileExists: (p) => p === "C:\\Tools\\ffmpeg\\bin\\ffmpeg.exe"
   }), "C:\\Tools\\ffmpeg\\bin\\ffmpeg.exe");
   assert.equal(resolveFfmpegPath({
     platform: "win32",
     env: { Path: "C:\\Windows", LOCALAPPDATA: "C:\\Users\\me\\AppData\\Local", USERPROFILE: "C:\\Users\\me" },
-    execPath: "C:\\Plugin\\companion-backend.exe",
+    execPath: "C:\\Companion\\codex-companion.exe",
     fileExists: (p) => p === "C:\\Users\\me\\scoop\\shims\\ffmpeg.exe"
   }), "C:\\Users\\me\\scoop\\shims\\ffmpeg.exe");
   assert.equal(resolveFfmpegPath({ platform: "win32", env: {}, execPath: "C:\\x\\a.exe", fileExists: () => false }), null);

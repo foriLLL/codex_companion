@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏、代理状态与任务看板（仅注入）。
-两条并行链路共用卡片 renderer/service，均不修改 app.asar 或应用签名：
-- **官方插件**（macOS / Windows / Linux，arm64 + x64）：Codex 插件与 MCP Apps，在会话侧栏中展示，
-  不依赖 CDP。
-- **无感注入**（仅 macOS）：launchd 常驻 agent 监听 Codex 启动，刚打开且未带调试参数的 Codex 在安全条件下
-  被正常退出、以 loopback 随机端口重开，再经 CDP 注入卡片；设置页在 Codex 内（卡片区齿轮）。
+Codex Companion — 在 Codex 桌面端（macOS；Linux 预览）中注入红果短剧、Emby、小游戏、代理状态与任务看板。
+不修改 app.asar 或应用签名：launchd 常驻 agent 监听 Codex 启动，刚打开且未带调试参数的 Codex
+在安全条件下被正常退出、以 loopback 随机端口重开，再经 CDP 注入卡片；设置页在 Codex 内（卡片区齿轮）。
+Linux 不自动重开：用户级 `chatgpt.desktop` 覆盖菜单入口（`open-codex` 带调试参数启动），
+systemd 用户服务常驻发现并注入；主进程 cmdline 被 Chromium setproctitle 改写成空格拼接的一行。
+官方插件（MCP Apps）链路已彻底放弃并删除，不要再加回来。
 
 ## 技术栈
 - JavaScript ESM (`.mjs`, `"type": "module"`)，Node.js >= 22
@@ -16,32 +16,31 @@ Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏、代理�
 ## 目录结构
 - `src/agent/` — 无感注入 agent：`controller.mjs` 状态机（纯逻辑）、`adapter.mjs`
   平台动作、`session.mjs` 注入会话、`main.mjs` 常驻运行时与单实例锁、
-  `launch-agent.mjs` 安装/卸载/状态/重启命令、`native-bridge.mjs` 原生助手封装
+  `launch-agent.mjs` 安装/卸载/状态/重启命令、`native-bridge.mjs` 原生助手封装、
+  `linux-service.mjs` systemd 用户服务与菜单入口覆盖、`open-codex.mjs` Linux 菜单入口启动器
 - `packaging/mac-app/Native/` — 原生助手源码；`scripts/smoke-native.mjs` 只对 dummy app 冒烟
-- `src/plugin/` — 官方插件后端、MCP Apps UI、桥接、存档与媒体传输
-- `plugin/` — 插件和本地 marketplace 的声明；构建时复制到 `dist/plugin/`
 - `src/platform/` — 平台差异集中处：`paths.mjs` 数据目录/PATH 查找/路径包含判断、
+  `processes.mjs` Linux `/proc` 进程发现、
   `secret-store.mjs` 凭证存储（钥匙串 / DPAPI / Secret Service）
 - `src/` — 共用核心逻辑。旧入口 `cli.mjs`；`injection.mjs` 为旧注入的卡片
   UI/CSS/渲染器；`emby-*.mjs` Emby 相关；`hls-proxy.mjs` Emby HLS 的
   127.0.0.1 本地代理（替代 RPC + base64 分片通道）；`hongguo.mjs` 红果短剧；
   `daemon.mjs` 看门狗；`cdp-connection.mjs`、`rpc-bridge.mjs` 通信层
 - `test/` — `*.test.mjs`，Node 内置 test runner
-- `scripts/` — 构建 (`build-plugin.mjs`、`build-app.mjs`)、生成 (`generate-renderer.mjs`)、
+- `scripts/` — 构建 (`build-app.mjs`、`build-linux.mjs`、`build-native.mjs`、`prepare-installer.mjs`)、生成 (`generate-renderer.mjs`)、
   探测 (`probe-emby.mjs`)、冒烟 (`smoke-*.mjs`)
-- `packaging/` — `install.sh` 与 macOS 启动器 (`mac-app/`)
+- `packaging/` — `install.sh`（macOS 与 Linux）与 macOS 启动器 (`mac-app/`)
 
 ## 常用命令
-- 构建并安装插件：`npm start` / `npm run plugin:install`（尊重 CODEX_HOME；桌面默认使用 ~/.codex）
-- 只构建插件：`npm run build:plugin`（默认本机平台；`-- --target <darwin|linux|win32>-<arm64|x64>`）
-- 插件验证：`npm run smoke:plugin:backend`（按 .mcp.json 启动后端）/ `npm run plugin:probe` /
-  `npm run plugin:probe:host` / `npm run smoke:plugin`
+- 以源码注册 agent：`npm start`（即 `agent install`）
 - 无感注入 agent：`node src/cli.mjs agent [--log-dir <dir>]`（常驻）、
   `agent install|uninstall|status|restart-codex`；原生助手 `node scripts/build-native.mjs`
 - 原生冒烟：`node scripts/smoke-native.mjs`（默认档不抢焦点；`--interactive` 会激活窗口）
 - 旧一次性 CDP 启动与注入：`npm run start:legacy`
 - 测试：`npm test`（即 `node --test`）
 - 构建 .app：`npm run build:app`（默认 arm64；`-- --target darwin-x64`）
+- 构建 Linux 后端：`npm run build:linux -- --target linux-x64|linux-arm64`；Release 由
+  `scripts/prepare-installer.mjs` 把 Team ID、tag 与 Linux 归档 SHA256 写入 `install.sh`
 - 冒烟/探测：`npm run smoke` / `npm run probe:emby`
 
 ## 代码约定
@@ -51,13 +50,13 @@ Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏、代理�
 - 分支命名：`agent/*`、`codex/*`、`feature/*`、`fix/*`
 
 ## 关键陷阱
-- 官方插件不依赖 CDP，不为安装或验证强制重启用户正在使用的 Codex。
 - Codex 的 Electron fuse 已关闭 inspect/RunAsNode/NODE_OPTIONS，CDP 只能在**启动参数**上开启；
   已运行且未带参数的 Codex 只能重启后注入。agent 只自动重开「刚启动、未被操作、在前台」
   的实例（守卫在 JS 状态机与原生助手两侧各查一次），其余情况只通知，绝不强杀。
 - 退出 Codex 只能用 `NSRunningApplication.terminate()`；禁止 SIGKILL、forceTerminate。
+  Linux 上 agent 不退出也不重启 Codex，只提示用户从应用菜单重开。
   开发与测试禁止对真实 Codex 执行 quit/launch/show，原生能力只对 dummy app 验证。
-- 配置 `config-v2.json` 是唯一事实来源：设置页、Swift App、插件 launcher 都通过
+- 配置 `config-v2.json` 是唯一事实来源：设置页、Swift App 都通过
   revision + 文件锁写入；agent 由 config watcher 热更新。
 - 平台 RPC 命名空间 `companion.*` 保留给设置页，卡片 id 不能为 `companion`。
 - **测试必须用 `node --test`，不要用 `bun test`**：Bun 转译器会改写
@@ -73,9 +72,7 @@ Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏、代理�
   文件权限断言用 `test/helpers/permissions.mjs` 的 `assertMode`
 - `npm run inject` 是一次性注入后退出，RPC 随之结束，只能看静态布局，
   不能用于浏览/播放
-- 插件 iframe 禁止 HTTP loopback，媒体走有界 MCP 分片/MSE，不能把现有
-  HTTP 媒体代理 URL 直接交给插件页面，也不能修改沙箱私有开关。
-- 插件源码、构建产物内部禁止放隔离 CODEX_HOME：安装会复制插件目录，可能递归复制。
 - 公开 `.app` 不打包 FFmpeg；本机转码只调用用户通过 PATH、常见包管理器路径或
   `CODEX_COMPANION_FFMPEG` 指定的系统 FFmpeg
-- tag Release 必须 Developer ID 签名并经 Apple 公证；缺少凭据时工作流应失败关闭
+- tag Release 必须 Developer ID 签名并经 Apple 公证；缺少凭据时工作流应失败关闭。
+  Linux 没有平台签名，install.sh 只下载同 tag 归档并比对写入脚本的 SHA256，不跟随 latest
