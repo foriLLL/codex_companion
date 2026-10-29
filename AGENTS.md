@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏与代理状态。
+Codex Companion — 在 Codex 中展示红果短剧、Emby、小游戏、代理状态与任务看板（仅注入）。
 两条并行链路共用卡片 renderer/service，均不修改 app.asar 或应用签名：
 - **官方插件**（macOS / Windows / Linux，arm64 + x64）：Codex 插件与 MCP Apps，在会话侧栏中展示，
   不依赖 CDP。
