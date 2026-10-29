@@ -255,6 +255,31 @@ try {
   await evaluate(`shiftAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
+  // 侧聊关闭确认等 Codex 模态弹窗：遮罩（z-50）与确认框必须盖过已打开的抽屉，关闭后抽屉恢复置顶。
+  await evaluate(`(() => {
+    document.body.innerHTML='<header class="toolbar" style="display:flex;justify-content:flex-end;height:40px"><div><button aria-label="Share">S</button></div></header>'
+      + '<div class="thread-scroll-container" style="position:absolute;inset:48px 0 0"><div data-thread-user-message-navigation-content>Conversation</div></div>';
+    globalThis.modalAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+  })()`);
+  await evaluate(`modalAdapter.setOpen(true)`);
+  await waitFor(`modalAdapter.isOpen() && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').dataset.state === 'open'`, "弹窗场景抽屉打开");
+  const drawerHit = `(() => {
+    const drawer=document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').getBoundingClientRect();
+    return document.elementFromPoint(drawer.x+drawer.width/2,drawer.y+40);
+  })()`;
+  assert.equal(await evaluate(`${drawerHit}?.id`), "codex-companion-root-shell", "无弹窗时抽屉置顶");
+  await evaluate(`(() => {
+    const overlay=document.createElement('div');
+    overlay.id='modal-overlay';overlay.className='codex-dialog-overlay';
+    overlay.style.cssText='position:fixed;inset:0;z-index:50;pointer-events:auto';
+    document.body.append(overlay);
+  })()`);
+  await waitFor(`${drawerHit}?.id === 'modal-overlay'`, "模态遮罩必须盖过抽屉");
+  await evaluate(`document.getElementById('modal-overlay').remove()`);
+  await waitFor(`${drawerHit}?.id === 'codex-companion-root-shell'`, "弹窗关闭后抽屉恢复置顶");
+  await evaluate(`modalAdapter.dispose()`);
+  assert.deepEqual(await evaluate(`errors`), []);
+
   await evaluate(`clearInterval(frameTimer);video.srcObject.getTracks().forEach(track=>track.stop())`);
   console.log("Codex adapter smoke passed:", JSON.stringify(evidence));
 } finally {

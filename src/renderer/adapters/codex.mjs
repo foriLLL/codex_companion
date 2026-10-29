@@ -392,6 +392,13 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
   const shell = document.createElement("div");
   shell.id = `${hostId}-shell`;
   shell.style.cssText = "all:initial !important;position:fixed !important;inset:0 !important;z-index:2147483646 !important;pointer-events:none !important;-webkit-app-region:no-drag !important";
+  // Codex 模态弹窗（侧聊关闭确认等）的遮罩为 `.codex-dialog-overlay`（z-50），Codex 自身也以此判断模态。
+  // 弹窗期间 shell 降为 z-index:auto：仍盖在会话内容上，但让出遮罩与确认框，避免挡住按钮。
+  const SHELL_TOP_LAYER = "2147483646";
+  const syncShellLayer = () => {
+    const layer = document.querySelector(".codex-dialog-overlay") ? "auto" : SHELL_TOP_LAYER;
+    if (shell.style.getPropertyValue("z-index") !== layer) shell.style.setProperty("z-index", layer, "important");
+  };
   const shellShadow = shell.attachShadow({ mode: "open" });
   shellShadow.innerHTML = `
     <style>
@@ -941,6 +948,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     observer.disconnect();
     const startedAt = performance.now();
     try {
+      syncShellLayer();
       return ensurePlacement();
     } catch (error) {
       reportError(error);

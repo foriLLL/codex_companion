@@ -163,7 +163,7 @@ try {
       open: () => ({ opened: true }),
       // Trace：两个已结束的回合（一个以提问结束）和一个进行中的回合，最后一段还在长。
       trace: async ({ threadId, since }) => {
-        if (since === 'trace-' + threadId) await new Promise((resolve) => setTimeout(resolve, 2000));
+        if (since === 'trace-' + threadId + (globalThis.traceRevision ?? '')) await new Promise((resolve) => setTimeout(resolve, 2000));
         const now = Date.now();
         const s = 1000;
         const seg = (lane, kind, from, to, label, extra = {}) => ({ lane, kind, start: from, end: to, label, ...extra });
@@ -188,7 +188,7 @@ try {
             seg('shell', 'tool', t3 + 16 * s, t3 + 52 * s, '运行 npm run smoke', { failed: false }), seg('model', 'think', t3 + 52 * s, null, '思考中')] }
         ];
         const data = { threadId, model: 'gpt-5.6-sol', contextWindow: 258400, turns, updatedAt: now };
-        return { ...data, sig: 'trace-' + threadId, now };
+        return { ...data, sig: 'trace-' + threadId + (globalThis.traceRevision ?? ''), now };
       },
       watch: async ({ since, waitMs }) => {
         if (view().sig === since) await new Promise((resolve) => { wake = resolve; setTimeout(resolve, Math.min(waitMs, 2000)); });
@@ -286,6 +286,21 @@ try {
   assert.equal(await evaluate(`card.querySelector('.peek').matches(':popover-open')`), true, "移进浮层保持打开");
   await evaluate(`card.querySelector('.tl-scroll').scrollLeft = 0`);
   await screenshot("task-board-5-trace-scrolled.png");
+  // 新数据到来会重建时间轴：翻看到中间时位置不变；正在滚动时等停下再重建，不打断手势。
+  await evaluate(`(() => { const box = card.querySelector('.tl-scroll'); box.scrollLeft = Math.round((box.scrollWidth - box.clientWidth) / 2); globalThis.oldScroll = box; globalThis.middleLeft = box.scrollLeft; globalThis.traceRevision = 1; })()`);
+  await waitFor(`card.querySelector('.tl-scroll') !== oldScroll`, "新 Trace 数据未重建");
+  assert.equal(await evaluate(`Math.abs(card.querySelector('.tl-scroll').scrollLeft - middleLeft) <= 1`), true, "重建后保持翻看位置");
+  const settle = await evaluate(`(async () => {
+    const box = card.querySelector('.tl-scroll');
+    globalThis.traceRevision = 2;
+    const until = Date.now() + 2600;
+    while (Date.now() < until) { box.dispatchEvent(new WheelEvent('wheel', { deltaX: 1, bubbles: true })); await new Promise((r) => setTimeout(r, 100)); }
+    const kept = card.querySelector('.tl-scroll') === box;
+    const start = Date.now();
+    while (card.querySelector('.tl-scroll') === box && Date.now() - start < 3000) await new Promise((r) => setTimeout(r, 20));
+    return { kept, redrawn: card.querySelector('.tl-scroll') !== box };
+  })()`);
+  assert.deepEqual(settle, { kept: true, redrawn: true }, "滚动中不重建，停下后再画");
   await pointAt(`${task("a24")}.querySelector('.name')`);
   await waitFor(`card.querySelector('.trace-title')?.textContent === ${task("a24")}.querySelector('.name').textContent && ${task("a24")}.hasAttribute('data-peek')`, "移到别的任务直接切换");
   await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 600, y: 700 });
