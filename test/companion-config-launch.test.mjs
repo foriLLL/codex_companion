@@ -21,7 +21,7 @@ async function fixture(t, options = {}) {
     execFileImpl: async (...args) => { defaultsCalls.push(args); return { stdout: "" }; },
     ...options
   });
-  return { dir, path, store, reads, defaultsCalls, launcherPath: join(dir, "plugin-launcher.json") };
+  return { dir, path, store, reads, defaultsCalls };
 }
 
 function oldV2(revision = 7) {
@@ -121,45 +121,8 @@ test("validateV2 拒绝显式损坏的新字段，保留 last-good，不尝试�
   assert.ok(reads.every(([file]) => file === path));
 });
 
-test("旧 v2 优先迁移同目录 plugin-launcher，读取不写盘，下次 patch 落盘且保留旧文件", async t => {
-  const { store, path, launcherPath, defaultsCalls, reads } = await fixture(t);
-  const original = `${JSON.stringify(oldV2(), null, 2)}\n`;
-  const preferences = { version: 1, revision: 42, preferences: { launchThroughProxy: true, proxyPort: 10809 } };
-  const oldPreferences = `${JSON.stringify(preferences)}\n`;
-  await writeFile(path, original);
-  await writeFile(launcherPath, oldPreferences);
-  const config = await store.loadV2({ strict: true });
-  assert.equal(config.revision, 7);
-  assert.deepEqual(config.launch, { proxy: { enabled: true, port: 10809 } });
-  assert.deepEqual(config.agent, DEFAULT_AGENT);
-  assert.equal(await readFile(path, "utf8"), original);
-  assert.ok(reads.some(([file, encoding]) => file === launcherPath && encoding === "utf8"));
-  assert.equal(defaultsCalls.length, 0);
-  const saved = await store.patch({ agent: { autoRelaunch: false } }, { expectedRevision: 7 });
-  assert.equal(saved.revision, 8);
-  assert.deepEqual(saved.launch, config.launch);
-  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), saved);
-  assert.equal(await readFile(launcherPath, "utf8"), oldPreferences);
-  assertMode(await stat(path), 0o600);
-  reads.length = 0;
-  assert.deepEqual(await store.loadV2(), saved);
-  assert.ok(reads.every(([file]) => file === path));
-});
-
-test("迁移文件读取可注入；已有 launch（包括空对象）优先于全部旧来源", async t => {
-  const { path, launcherPath } = await fixture(t);
-  const reads = [];
-  const store = new CompanionConfig({ path, platform: "darwin",
-    readFileImpl: async (...args) => {
-      reads.push(args);
-      if (args[0] === launcherPath) return JSON.stringify({ version: 1, revision: 1, preferences: { launchThroughProxy: true, proxyPort: 1080 } });
-      return readFile(...args);
-    },
-    execFileImpl: async () => { throw new Error("无旧 defaults"); }
-  });
-  await writeFile(path, JSON.stringify(oldV2()));
-  assert.deepEqual((await store.loadV2()).launch, { proxy: { enabled: true, port: 1080 } });
-  await assert.rejects(stat(launcherPath), { code: "ENOENT" });
+test("已有 launch（包括空对象）优先于旧 defaults", async t => {
+  const { store, path, reads, defaultsCalls } = await fixture(t);
   for (const [launch, expected] of [
     [{}, DEFAULT_LAUNCH], [{ proxy: {} }, DEFAULT_LAUNCH],
     [{ proxy: { port: 4321 } }, { proxy: { enabled: false, port: 4321 } }],
@@ -173,32 +136,7 @@ test("迁移文件读取可注入；已有 launch（包括空对象）优先于�
     assert.deepEqual(config.agent, DEFAULT_AGENT);
     assert.deepEqual(reads, [[path, "utf8"]]);
   }
-});
-
-test("非法 plugin-launcher 回退 defaults，损坏旧文件仍完整保留", async t => {
-  const valid = { version: 1, revision: 0, preferences: { launchThroughProxy: false, proxyPort: 4321 } };
-  const sources = ["{broken", "null", "[]", ...[
-    { ...valid, version: 2 }, { ...valid, revision: -1 }, { ...valid, revision: "1" },
-    { ...valid, preferences: null }, { ...valid, preferences: { proxyPort: 4321 } },
-    { ...valid, preferences: { launchThroughProxy: "true", proxyPort: 4321 } },
-    { ...valid, preferences: { launchThroughProxy: true, proxyPort: 65536 } },
-    { ...valid, preferences: { ...valid.preferences, unknown: true } }
-  ].map(value => JSON.stringify(value))];
-  const original = JSON.stringify(oldV2());
-  for (const source of sources) {
-    const calls = [];
-    const { store, path, launcherPath } = await fixture(t, {
-      execFileImpl: async (...args) => { calls.push(args); return { stdout: args[1][2] === "launchThroughProxy" ? "YES\n" : "7891\n" }; }
-    });
-    await writeFile(path, original);
-    await writeFile(launcherPath, source);
-    const config = await store.loadV2({ strict: true });
-    assert.deepEqual(config.launch, { proxy: { enabled: true, port: 7891 } });
-    assert.equal(config.revision, 7);
-    assert.equal(calls.length, 2);
-    assert.equal(await readFile(path, "utf8"), original);
-    assert.equal(await readFile(launcherPath, "utf8"), source);
-  }
+  assert.equal(defaultsCalls.length, 0);
 });
 
 test("defaults 迁移使用可注入执行函数，兼容旧布尔值与端口回退并延迟落盘", async t => {
@@ -215,7 +153,7 @@ test("defaults 迁移使用可注入执行函数，兼容旧布尔值与端口�
     [null, null, { enabled: false, port: 7890 }]
   ]) {
     const calls = [];
-    const { store, path, launcherPath } = await fixture(t, {
+    const { store, path } = await fixture(t, {
       execFileImpl: async (...args) => {
         calls.push(args);
         const value = args[1][2] === "launchThroughProxy" ? enabled : port;
@@ -235,14 +173,13 @@ test("defaults 迁移使用可注入执行函数，兼容旧布尔值与端口�
     assert.equal(saved.launch.proxy.enabled, expected.enabled);
     assert.equal(saved.launch.proxy.port, 9000);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), saved);
-    await assert.rejects(stat(launcherPath), { code: "ENOENT" });
   }
 });
 
 test("连续 loadV2 只迁移一次，旧来源变化和调用方修改返回值不改变同 revision 配置", async t => {
   const calls = [];
   let port = "1080";
-  const { store, path, launcherPath, reads } = await fixture(t, {
+  const { store, path } = await fixture(t, {
     execFileImpl: async (_command, args) => { calls.push(args[2]); return { stdout: args[2] === "launchThroughProxy" ? "1" : port }; }
   });
   const original = JSON.stringify(oldV2());
@@ -251,26 +188,24 @@ test("连续 loadV2 只迁移一次，旧来源变化和调用方修改返回值
   const expected = structuredClone(first);
   first.launch.proxy.port = 65535;
   port = "7891";
-  await writeFile(launcherPath, JSON.stringify({ version: 1, revision: 0, preferences: { launchThroughProxy: false, proxyPort: 4321 } }));
   for (let attempt = 0; attempt < 5; attempt++) assert.deepEqual(await store.loadV2({ strict: true }), expected);
   assert.deepEqual(expected.launch, { proxy: { enabled: true, port: 1080 } });
   assert.equal(expected.revision, 7);
   assert.deepEqual(calls, ["launchThroughProxy", "launchProxyPort"]);
-  assert.equal(reads.filter(([file]) => file === launcherPath).length, 1);
   assert.equal(await readFile(path, "utf8"), original);
   // 缓存属于实例，新实例可以在首次读取时使用更新后的旧来源。
   const another = new CompanionConfig({ path, platform: "darwin", execFileImpl: store.execFileImpl });
-  assert.deepEqual((await another.loadV2({ strict: true })).launch, { proxy: { enabled: false, port: 4321 } });
-  assert.equal(calls.length, 2);
+  assert.deepEqual((await another.loadV2({ strict: true })).launch, { proxy: { enabled: true, port: 7891 } });
+  assert.equal(calls.length, 4);
 });
 
-test("并发 loadV2 共享尚未完成的迁移，旧文件只读一次、defaults 两个 key 各执行一次", async t => {
+test("并发 loadV2 共享尚未完成的迁移，defaults 两个 key 各执行一次", async t => {
   const calls = [];
   const { promise: firstDefault, resolve: started } = Promise.withResolvers();
   const { promise: allReads, resolve: readAll } = Promise.withResolvers();
   const { promise: gate, resolve: release } = Promise.withResolvers();
   t.after(release);
-  const { store, path, launcherPath } = await fixture(t, {
+  const { store, path } = await fixture(t, {
     execFileImpl: async (_command, args) => {
       calls.push(args[2]);
       started();
@@ -281,9 +216,7 @@ test("并发 loadV2 共享尚未完成的迁移，旧文件只读一次、defaul
   const original = JSON.stringify(oldV2());
   await writeFile(path, original);
   let configReads = 0;
-  let launcherReads = 0;
   store.readFileImpl = async (...args) => {
-    if (args[0] === launcherPath) launcherReads += 1;
     const result = await readFile(...args);
     if (args[0] === path && ++configReads === 8) readAll();
     return result;
@@ -297,18 +230,15 @@ test("并发 loadV2 共享尚未完成的迁移，旧文件只读一次、defaul
     assert.deepEqual(config.launch, { proxy: { enabled: true, port: 1080 } });
     assert.equal(config.revision, 7);
   }
-  assert.equal(launcherReads, 1);
   assert.deepEqual(calls, ["launchThroughProxy", "launchProxyPort"]);
   assert.equal(await readFile(path, "utf8"), original);
 });
 
 test("patch 失败保留迁移快照，成功后写入该快照且后续读取不再访问旧来源", async t => {
-  const { store, path, launcherPath, reads, defaultsCalls } = await fixture(t);
+  const { store, path, defaultsCalls } = await fixture(t);
   const original = JSON.stringify(oldV2());
   await writeFile(path, original);
   const initial = await store.loadV2({ strict: true });
-  const source = JSON.stringify({ version: 1, revision: 0, preferences: { launchThroughProxy: true, proxyPort: 1080 } });
-  await writeFile(launcherPath, source);
   await assert.rejects(store.patch({ enabled: false }, { expectedRevision: 6 }), { code: "CONFIG_CONFLICT" });
   await assert.rejects(store.patch({ launch: { proxy: { port: 0 } } }, { expectedRevision: 7 }), { code: "CONFIG_PATCH_INVALID" });
   const atomicWrite = store.atomicWrite;
@@ -323,35 +253,32 @@ test("patch 失败保留迁移快照，成功后写入该快照且后续读取�
   assert.deepEqual(saved.launch, initial.launch);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")), saved);
   for (let attempt = 0; attempt < 3; attempt++) assert.deepEqual(await store.loadV2({ strict: true }), saved);
-  assert.equal(reads.filter(([file]) => file === launcherPath).length, 1);
   assert.equal(defaultsCalls.length, 2);
-  assert.equal(await readFile(launcherPath, "utf8"), source);
 });
 
 test("磁盘已有 launch 时立即使用磁盘值，后续读取不再访问迁移来源", async t => {
-  const { store, path, launcherPath, reads, defaultsCalls } = await fixture(t);
+  const { store, path, defaultsCalls } = await fixture(t);
   await writeFile(path, JSON.stringify(oldV2()));
   await store.loadV2({ strict: true });
   const stored = normalizeCompanionConfigV2({ ...oldV2(8), launch: { proxy: { enabled: true, port: 4321 } } });
   await writeFile(path, JSON.stringify(stored));
   for (let attempt = 0; attempt < 3; attempt++) assert.deepEqual(await store.loadV2({ strict: true }), stored);
-  assert.equal(reads.filter(([file]) => file === launcherPath).length, 1);
   assert.equal(defaultsCalls.length, 2);
 });
 
-test("首次创建 v2 或从 v1 迁移也保留已有插件偏好，沿用 revision 0", async t => {
+test("首次创建 v2 或从 v1 迁移也导入旧 defaults 偏好，沿用 revision 0", async t => {
   for (const legacy of [null, { version: 1, enabled: false, cards: { games: false } }]) {
-    const { store, path, dir, launcherPath, defaultsCalls } = await fixture(t);
-    const source = JSON.stringify({ version: 1, revision: 20, preferences: { launchThroughProxy: true, proxyPort: 1080 } });
-    await writeFile(launcherPath, source);
+    const defaultsCalls = [];
+    const { store, path, dir } = await fixture(t, {
+      execFileImpl: async (...args) => { defaultsCalls.push(args); return { stdout: args[1][2] === "launchThroughProxy" ? "YES\n" : "1080\n" }; }
+    });
     if (legacy) await writeFile(join(dir, "config.json"), JSON.stringify(legacy));
     const config = await store.loadV2();
     assert.equal(config.revision, 0);
     assert.deepEqual(config.launch, { proxy: { enabled: true, port: 1080 } });
     assert.deepEqual(config.agent, DEFAULT_AGENT);
     assert.equal(config.enabled, legacy?.enabled ?? true);
-    assert.equal(defaultsCalls.length, 0);
-    assert.equal(await readFile(launcherPath, "utf8"), source);
+    assert.equal(defaultsCalls.length, 2);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), config);
   }
 });

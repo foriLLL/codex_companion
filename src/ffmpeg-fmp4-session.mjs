@@ -845,7 +845,7 @@ export class FfmpegFmp4Session {
     if (this.queue.length === 0 && !this.ended) await this.#waitForSegment(signal);
     if (this.queue.length === 0 && this.failure) throw this.failure;
 
-    // 单个 moof+mdat 也可能超过 MCP 的消息预算。按连续字节拆包，保留边界
+    // 单个 moof+mdat 也可能超过 RPC 的消息预算。按连续字节拆包，保留边界
     // 标志供 MSE 配额回收使用；拆包不改变解码器接收到的字节顺序。
     const segments = [];
     let batchBytes = 0;
