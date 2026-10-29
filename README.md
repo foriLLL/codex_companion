@@ -1,7 +1,8 @@
 # Codex Companion
 
-Companion 是一个非官方的 Codex 插件，把红果短剧、Emby、小游戏和代理状态放进
-聊天旁的会话侧栏；macOS 无感注入模式下还提供跟踪多个 Codex 会话的任务看板。页面通过官方 MCP Apps 协议运行，后端由 Codex 按需自动启动；安装一次后，日常只需打开 Codex，不用单独启动 Companion。
+Companion 是一个非官方的 Codex 桌面端（macOS / Linux）增强，把红果短剧、Emby、小游戏、
+代理状态和跟踪多个会话的任务看板注入到 Codex 聊天旁。后台服务随登录启动，
+安装一次后日常只需打开 Codex，不用单独启动 Companion。
 不修改 `app.asar`、Codex 安装包或应用签名。
 
 > Codex Companion 与 OpenAI、ChatGPT、Codex、字节跳动、红果短剧及 Emby 均无隶属、
@@ -11,94 +12,93 @@ Companion 是一个非官方的 Codex 插件，把红果短剧、Emby、小游�
 
 - **红果短剧**：公开内容浏览、搜索、收藏、选集、播放和倒计时自动连播。
 - **Emby**：多服务器、媒体库、继续观看、最近添加、搜索、选季选集、选源、字幕和进度上报。
-- **小游戏**：2048、扫雷和纸牌，存档通过插件后端保存在本机。
-- **代理状态**：查看当前 Codex 的启动代理与本机端口连通性（macOS）。
+- **小游戏**：2048、扫雷和纸牌，存档保存在本机。
+- **代理状态**：查看当前 Codex 的启动代理与本机端口连通性。
 - **任务看板**：把正在推进的 Codex 会话钉在一处，实时显示进行中、等你回答、已中断等状态，
-  悬停查看单个会话的 Trace（仅 macOS 无感注入）。
-- **卡片管理**：分别启停、调整顺序；窄侧栏和宽页面自适应，跟随宿主明暗主题。
+  悬停查看单个会话的 Trace。
+- **卡片管理**：分别启停、调整顺序；跟随宿主明暗主题。
 
-切换卡片保留页面状态并暂停隐藏的媒体；关闭页面、取消请求或后端退出时回收
+收起卡片保留页面状态；关闭页面、取消请求或后台退出时回收
 媒体会话、Blob URL、分片缓存与转码进程。
 
 ## 平台支持
 
-| 能力 | macOS | Windows | Linux |
-| --- | :---: | :---: | :---: |
-| 官方插件（全部卡片、媒体播放、存档） | ✅ | ✅ | ✅ |
-| Emby 凭证保存在系统凭证库 | 钥匙串 | DPAPI（当前用户） | Secret Service，无密钥环时回退 0600 文件 |
-| 本机 FFmpeg 转码 | ✅ VideoToolbox 硬件编码 | ✅ 软件编码 | ✅ 软件编码 |
-| 代理状态检测；由 Companion 通过代理重启 / 退出 Codex | ✅ | — | — |
-| 无感注入（CDP）、`Codex Companion.app`、原生助手 | ✅ | — | — |
-| 任务看板（依赖无感注入读取宿主侧栏） | ✅ | — | — |
+Codex 已关闭 Electron 的运行时调试入口，注入依赖以启动参数开启的本机 CDP，两个平台
+加载卡片的方式不同：
 
-插件后端为 Bun 编译的单文件可执行程序，提供 `darwin`、`linux`、`win32` 的
-`arm64` / `x64` 六个目标。不支持的功能在界面中降级说明，不影响其它卡片。
+| 平台 | 加载方式 | 数据目录 |
+|---|---|---|
+| macOS（Apple Silicon / Intel） | 原生助手识别刚打开的 Codex，安全退出后带调试参数重开 | `~/Library/Application Support/codex-companion/` |
+| Linux（预览，x64 / ARM64） | 覆盖应用菜单里的 ChatGPT 入口，打开时直接带上调试参数，不需要重开 | `~/.config/codex-companion/` |
 
-本机数据目录：
-
-| 系统 | 路径 |
-| --- | --- |
-| macOS | `~/Library/Application Support/codex-companion/` |
-| Windows | `%APPDATA%\codex-companion\` |
-| Linux | `$XDG_CONFIG_HOME/codex-companion/`（默认 `~/.config/codex-companion/`） |
+Linux 版为预览：已验证安装、启动、连接、注入与 RPC，登录后会话界面里的卡片位置尚未在 Linux 上验证。
 
 ## 系统要求
 
-- 支持本地插件与 MCP Apps 的 Codex 桌面端或 Codex CLI。
-- 使用发布的插件包不需要 Node.js；从源码构建需要 Node.js 22+ 与 npm
+- macOS 上的 Codex 桌面端，或 Linux 上官方 deb / rpm 安装的 ChatGPT 桌面版
+  （`/usr/lib/chatgpt/ChatGPT`，其它位置用 `CODEX_COMPANION_CODEX_EXECUTABLE` 指定）。
+- Linux 需要 systemd 用户服务（`systemctl --user`）；可选 `notify-send`（libnotify）用于
+  提示重开，`secret-tool`（libsecret）用于保存 Emby Token，缺少时 Token 存到数据目录下 `0600` 的文件。
+- 使用发布版（macOS 的 `.app`、Linux 的单文件后端）不需要 Node.js；从源码运行需要 Node.js 22+ 与 npm
   （依赖安装会提供固定版本的 Bun）。
-- 可选：系统 FFmpeg，用于本机重封装、转码与复杂字幕。项目不打包、不自动安装 FFmpeg，
-  只查找 `CODEX_COMPANION_FFMPEG`、`PATH` 与各平台常见包管理器目录
-  （Homebrew / MacPorts、apt / Snap / Linuxbrew、winget / Scoop / Chocolatey）。
+- 可选：系统 FFmpeg，用于本机重封装、转码与复杂字幕。项目不打包 FFmpeg，
+  只查找 `CODEX_COMPANION_FFMPEG`、`PATH` 与 Homebrew / MacPorts（Linux 另含 `/usr/bin`、snap、Linuxbrew）目录。
 
 macOS 上的杜比视界 / HDR 本机播放需要 `brew install ffmpeg-full molten-vk`；
 P5/P8 使用 RPU 映射到 BT.709 SDR，HDR10/HLG 做色调映射，这不是原生 HDR 输出。
 
 ## 安装
 
-### 从源码安装（推荐给开发者）
+### 使用发布版（推荐）
+
+```sh
+curl -fsSL https://github.com/foriLLL/codex_companion/releases/latest/download/install.sh | bash
+```
+
+macOS 上，安装器下载经 Developer ID 签名与 Apple 公证的 `Codex Companion.app`，校验后安装到
+`~/Applications` 并打开引导；在引导中点击「启用自动加载」，注册登录后自动启动的
+后台服务（如需批准，前往「系统设置 › 通用 › 登录项」）。已有 Homebrew 时会补装 FFmpeg。
+
+Linux 上先安装官方 ChatGPT 桌面版，再运行同一条命令。安装器下载与脚本同版本的单文件后端，
+按发布时写入脚本的 SHA256 校验后放到 `~/.local/share/codex-companion`，注册 systemd 用户服务
+并覆盖应用菜单里的 ChatGPT 入口，不需要 sudo。之后从应用菜单打开 ChatGPT 即可；安装时
+ChatGPT 若已开着，需要退出后从菜单重开一次。FFmpeg 需自行安装（如 `sudo apt install ffmpeg`）。
+
+### 从源码安装（开发者）
 
 ```sh
 npm ci
-npm start        # 构建本机平台的插件并通过官方 CLI 安装
+npm start        # 生成渲染器并以当前源码注册后台服务（macOS：launchd；Linux：systemd 用户服务）
 ```
 
-安装器只更新本插件的本地 marketplace 与缓存，不更改其他插件、认证或 Codex
-安装包，也不会退出正在运行的 Codex。它会依次查找：macOS 桌面端附带的 CLI、
-`PATH` 中的 `codex`（Windows 上为 `codex.exe` / `codex.cmd`）。也可以显式指定：
+开发安装的后台服务直接运行当前 Node 与仓库源码；更换 Node 版本或移动仓库后需重新执行。
 
-```sh
-npm run plugin:install -- --cli /path/to/codex --codex-home "$HOME/.codex"
-```
+Linux 上 `npm start` 同样以源码注册 systemd 用户服务并覆盖菜单入口。
 
-`--codex-home` 必须是桌面端使用的配置目录；省略时依次使用 `CODEX_HOME` 和
-`~/.codex`。
+### Linux 安装写入的文件
 
-### 使用发布的插件包
-
-从 GitHub Release 下载与系统匹配的 `codex-companion-plugin-<os>-<arch>` 包并解压，
-然后用 Codex CLI 注册：
-
-```sh
-codex plugin marketplace add /path/to/plugin
-codex plugin add codex-companion@codex-companion-local
-```
-
-macOS 插件包中的后端经过 Developer ID 签名与 Apple 公证。
+安装会写入两个文件：`~/.config/systemd/user/codex-companion-agent.service`，以及与系统同名的
+`~/.local/share/applications/chatgpt.desktop`。后者只把启动命令换成 Companion 的入口，
+名称、图标和 `codex://` 等协议关联保持不变。如果这个位置已有你自己的同名文件，安装会停下，不会覆盖。
 
 ### 打开 Companion
 
-安装或更新后，保存手头工作并**手动重启** Codex，使本地插件重新加载（见
-[官方本地插件流程](https://developers.openai.com/plugins/build/plugins)）。
-重启后在聊天中说「打开 Companion」，Codex 会在右侧面板显示插件页面。
+后台服务（launchd `com.codexcompanion.agent`）在 Codex 刚启动、尚未操作且位于前台时，
+请求它正常退出，再以 `--remote-debugging-address=127.0.0.1` 和随机端口重开并注入卡片。
+已经在使用的 Codex 窗口不会被自动退出，只提示需要重开；两次自动重开至少间隔两分钟。
+
+注入后 Codex 顶栏出现 Companion 入口，点开即显示卡片；设置（卡片区齿轮）里可以改为
+排在原生摘要下方。后台服务崩溃后由 launchd 自动拉起，并重新连接已开启调试端口的 Codex。
+
+Linux 上从应用菜单打开 ChatGPT 即可：入口以 `--remote-debugging-address=127.0.0.1` 和随机端口
+启动它，常驻服务发现后连接并注入。在终端直接运行 `chatgpt`、或安装时 ChatGPT 已经开着，
+都不会带调试参数，此时会提示退出后从应用菜单重新打开。Companion 不会在 Linux 上自动退出或重启 ChatGPT，
+修改启动代理后同样需要手动从菜单重开。
 
 ## 使用
 
-- 右上角「管理卡片」调整开关与顺序；关闭卡片保留存档。
-- 「Codex 启动代理」（仅 macOS）保存启动偏好后，点击「保存并重启」应用。
-  其它系统请在系统或 Codex 设置中配置网络代理。
-- 游戏存档写入数据目录下的 `plugin-state.json`，不依赖 iframe 的 `localStorage`；
-  多个插件窗口共享存档并检查版本冲突。
+- 设置中调整卡片开关与顺序；关闭卡片保留存档。
+- 「Codex 启动代理」保存启动偏好后，点击「保存并重启」应用。
 
 ### 红果短剧
 
@@ -119,7 +119,7 @@ macOS 插件包中的后端经过 Developer ID 签名与 Apple 公证。
 并估算输入、转码输出和页面解码的成本。播放路径：
 
 1. 服务端允许转码时使用 H.264/AAC HLS。
-2. 兼容的 H.264/AAC MP4 经 MP4Box 分段，通过有界 MCP 分片和 MSE 播放。
+2. 兼容的 H.264/AAC MP4 经 CDP 媒体拦截原生播放，或经 MP4Box 分段，通过有界 RPC 分片和 MSE 播放。
 3. 超高码率 MP4、HEVC、EC-3、多音轨、其他容器或图形字幕烧录交给本机 FFmpeg，
    输出 H.264/AAC fMP4。
 
@@ -138,10 +138,7 @@ npm run probe:emby -- --server https://emby.example.com --username alice --searc
 「摸鱼」卡片包含本地实现的 2048、9×9 扫雷（首击安全）和经典接龙，支持最多 30 步
 撤销，不请求外部网站。
 
-### 任务看板（仅 macOS 无感注入）
-
-看板需要读取和标记 Codex 左侧的会话列表，官方插件页面拿不到宿主侧栏，因此只在
-无感注入模式下出现。
+### 任务看板
 
 - 打开一个会话后点「加入当前会话」，它会一直留在看板上，左侧侧栏对应条目也会标上
   同样的颜色；做完点 ✓ 移出，几秒内可以撤销。最多保留 100 个任务。
@@ -154,45 +151,29 @@ npm run probe:emby -- --server https://emby.example.com --username alice --searc
 
 ## 工作原理
 
-1. Codex 读取插件声明（`plugin/`），按 `.mcp.json` 启动打包好的 stdio MCP 后端。
-2. MCP Apps 页面通过 AppBridge 调用仅供页面使用的工具；各卡片共用渲染器、
-   服务注册表与生命周期管理。
-3. 后端访问红果、Emby 和允许的媒体 CDN；页面不直接接触凭证或远端，也不访问
-   HTTP loopback。
-4. 媒体按需分片传输，通过 MSE、HLS 或 FFmpeg 路径播放；每次响应、后台队列、
-   分片缓存与页面缓冲都有上限。
+1. launchd 常驻的后台服务经原生助手观察 Codex 启动，在安全条件下以 loopback
+   随机调试端口重开 Codex，再通过 CDP 注入卡片渲染器。
+2. 页面经 CDP binding 与后台 RPC 通信；各卡片共用渲染器、服务注册表与生命周期管理。
+3. 后台访问红果、Emby 和允许的媒体 CDN；页面不直接接触凭证。
+4. 媒体经 127.0.0.1 本地代理（HLS）、CDP 媒体拦截或有界 RPC 分片 + MSE 播放；
+   每次响应、后台队列、分片缓存与页面缓冲都有上限。
 5. 返回、seek、切集、登出或关闭页面会取消对应请求并回收资源；心跳超时也会触发回收。
 
-### 无感注入（仅 macOS，可选）
-
-除官方插件外，macOS 还可以使用 `Codex Companion.app` 提供的无感注入：后台服务
-（launchd `com.codexcompanion.agent`）在 Codex 刚启动、尚未操作且位于前台时，请求它
-正常退出，再以 `--remote-debugging-address=127.0.0.1` 和随机端口重开并注入卡片。
-已经在使用的 Codex 窗口不会被自动退出，两次自动重开至少间隔两分钟。
-
-Codex 已关闭 Electron 的运行时调试入口，CDP 只能通过启动参数开启。该模式依赖
-Codex 的 DOM 结构，Codex 改版后可能需要更新。日志位于
-`~/Library/Logs/codex-companion/agent.log`，`node src/cli.mjs agent status` 输出状态。
+注入依赖 Codex 的 DOM 结构，Codex 改版后可能需要更新。日志位于
+`~/Library/Logs/codex-companion/agent.log`（Linux：`journalctl --user -u codex-companion-agent`），
+`node src/cli.mjs agent status` 输出状态。
 
 ## 开发
 
 ```sh
 npm test                                        # 必须使用 Node 内置测试运行器
-npm run build:plugin                            # 本机平台 → dist/plugin
-npm run build:plugin -- --target linux-x64      # 交叉编译：darwin|linux|win32 - arm64|x64
-npm run smoke:plugin:backend                    # 按 .mcp.json 启动后端并完成 MCP 握手
-npm run smoke:plugin                            # 官方 AppBridge、全部卡片与媒体的浏览器验证
-npm run smoke                                   # Chromium 冒烟（旧注入渲染器）
+npm run smoke                                   # Chromium 冒烟
 npm run card:create -- my-card --title 我的卡片  # 新建内置卡片
-```
-
-macOS 专用：
-
-```sh
-npm run start:legacy              # 旧 CDP 启动与常驻注入
-node src/cli.mjs agent            # 前台运行无感注入后台服务
-node scripts/build-native.mjs     # 编译原生助手
-npm run build:app                 # 构建 Codex Companion.app
+node src/cli.mjs agent                          # 前台运行后台服务
+node scripts/build-native.mjs                   # 编译原生助手
+npm run build:app                               # 构建 Codex Companion.app
+npm run build:linux -- --target linux-x64       # 构建 Linux 单文件后端
+npm run start:legacy                            # 旧一次性 CDP 启动与注入
 ```
 
 新增卡片只需在 `src/cards/<id>/` 下新建目录，平台统一管理外框、Shadow DOM、配置、
@@ -200,9 +181,8 @@ npm run build:app                 # 构建 Codex Companion.app
 
 ## 安全与隐私
 
-插件页面使用受限 CSP，通过后端工具访问服务；视图、卡片、请求代次和媒体分片相互
-绑定，关闭或禁用卡片后不能继续读取旧分片。旧 CDP 模式强制绑定 loopback 和随机
-端口，禁止暴露到局域网或公网。
+CDP 调试端口强制绑定 loopback 和随机端口，禁止暴露到局域网或公网。卡片、请求代次和
+媒体分片相互绑定，关闭或禁用卡片后不能继续读取旧分片。
 
 Emby Token 只发往配置的 Emby origin，不进入 DOM、媒体 URL、FFmpeg 命令行或日志。
 跨源媒体 CDN 必须使用 HTTPS，并经过地址、DNS 和公网 IP 校验。依赖版本由
@@ -221,25 +201,19 @@ Emby Token 只发往配置的 Emby origin，不进入 DOM、媒体 URL、FFmpeg 
   不支持自签名 Emby HTTPS。
 - 切换到其他卡片时暂停媒体；不支持 Emby 自动连播、在线字幕搜索或字幕时间轴偏移。
 - 红果仅支持公开播放页提供的 MP4 和当前页面 / FFmpeg 可处理的编码。
-- 插件入口、侧栏宽度和页面模式由 Codex 宿主提供。
-- Windows / Linux 不提供通过代理重启 Codex 与无感注入。
+- 已经在使用、未带调试参数的 Codex 需要手动重开一次才能注入。
+- Linux 为预览：登录后会话界面中的卡片位置尚未验证；Windows 暂不支持。
 - 任务看板的状态由 Codex 本地会话记录推断，依赖其记录格式与侧栏 DOM，Codex 改版后
   可能需要更新。
 
 ## 卸载
 
-在 Codex 的插件管理中移除 Companion，或使用与安装时相同 `CODEX_HOME` 的 CLI：
+在 `Codex Companion.app` 中点击「卸载 Companion」再删除 App，或运行
+`bash install.sh --uninstall`（Linux 同样适用：停用服务、删除 Companion 生成的菜单入口与程序，
+系统原有入口随之恢复）；开发安装使用 `node src/cli.mjs agent uninstall`。
 
-```sh
-codex plugin remove codex-companion@codex-companion-local
-```
-
-如需同时清除配置与存档，手动删除上文的数据目录；Emby Token 位于 macOS「钥匙串访问」、
-Windows 数据目录下的 `credentials\`，或 Linux 密钥环（`secret-tool clear service
-codex-companion.emby`）/ 数据目录下的 `credentials.json`。删除不可恢复。
-
-macOS 无感注入：在 `Codex Companion.app` 中点击「卸载 Companion」再删除 App，或运行
-`bash install.sh --uninstall`；开发安装使用 `node src/cli.mjs agent uninstall`。
+如需同时清除配置与存档，手动删除上文的数据目录；Emby Token 位于「钥匙串访问」
+（service 为 `codex-companion.emby`）。删除不可恢复。
 
 ## 参与贡献与许可
 

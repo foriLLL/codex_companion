@@ -5,25 +5,21 @@
 
 ## 开发环境
 
-- macOS、Windows 或 Linux，Node.js 22+ 与 npm
-- 可选系统 FFmpeg（`brew install ffmpeg`、`apt install ffmpeg`、`winget install ffmpeg` 等）
-- 无感注入、`.app` 与原生助手的开发需要 macOS 与 `/Applications/ChatGPT.app`
+- macOS 与 `/Applications/ChatGPT.app`，或 Linux 与官方 ChatGPT 桌面版（预览），Node.js 22+ 与 npm
+- 可选系统 FFmpeg（`brew install ffmpeg`）
 
 ```bash
 npm ci
 npm test
-npm run build:plugin
-npm run smoke:plugin:backend
-npm run smoke:plugin
 npm run smoke
 ```
 
 测试必须使用 `node --test`（即 `npm test`），不要使用 `bun test`。注入源码包含基于
 `Function.prototype.toString()` 的断言，Bun 转译会改变函数文本。Bun 只用于编译和打包。
 
-主入口为官方插件，代码位于 `src/plugin/`；卡片渲染器和服务与旧 CDP 模式共用。
-修改插件界面后运行 `build:plugin` 与 `smoke:plugin`；修改公共运行时还应验证
-`smoke:platform`。`plugin:probe:host` 使用临时隔离配置，不调用模型、不重启桌面端。
+主入口为无感注入后台服务，代码位于 `src/agent/`；卡片渲染器与服务位于 `src/cards/`
+与 `src/renderer/`。修改公共运行时还应验证 `smoke:platform`。开发与测试禁止对真实
+Codex 执行退出、启动或激活，原生能力只对 dummy app 验证。
 
 ### 跨平台约定
 
@@ -32,11 +28,13 @@ npm run smoke
 - 需要平台分支的函数接受 `platform` 参数（默认 `process.platform`），测试显式传入，
   保证在任意宿主上都能覆盖 macOS / Windows / Linux 规则。
 - 只在 macOS 上有意义的功能（launchd、钥匙串、通过代理重启 Codex）在其它平台
-  返回明确的「不支持」状态，而不是抛出 `ENOENT`。
+  返回明确的「不支持」状态，而不是抛出 `ENOENT`。宿主操作系统在 agent 里叫 `hostPlatform`，
+  与传给页面的 RPC `platform` 对象区分。
+- Linux 没有图形界面也能验证：用 Xvfb 提供虚拟显示，从覆盖后的菜单入口启动
+  （`gio launch ~/.local/share/applications/chatgpt.desktop`），再经 CDP 截图核对。
 - 断言文件权限请使用 `test/helpers/permissions.mjs` 中的 `assertMode`（Windows 没有
   POSIX 权限位）。
-- CI 在 Ubuntu、Windows 与 macOS 上运行全部测试，并为六个目标构建插件、按
-  `.mcp.json` 启动后端冒烟。
+- CI 在 Ubuntu、Windows 与 macOS 上运行全部测试，并构建 arm64/x64 的 `.app`。
 
 ## 代码约定
 
@@ -55,8 +53,7 @@ smoke。macOS Release 必须保持 Developer ID 签名和 Apple 公证的失败�
 
 ## 维护者发布
 
-GitHub Release 只接受与 `package.json` 版本一致的 `v*` tag；`package.json` 与
-`plugin/.codex-plugin/plugin.json` 的版本必须一致（有测试校验）。仓库需要配置：
+GitHub Release 只接受与 `package.json` 版本一致的 `v*` tag。仓库需要配置：
 
 - `MACOS_CERTIFICATE_P12`、`MACOS_CERTIFICATE_PASSWORD`；
 - `MACOS_SIGNING_IDENTITY`；
@@ -65,9 +62,7 @@ GitHub Release 只接受与 `package.json` 版本一致的 `v*` tag；`package.j
 工作流会：
 
 - 分别构建 arm64/x64 的 `Codex Companion.app`，签名内层后端和应用、核对 Team ID、
-  提交 Apple 公证并 staple，再生成绑定同一 Team ID 的安装器；
-- 在各平台原生 runner 上构建六个目标的插件包并冒烟；macOS 插件后端同样经过
-  Developer ID 签名与公证，Linux 为 `.tar.gz`，Windows 为 `.zip`。
+  提交 Apple 公证并 staple，再生成绑定同一 Team ID 的安装器。
 
 任一凭据缺失、版本不一致、签名或公证失败都会终止，不发布降级产物。
 `workflow_dispatch` 只生成内部 workflow artifact，不创建 GitHub Release。
