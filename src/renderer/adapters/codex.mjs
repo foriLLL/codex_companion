@@ -11,6 +11,8 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
   const matchMedia = window.matchMedia.bind(window);
   const hostId = "codex-companion-root";
   const railId = "codex-companion-rail";
+  // 原生 Summary 面板的默认宽度；独立抽屉同宽，原生布局判定按它计算。
+  const PANEL_WIDTH = 300;
   const hostStyles = new Map();
   const nativeAttributes = new Map();
   const markNative = (node, name, value) => {
@@ -419,7 +421,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
       button:focus-visible { outline:2px solid #4b91e2; outline-offset:2px; }
       .drawer {
         position:absolute; top:88px; right:0; bottom:0;
-        width:min(348px, 100%); padding:12px 16px 16px;
+        width:min(${PANEL_WIDTH + 24}px, 100%); padding:12px 8px 16px 16px;
         overflow:auto; overscroll-behavior:contain; pointer-events:auto;
         -webkit-app-region:no-drag; transform-origin:top right;
       }
@@ -544,7 +546,12 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     syncResizeObservation();
     return false;
   };
-  let panelIntent = null;
+  // 与原生 Summary 相同的两层意图：pinned 是常驻开关，popover 只在 overlay 档临时浮出。
+  // overlay 档下 pinned 的面板不显示（拖窄窗口时消失），回到宽档再出现。
+  let pinned = false;
+  let popoverOpen = false;
+  let displayMode = null; // 原生判定："overlay" | "shift" | "gutter"；原生模块缺失时为 null
+  const wantsOpen = () => pinned || popoverOpen;
   let returnFocus = null;
 
   let closingSummary = null;
@@ -569,7 +576,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     closingSummary = null;
   };
 
-  const setCompanionOpen = (open) => {
+  const setCompanionOpen = (open, { everywhere = false } = {}) => {
     clearSummaryClose();
     if ((!hasCards && !hasSettings) || disposed) return;
     if (!usesStandalone()) {
@@ -579,7 +586,10 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
       return;
     }
     if (open) returnFocus = document.activeElement;
-    panelIntent = open ? "cards" : null;
+    // 同原生 toggle：overlay 档只开合浮层，其余档位改常驻开关。
+    if (everywhere) pinned = popoverOpen = open;
+    else if (displayMode === "overlay") popoverOpen = open;
+    else pinned = open;
     if (open && usesStandalone()) {
       const trigger = openSummaryTrigger();
       if (trigger) {
@@ -591,7 +601,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
         summaryCloseTimer = setTimeout(() => {
           const stillOpen = openSummaryTrigger();
           clearSummaryClose();
-          if (stillOpen) setCompanionOpen(false);
+          if (stillOpen) setCompanionOpen(false, { everywhere: true });
           else schedulePlacement();
         }, 1200);
       }
@@ -606,17 +616,17 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     schedulePlacement();
   };
   const onNativeSummaryClick = (event) => {
-    if (!usesStandalone() || drivingSummary || panelIntent !== "cards") return;
+    if (!usesStandalone() || drivingSummary || !wantsOpen()) return;
     const trigger = event.composedPath().find((node) => node instanceof HTMLButtonElement && matchesSummaryLabel(node));
-    if (trigger) setCompanionOpen(false);
+    if (trigger) setCompanionOpen(false, { everywhere: true });
   };
   // 捕获阶段先撤下播放器，原生点击/键盘激活照常传播，不劫持 Toggle Summary。
   document.addEventListener("click", onNativeSummaryClick, true);
-  const onEntryClick = () => setCompanionOpen(panelIntent !== "cards");
+  const onEntryClick = () => setCompanionOpen(displayMode === "overlay" ? !popoverOpen : !pinned);
   companionButton.addEventListener("click", onEntryClick);
   toolbarButton.addEventListener("click", onEntryClick);
   const onCompanionKeyDown = (event) => {
-    if (event.key !== "Escape" || event.defaultPrevented || panelIntent !== "cards") return;
+    if (event.key !== "Escape" || event.defaultPrevented || !wantsOpen()) return;
     // 只处理播放器自己的 Escape，避免抢占 Codex 的菜单和编辑器快捷键。
     if (!event.composedPath().includes(shell) && !event.composedPath().includes(toolbarHost)) return;
     event.preventDefault();
@@ -626,12 +636,74 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
   shell.addEventListener("keydown", onCompanionKeyDown);
   toolbarHost.addEventListener("keydown", onCompanionKeyDown);
 
-  // 只接管会话与输入框的位置，不改应用根节点、导航栏或 React 状态。
-  // 与原生 Summary 一样平移这两个区域（宽度不变、不重排），平移量为抽屉宽度的一半，
-  // 即让内容列在剩余空间居中；宽块通过原生的 --thread-wide-block-inline-shift 同步收窄。
-  // 平移由注册过的自定义属性驱动，才能与抽屉同时开始、同时结束地动画。
-  // 左侧留白放不下内容列时回退为收窄宽度。样式表覆盖而非改写原生 inline style，
-  // 关闭时恢复的是原生当前状态。
+  // 判定与平移都复用原生 Summary，不自己定阈值：
+  // - 判定：原生 thread-summary-panel-layout-*.js 是纯函数 chunk（overlay/shift/gutter 档位、
+  //   可见面、会话平移量）。按文件名找到后动态 import，导出名经压缩会变，按行为识别。
+  // - 平移：原生在 [data-request-input-activity-root] 上写 --thread-content-x，会话与输入框的
+  //   _shiftWithTranscript_* 类据此 translate 并收窄宽块。我们只覆盖这一个变量。
+  // 原生模块或平移钩子缺失（非本地会话、宿主改版）时不平移，抽屉浮在会话上方。
+  const NATIVE_LAYOUT_CHUNK = /\/thread-summary-panel-layout-[\w-]+\.js(?:[?#]|$)/;
+  let nativeLayout = null;
+  let nativeLayoutUrl = null;
+  let nativeLayoutLoading = false;
+  let nativeLayoutCheckedAt = -Infinity;
+  const pickNativeLayout = (module) => {
+    const exports = Object.values(module ?? {}).filter((value) => typeof value === "function");
+    const probe = (fn, argument) => { try { return fn(argument); } catch { return undefined; } };
+    const find = (matches) => exports.find((fn) => matches((argument) => probe(fn, argument)));
+    const resolveMode = find((call) => call(0) === "overlay" && call(1300) === "shift" && call(2000) === "gutter");
+    const contentOffset = find((call) => {
+      const shifted = call({ displayMode: "shift", isPinned: true, panelWidth: PANEL_WIDTH });
+      return typeof shifted === "number" && shifted < 0 && call({ displayMode: "gutter", isPinned: true }) === 0;
+    });
+    const visibility = find((call) => call({ displayMode: "shift", isPinned: true })?.visibleSurface === "inline"
+      && call({ displayMode: "overlay", isPinned: true, isPopoverOpen: true })?.visibleSurface === "popover");
+    return resolveMode && contentOffset && visibility ? { resolveMode, contentOffset, visibility } : null;
+  };
+  const loadNativeLayout = () => {
+    if (nativeLayout || nativeLayoutLoading) return;
+    // 原生 chunk 随会话页懒加载；未找到时每秒最多复查一次，不在流式输出时反复扫描。
+    const now = performance.now();
+    if (now - nativeLayoutCheckedAt < 1000) return;
+    nativeLayoutCheckedAt = now;
+    const url = [
+      ...Array.from(document.querySelectorAll("link[href], script[src]"), (node) => node.href || node.src),
+      ...(window.performance?.getEntriesByType?.("resource") ?? []).map((entry) => entry.name)
+    ].find((candidate) => NATIVE_LAYOUT_CHUNK.test(candidate));
+    if (!url || url === nativeLayoutUrl) return;
+    nativeLayoutUrl = url;
+    nativeLayoutLoading = true;
+    import(url).then((module) => {
+      nativeLayout = pickNativeLayout(module);
+      if (!nativeLayout) reportError(new Error("无法识别原生 Summary 布局模块的导出"));
+    }, reportError).finally(() => {
+      nativeLayoutLoading = false;
+      if (!disposed) schedulePlacement();
+    });
+  };
+  // mainContentTargetWidth 的 DOM 对应：会话布局根（含输入框）的宽度。
+  const measureThread = () => {
+    const content = Array.from(document.querySelectorAll("[data-thread-user-message-navigation-content]"))
+      .find((node) => node.getBoundingClientRect().width > 0);
+    const root = content?.closest("[data-request-input-activity-root]") ?? null;
+    const frame = root ?? content?.closest(".thread-scroll-container") ?? null;
+    const bounds = frame?.getBoundingClientRect() ?? null;
+    return {
+      bounds: bounds && bounds.width > 0 && bounds.height > 0 ? bounds : null,
+      shiftRoot: root?.querySelector('[class*="_shiftWithTranscript_"]') ? root : null
+    };
+  };
+  const layoutResizeObserver = new ResizeObserver(() => schedulePlacement());
+  let layoutObserved = null;
+  const observeLayout = (element) => {
+    if (element === layoutObserved) return;
+    if (layoutObserved) layoutResizeObserver.unobserve(layoutObserved);
+    layoutObserved = element;
+    if (element) layoutResizeObserver.observe(element);
+  };
+
+  // 平移量由注册过的自定义属性驱动，才能与抽屉同时开始、同时结束地动画；
+  // 样式表覆盖而非改写原生 inline style，关闭时恢复的是原生当前状态。
   const DOCK_SHIFT = "--codex-companion-dock-shift";
   let dockShiftAnimatable = false;
   if (typeof window.CSS?.registerProperty === "function") {
@@ -645,126 +717,58 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
   }
   const dockStyle = document.createElement("style");
   dockStyle.id = `${hostId}-dock-style`;
-  const dockNodes = new Set();
-  let dockMode = null; // "shift" | "narrow" | null
+  let dockRoot = null;
   let dockShift = 0;
-  let dockAnimations = [];
-  const stopDockAnimations = () => {
-    const animations = dockAnimations;
-    dockAnimations = [];
-    for (const animation of animations) animation.cancel();
-  };
-  const unmarkDock = () => {
-    dockStyle.remove();
-    for (const node of dockNodes) restoreNativeAttribute(node, "data-companion-dock");
-    dockNodes.clear();
+  let dockAnimation = null;
+  const stopDockAnimation = () => {
+    const animation = dockAnimation;
+    dockAnimation = null;
+    animation?.cancel();
   };
   const clearConversationDock = () => {
-    stopDockAnimations();
-    dockMode = null;
+    stopDockAnimation();
     dockShift = 0;
-    unmarkDock();
-  };
-  const writeDockStyle = (css) => {
-    if (dockStyle.textContent !== css) dockStyle.textContent = css;
-    if (!dockStyle.isConnected) document.documentElement.append(dockStyle);
+    dockStyle.remove();
+    if (dockRoot) restoreNativeAttribute(dockRoot, "data-companion-dock");
+    dockRoot = null;
   };
   // 当前实际平移量（含进行中的动画），中途反向时从当前帧继续。
   const renderedDockShift = () => {
-    for (const node of dockNodes) {
-      if (node.getAttribute("data-companion-dock") !== "content") continue;
-      const value = parseFloat(getComputedStyle(node).getPropertyValue(DOCK_SHIFT));
-      if (Number.isFinite(value)) return value;
-    }
-    return 0;
+    const value = dockRoot ? parseFloat(getComputedStyle(dockRoot).getPropertyValue(DOCK_SHIFT)) : 0;
+    return Number.isFinite(value) ? value : 0;
   };
-  const animateDockShift = (from, to, phase) => {
-    stopDockAnimations();
-    const keyframes = [{ [DOCK_SHIFT]: `${from}px` }, { [DOCK_SHIFT]: `${to}px` }];
-    const animations = [...dockNodes].map((node) => node.animate(keyframes, motion(phase)));
-    dockAnimations = animations;
-    for (const animation of animations) {
-      animation.finished.then(() => {
-        dockAnimations = dockAnimations.filter((item) => item !== animation);
-        // 平移回 0 后由下一轮放置移除标记和样式。
-        if (!disposed && !dockAnimations.length) schedulePlacement();
-      }).catch(() => {});
-    }
-  };
-  const dockConversation = (open, { visible = open, handoff = false } = {}) => {
-    ownedRail.style.removeProperty("width");
-    // 抽屉已隐藏，或原生 Summary 接管平移：立即交还，不与原生动画叠加。
-    if (!visible || handoff) { clearConversationDock(); return; }
+  const dockConversation = (target, { root, visible, animate }) => {
+    // 抽屉已隐藏、原生 Summary 接管或没有原生平移钩子：立即交还，不与原生动画叠加。
+    if (!visible || !root) { clearConversationDock(); return; }
     const from = renderedDockShift();
-    const previousNodes = [...dockNodes];
-    // 收窄会改变被测量的宽度，先撤销；平移不影响测量，保留以免打断动画。
-    if (dockMode === "narrow") unmarkDock();
-    // 稳定的语义标记优先，类名仅用于找到承载滚动/容器查询的布局区域。
-    const content = Array.from(document.querySelectorAll("[data-thread-user-message-navigation-content]"))
-      .find((node) => node.getBoundingClientRect().width > 0);
-    const scroller = content?.closest(".thread-scroll-container");
-    const bounds = scroller?.getBoundingClientRect();
-    if (!bounds || bounds.width <= 0 || bounds.height <= 0) { clearConversationDock(); return; }
-    const drawerWidth = Math.min(348, bounds.width * 0.45);
-    ownedRail.style.width = `${drawerWidth}px`;
-    ownedRail.style.right = `${Math.max(0, window.innerWidth - bounds.right)}px`;
-    const mark = (node, value) => {
-      markNative(node, "data-companion-dock", value);
-      dockNodes.add(node);
-    };
-    let frame = content;
-    while (frame.parentElement && frame.parentElement !== scroller) frame = frame.parentElement;
-    const footer = scroller.querySelector("[data-thread-scroll-footer]")
-      ?? scroller.parentElement?.querySelector("[data-thread-scroll-footer]");
-    const margin = parseFloat(getComputedStyle(frame).getPropertyValue("--thread-content-margin")) || 24;
-    const fits = frame !== scroller && content.getBoundingClientRect().width + margin * 2 <= bounds.width - drawerWidth;
-    if (!fits) {
-      // 回退：收窄会话与输入框；关闭动画期间保持，抽屉隐藏后才恢复。
+    const sameRoot = root === dockRoot;
+    if (!sameRoot) {
+      // 原生替换了节点：旧节点上的动画作废，在新节点上直接到位。
       clearConversationDock();
-      dockMode = "narrow";
-      mark(scroller, "scroll");
-      if (frame !== scroller) mark(frame, "content");
-      if (footer) mark(footer, "footer");
-      const width = Math.max(1, bounds.width - drawerWidth);
-      writeDockStyle(`
-        [data-companion-dock="scroll"], [data-companion-dock="footer"] {
-          box-sizing:border-box !important; width:${width}px !important; max-width:${width}px !important;
-        }
-        [data-companion-dock="content"], [data-companion-dock="footer"] {
-          transform:none !important; translate:none !important; --thread-wide-block-inline-shift:0px !important;
-        }
-      `);
-      return;
+      dockRoot = root;
+      markNative(root, "data-companion-dock", "root");
     }
-    const nextNodes = footer ? [frame, footer] : [frame];
-    const sameNodes = dockMode === "shift" && previousNodes.length === nextNodes.length
-      && nextNodes.every((node) => dockNodes.has(node));
-    if (!sameNodes) {
-      // 原生替换了节点或刚从收窄切换：旧节点上的动画作废，在新节点上直接到位。
-      stopDockAnimations();
-      unmarkDock();
-      mark(frame, "content");
-      if (footer) mark(footer, "footer");
-    }
-    dockMode = "shift";
-    const target = open ? Math.round(drawerWidth / 2) : 0;
     if (target !== dockShift) {
-      // 只在开合之间动画；窗口尺寸变化直接跟随。
+      // 只在开合之间动画；拖动窗口跨档位与原生一样直接跟随。
       const toggled = (target > 0) !== (dockShift > 0);
-      const animatable = dockShiftAnimatable && !drawerMotion.matches && typeof frame.animate === "function";
-      if (toggled && animatable && (sameNodes || !previousNodes.length)) {
-        animateDockShift(sameNodes ? from : 0, target, open ? "dockOpen" : "dockClose");
-      } else stopDockAnimations();
+      if (animate && toggled && dockShiftAnimatable && !drawerMotion.matches && typeof root.animate === "function") {
+        stopDockAnimation();
+        const animation = root.animate([{ [DOCK_SHIFT]: `${sameRoot ? from : 0}px` }, { [DOCK_SHIFT]: `${target}px` }],
+          motion(target > 0 ? "dockOpen" : "dockClose"));
+        dockAnimation = animation;
+        animation.finished.then(() => {
+          if (dockAnimation !== animation) return;
+          dockAnimation = null;
+          // 平移回 0 后由下一轮放置移除标记和样式。
+          if (!disposed) schedulePlacement();
+        }).catch(() => {});
+      } else stopDockAnimation();
       dockShift = target;
     }
-    if (target === 0 && !dockAnimations.length) { clearConversationDock(); return; }
-    writeDockStyle(`
-      [data-companion-dock="content"], [data-companion-dock="footer"] {
-        ${DOCK_SHIFT}:${target}px;
-        transform:translateX(calc(var(${DOCK_SHIFT}) * -1)) !important; translate:none !important;
-        --thread-wide-block-inline-shift:var(${DOCK_SHIFT}) !important;
-      }
-    `);
+    if (target === 0 && !dockAnimation) { clearConversationDock(); return; }
+    const css = `[data-companion-dock="root"] { ${DOCK_SHIFT}:${target}px; --thread-content-x:calc(var(${DOCK_SHIFT}) * -1) !important; }`;
+    if (dockStyle.textContent !== css) dockStyle.textContent = css;
+    if (!dockStyle.isConnected) document.documentElement.append(dockStyle);
   };
 
   // 同一棵文档中的 moveBefore 保留焦点、iframe 与媒体的连接状态。
@@ -798,15 +802,30 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     const appReady = Boolean(document.querySelector("button"));
     companionButton.hidden = inToolbar || !appReady;
     ownedRail.style.top = inToolbar ? "48px" : "88px";
-    ownedRail.style.right = "0px";
     const nativeOpen = openSummaryTrigger();
     if (closingSummary && !nativeOpen) clearSummaryClose();
-    if (panelIntent === "cards" && nativeOpen && !closingSummary) setCompanionOpen(false);
-    const open = panelIntent === "cards" && !nativeOpen;
+    if (wantsOpen() && nativeOpen && !closingSummary) setCompanionOpen(false, { everywhere: true });
+    loadNativeLayout();
+    const { bounds, shiftRoot } = measureThread();
+    observeLayout(shiftRoot);
+    const nextMode = nativeLayout && bounds ? nativeLayout.resolveMode(bounds.width, PANEL_WIDTH) : null;
+    const modeChanged = nextMode !== displayMode;
+    // 同原生：离开 overlay 档即收起浮层，常驻开关保留。
+    if (modeChanged && nextMode !== "overlay") popoverOpen = false;
+    displayMode = nextMode;
+    const surface = nativeOpen ? null
+      : nextMode ? nativeLayout.visibility({ displayMode: nextMode, isPinned: pinned, isPopoverOpen: popoverOpen }).visibleSurface
+        : (wantsOpen() ? "floating" : null);
+    const open = surface !== null;
+    ownedRail.dataset.surface = surface ?? "none";
+    ownedRail.style.right = `${bounds ? Math.max(0, window.innerWidth - bounds.right) : 0}px`;
     toolbarButton.setAttribute("aria-expanded", String(open));
     setDrawerVisible(open);
-    // 收起时会话与抽屉同时回位；关闭期间抽屉仍可见，宽度保持不变。
-    dockConversation(open, { visible: !ownedRail.hidden, handoff: nativeOpen });
+    // 收起时会话与抽屉同时回位；关闭期间抽屉仍可见。
+    const target = surface === "inline"
+      ? Math.round(-nativeLayout.contentOffset({ displayMode: nextMode, isPinned: true, panelWidth: PANEL_WIDTH }))
+      : 0;
+    dockConversation(target, { root: nativeOpen ? null : shiftRoot, visible: !ownedRail.hidden, animate: !modeChanged });
     companionButton.setAttribute("aria-expanded", String(open));
     syncNativeStyles(null);
     placementMode = open ? "standalone" : "hidden";
@@ -848,6 +867,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     }
     if (usesStandalone()) return ensureStandalonePlacement();
     clearConversationDock();
+    observeLayout(null);
     toolbarHost.remove();
     companionButton.hidden = true;
     // 隐藏时保留同一个已连接的 rail；只有原生自己删除父节点才迁移到停车区。
@@ -989,6 +1009,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     restoreAnimationColumn();
     restoreOuterScroller();
     clearConversationDock();
+    observeLayout(null);
     syncResizeObservation();
     toolbarHost.remove();
     if (detach) {
@@ -1012,7 +1033,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
       drawerAnimation = null;
       drawerOpen = false;
       ownedRail.hidden = true;
-      panelIntent = null;
+      pinned = popoverOpen = false;
       placement = value;
       standalone = value === "standalone-button";
       summaryUnsupported = false;
@@ -1023,13 +1044,14 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     setHasCards(value) {
       if (disposed || hasCards === Boolean(value)) return;
       hasCards = Boolean(value);
-      if (!hasCards && !hasSettings) panelIntent = null;
+      if (!hasCards && !hasSettings) pinned = popoverOpen = false;
       runPlacement();
     },
     setOpen(value) { setCompanionOpen(Boolean(value)); },
     isOpen: () => !disposed && Boolean(lastVisibility?.visible),
     isPlaced: () => !disposed && (hasCards || hasSettings) && host.isConnected && placementMode !== "hidden",
-    getDiagnostics: () => ({ placement, mode: placementMode, visible: !disposed && Boolean(lastVisibility?.visible), hasCards, hasSettings, disposed, fallbackActive, inlineEntryFallback, summaryUnsupported, moveFallbacks, placementStats: { ...placementStats } }),
+    getDiagnostics: () => ({ placement, mode: placementMode, visible: !disposed && Boolean(lastVisibility?.visible), hasCards, hasSettings, disposed, fallbackActive, inlineEntryFallback, summaryUnsupported, moveFallbacks,
+      nativeLayout: Boolean(nativeLayout), displayMode, drawerSurface: ownedRail.dataset.surface ?? "none", dockShift, placementStats: { ...placementStats } }),
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -1037,6 +1059,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
       if (placementFrame) window.cancelAnimationFrame?.(placementFrame);
       observer.disconnect();
       resizeObserver.disconnect();
+      layoutResizeObserver.disconnect();
       window.removeEventListener("resize", schedulePlacement);
       document.removeEventListener("click", onNativeSummaryClick, true);
       shell.removeEventListener("keydown", onCompanionKeyDown);
