@@ -64,6 +64,17 @@ export function endsWithQuestion(text) {
 
 const LINE_LIMIT = 80;
 
+// request_user_input 参数里的第一个问题标题。
+function questionTitle(args) {
+  try {
+    const input = typeof args === "string" ? JSON.parse(args) : args;
+    const question = input?.questions?.[0];
+    return firstLine(question?.title ?? question?.question ?? question?.header ?? null);
+  } catch {
+    return null;
+  }
+}
+
 // 取第一行有内容的文字，去掉 Markdown 记号并截短。
 export function firstLine(text, limit = LINE_LIMIT) {
   if (typeof text !== "string") return null;
@@ -106,6 +117,7 @@ export function describeTool(name, input) {
 /**
  * 解析 rollout 尾部文本，返回最后一个回合生命周期事件。首行可能被截断，解析失败的行直接跳过。
  * 回合以问句结束，或回合中有尚未得到回答的 request_user_input 调用时，状态为 asking。
+ * 异步提问不阻塞回合：Codex 问完可能再补一句再结束回合，问题卡仍挂着等回答，所以回合结束后照样算 asking。
  * activity：进行中时最近的动作；summary：回合结束时的回复摘要（提问时是问题本身）。
  */
 // inTurn：调用方确认这段文字只是文件尾部窗口。窗口里有回合内条目却没有任何回合事件，
@@ -119,12 +131,13 @@ export function lastLifecycle(text, { inTurn = false } = {}) {
   const pending = new Set();
   // 异步提问（request_user_input_async）的工具输出立即返回 accepted，
   // 要等用户回答（send_user_message_question_reply 消息里带着 call_id）才算答完。
-  const asking = new Set();
+  // call_id → 问题标题，用作摘要。
+  const asking = new Map();
   for (const line of text.split("\n")) {
     if (line.includes("\"response_item\"")) {
       sawItem = true;
       if (asking.size && line.includes("send_user_message_question_reply")) {
-        for (const callId of asking) if (line.includes(callId)) asking.delete(callId);
+        for (const callId of asking.keys()) if (line.includes(callId)) asking.delete(callId);
       }
       // 工具输出可能很大，只抠 call_id，不整行解析。
       if (line.includes("_call_output\"")) {
@@ -141,7 +154,7 @@ export function lastLifecycle(text, { inTurn = false } = {}) {
         note = firstLine((payload.content ?? []).map((part) => part?.text ?? "").join("\n")) ?? note;
         activity = note ?? activity;
       } else if (payload.type === "function_call" || payload.type === "custom_tool_call") {
-        if (/request_user_input_async/.test(payload.name ?? "")) asking.add(payload.call_id);
+        if (/request_user_input_async/.test(payload.name ?? "")) asking.set(payload.call_id, questionTitle(payload.arguments));
         else if (/request_user_input/.test(payload.name ?? "")) pending.add(payload.call_id);
         activity = describeTool(payload.name, payload.arguments ?? payload.input);
       }
@@ -159,6 +172,10 @@ export function lastLifecycle(text, { inTurn = false } = {}) {
     last = { status, at: Number.isFinite(at) ? at : null, summary: replySummary(payload.last_agent_message, status === "asking") };
   }
   if (!last && inTurn && sawItem) last = { status: "running", at: null, summary: null };
+  if (last && last.status !== "running" && last.status !== "interrupted" && asking.size) {
+    last.status = "asking";
+    last.summary = [...asking.values()].findLast(Boolean) ?? last.summary;
+  }
   if (last?.status === "running") {
     const waiting = pending.size + asking.size > 0;
     if (waiting) last.status = "asking";
