@@ -693,6 +693,12 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
       shiftRoot: root?.querySelector('[class*="_shiftWithTranscript_"]') ? root : null
     };
   };
+  const isShown = (node) => {
+    const bounds = node.getBoundingClientRect();
+    return bounds.width > 0 && bounds.height > 0;
+  };
+  const onDotPage = () => !measureThread().bounds
+    && Array.from(document.querySelectorAll(".messaging-root")).some(isShown);
   const layoutResizeObserver = new ResizeObserver(() => schedulePlacement());
   let layoutObserved = null;
   const observeLayout = (element) => {
@@ -838,6 +844,14 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     if (!hasCards && !hasSettings) {
       resetLayout(true);
       notifyVisibility(false, "no-cards");
+      return false;
+    }
+    // Dot 会话（.messaging-root）右上角有原生通话等浮动按钮，与抽屉位置冲突：此页不提供入口。
+    // 开关状态保留，回到普通会话后照常恢复。
+    if (onDotPage()) {
+      resetLayout(false);
+      companionButton.hidden = true;
+      notifyVisibility(false, "dot-page");
       return false;
     }
     // 新版/空会话可能没有 Summary。设置入口不能因此失联；原生入口出现后恢复原 placement。
