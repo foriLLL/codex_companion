@@ -337,6 +337,37 @@ try {
   await evaluate(`modalAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
+  // Dot 会话（.messaging-root）右上角有原生通话按钮，与抽屉冲突：此页不提供入口；回到普通会话后按原开关恢复。
+  await evaluate(`(() => {
+    globalThis.threadPage='<header class="toolbar" style="display:flex;justify-content:flex-end;height:40px"><div><button aria-label="Share">S</button></div></header>'
+      + '<div class="thread-scroll-container" style="position:absolute;inset:48px 0 0"><div data-thread-user-message-navigation-content>Conversation</div></div>';
+    globalThis.dotPage='<header class="toolbar" style="display:flex;justify-content:flex-end;height:40px"><div><button aria-label="Share">S</button></div></header>'
+      + '<div class="messaging-root messaging-embedded" style="position:absolute;inset:40px 0 0">'
+      + '<div style="position:absolute;top:8px;right:8px"><button id="dot-call" aria-label="Start call" style="width:32px;height:32px">C</button></div>'
+      + '<div data-role="messages-scroll" class="messages-scroll" style="height:100%;overflow:auto">Message</div></div>'
+      // 普通会话页保活在后台：节点仍在，尺寸为 0。
+      + '<div class="thread-scroll-container" style="display:none"><div data-thread-user-message-navigation-content>Hidden</div></div>';
+    document.body.innerHTML=threadPage;
+    globalThis.dotVisibility=[];
+    globalThis.dotAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message),onVisibilityChange:({visible,reason})=>dotVisibility.push([visible,reason])});
+  })()`);
+  const entryShown = `(() => {
+    const shell=document.getElementById('codex-companion-root-shell');
+    return {toolbar:Boolean(document.getElementById('codex-companion-root-toolbar')?.isConnected),
+      floating:shell?.shadowRoot.querySelector('button').hidden === false, drawer:shell?.shadowRoot.querySelector('.drawer').hidden === false};
+  })()`;
+  await evaluate(`dotAdapter.setOpen(true)`);
+  await waitFor(`dotAdapter.isOpen()`, "普通会话抽屉打开");
+  await evaluate(`document.body.innerHTML=dotPage`);
+  await waitFor(`!dotAdapter.isOpen() && ${entryShown}.drawer === false`, "Dot 页收起抽屉");
+  assert.deepEqual(await evaluate(entryShown), { toolbar: false, floating: false, drawer: false }, "Dot 页不显示入口");
+  assert.equal(await evaluate(`(() => { const call=document.getElementById('dot-call').getBoundingClientRect(); return document.elementFromPoint(call.x+call.width/2,call.y+call.height/2)?.id; })()`), "dot-call", "不挡原生通话按钮");
+  assert.deepEqual(await evaluate(`dotVisibility.at(-1)`), [false, "dot-page"]);
+  await evaluate(`document.body.innerHTML=threadPage`);
+  await waitFor(`dotAdapter.isOpen() && ${entryShown}.toolbar && ${entryShown}.drawer`, "回到普通会话按原开关恢复");
+  await evaluate(`dotAdapter.dispose()`);
+  assert.deepEqual(await evaluate(`errors`), []);
+
   await evaluate(`clearInterval(frameTimer);video.srcObject.getTracks().forEach(track=>track.stop())`);
   console.log("Codex adapter smoke passed:", JSON.stringify(evidence));
 } finally {
