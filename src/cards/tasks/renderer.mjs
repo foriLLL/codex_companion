@@ -11,7 +11,7 @@ const PEEK_MAX_WIDTH = 720;
 const PEEK_MIN_WIDTH = 420;
 const SILENT_CODES = new Set(["ABORTED", "RPC_CANCELLED", "RPC_STALE_GENERATION", "CARD_DISABLED", "STATE_DISPOSED"]);
 // 左侧状态图标。需要人处理的（提问、中断、无响应）排最前，没看过的会跳动提醒；
-// 其次是没看过的新回复，进行中的放后面。
+// 其次是没看过的新回复（图标摇晃提醒），进行中的放后面。
 const STATUS = {
   asking: { label: "在等你回答", icon: "ask", human: true },
   interrupted: { label: "已中断，需要你处理", icon: "alert", human: true },
@@ -41,7 +41,7 @@ const ICONS = {
   done: '<path d="M3.5 8.4l2.9 2.9 6.1-6.6"/>',
   color: '<path d="M8 2.6s4 4.2 4 6.9a4 4 0 0 1-8 0c0-2.7 4-6.9 4-6.9z"/>'
 };
-// 状态图标 20×20，彩色渐变实心：状态色与任务色分开，条目底色表示是哪个任务，图标表示它在干什么。
+// 状态图标 20×20，彩色渐变实心：状态色与任务色分开，图标底块表示是哪个任务，图标表示它在干什么。
 // 渐变 id 带 cc-task- 前缀，渲染时替换成每个图标唯一的 id。
 const gradient = (id, from, to) => `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="${to}"/></linearGradient></defs>`;
 const BUBBLE = '<path d="M3 6.2A3.2 3.2 0 0 1 6.2 3h7.6A3.2 3.2 0 0 1 17 6.2v4.6a3.2 3.2 0 0 1-3.2 3.2H9.6l-3.4 2.7c-.4.3-.9 0-.9-.5V14h-.1A2.2 2.2 0 0 1 3 11.8z" fill="url(#cc-task-reply)" stroke="none"/><path d="M7 7.6h6M7 10.2h3.8" stroke="#fff" stroke-width="1.5"/>';
@@ -79,8 +79,8 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
       --attention:#d9661b;--danger:#d4483e;--running:#3b82f6;--ease:cubic-bezier(.22,1,.36,1);
       font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif;letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
     *{box-sizing:border-box}
-    .board{padding:14px 0 0;font-size:13.5px;line-height:1.4}
-    header{display:flex;align-items:center;gap:10px;padding:0 14px 10px 16px;min-height:22px}
+    .board{padding:14px 8px 8px;font-size:13.5px;line-height:1.4}
+    header{display:flex;align-items:center;gap:10px;padding:0 6px 10px 8px;min-height:22px}
     h2{flex:none;display:flex;align-items:center;gap:7px;margin:0;font-size:14px;font-weight:600;white-space:nowrap}
     h2 svg{color:#5b8def}
     .chips{min-width:0;display:flex;gap:9px;overflow:hidden;font-size:12px;color:var(--text);font-variant-numeric:tabular-nums}
@@ -89,23 +89,22 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     .chip[data-kind=running]{--dot:var(--running)}
     .chip[data-kind=human]{--dot:var(--attention);color:var(--attention)}
     button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer;letter-spacing:inherit}
-    .add{display:flex;align-items:center;gap:9px;width:100%;padding:9px 16px;
-      box-shadow:inset 0 1px 0 var(--line);color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
+    .add{display:flex;align-items:center;gap:9px;width:100%;padding:9px 8px;border-radius:10px;color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
     .add:hover{background:var(--hover);color:var(--text)}
     .add svg{flex:none}
     .add .title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .add b{font-weight:500;color:currentColor}
     ul{list-style:none;margin:0;padding:0;display:grid}
-    /* 条目紧挨着铺满卡片宽度，底色取任务色，和左侧侧栏条目的标记一致；状态只看左侧彩色图标。
-       相邻条目之间只有一道很淡的分隔，同色条目挨着也分得清。 */
-    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;background:color-mix(in srgb,var(--task) 10%,transparent);
+    /* 条目紧挨着排列，不铺底色；任务色只铺在状态图标底下的浅色圆角块上，和左侧侧栏条目的标记呼应。
+       悬停时整行浅浅地铺一层任务色。 */
+    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;border-radius:10px;
       transition:background-color .16s ease;transform-origin:50% 60%}
-    .task+.task{box-shadow:inset 0 1px 0 color-mix(in srgb,currentColor 6%,transparent)}
-    .task:hover,.task:focus-within,.task[data-peek]{background:color-mix(in srgb,var(--task) 17%,transparent)}
-    .main{flex:1;min-width:0;display:grid;grid-template-columns:20px 1fr;column-gap:11px;align-items:center;padding:10px 16px;text-align:left}
+    .task:hover,.task:focus-within,.task[data-peek]{background:color-mix(in srgb,var(--task) 12%,transparent)}
+    .main{flex:1;min-width:0;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:8px;text-align:left;border-radius:10px}
     .main:focus-visible{outline:2px solid color-mix(in srgb,var(--task) 55%,transparent);outline-offset:-2px}
-    .status{position:relative;z-index:2;display:grid;place-items:center;width:20px;height:20px;transform-origin:50% 100%;color:var(--muted)}
-    .status svg{display:block;overflow:visible;width:20px;height:20px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.08))}
+    .status{position:relative;z-index:2;display:grid;place-items:center;width:28px;height:28px;border-radius:8px;
+      background:color-mix(in srgb,var(--task) 16%,transparent);transform-origin:50% 100%;color:var(--muted)}
+    .status svg{display:block;overflow:visible;width:18px;height:18px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.08))}
     .status[data-icon=spin] svg{filter:none}
     .status[data-icon=spin] .arc{transform-origin:10px 10px;animation:turn .9s linear infinite}
     .text{min-width:0}
@@ -128,22 +127,24 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     /* 需要人处理且还没看过：图标跳出条目，落下时砸得条目轻晃一下。常驻动画只动 transform，交给合成器。 */
     .task[data-hop]{animation:knock 3.2s infinite;will-change:transform}
     .task[data-hop] .status{animation:hop 3.2s infinite;will-change:transform}
-    .actions{position:absolute;right:10px;top:50%;display:flex;gap:2px;transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .16s ease}
+    /* 有新回复还没看：图标像来消息的手机一样隔一会儿摇一下。 */
+    .task[data-shake] .status{transform-origin:50% 50%;animation:shake 2.6s infinite;will-change:transform}
+    .actions{position:absolute;right:6px;top:50%;display:flex;gap:2px;transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .16s ease}
     .task:hover .actions,.task:focus-within .actions{opacity:1;pointer-events:auto}
     .task:hover .text,.task:focus-within .text{padding-right:86px}
     .icon{display:grid;place-items:center;width:26px;height:26px;border-radius:7px;color:var(--text);
       background:var(--cc-card-bg,transparent);box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.05)}
     .icon:hover{color:currentColor;background:color-mix(in srgb,currentColor 9%,transparent)}
-    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 16px;min-height:60px}
+    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 8px;min-height:60px}
     .palette button{width:22px;height:22px;border-radius:50%;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.08);transition:transform .2s var(--ease)}
     .palette button:hover{transform:scale(1.15)}
     .palette button[aria-checked=true]{box-shadow:0 0 0 2px currentColor}
-    .editor{flex:1;display:grid;grid-template-columns:20px 1fr;column-gap:11px;align-items:center;padding:10px 16px}
+    .editor{flex:1;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:8px}
     input{width:100%;font:inherit;font-weight:500;color:inherit;background:transparent;border:0;border-radius:6px;padding:2px 6px;margin:-2px -6px;
       outline:none;box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 30%,transparent)}
-    .empty{margin:6px 16px 14px;font-size:12.5px;line-height:1.55;color:var(--muted)}
-    .note{margin:6px 16px 10px;font-size:12.5px;color:var(--danger)}
-    .toast{display:flex;align-items:center;gap:10px;margin:8px 10px 10px;padding:7px 8px 7px 12px;border-radius:12px;font-size:12.5px;
+    .empty{margin:6px 8px 6px;font-size:12.5px;line-height:1.55;color:var(--muted)}
+    .note{margin:6px 8px 2px;font-size:12.5px;color:var(--danger)}
+    .toast{display:flex;align-items:center;gap:10px;margin:8px 0 0;padding:7px 8px 7px 12px;border-radius:12px;font-size:12.5px;
       background:color-mix(in srgb,currentColor 90%,transparent);color:var(--cc-card-bg,Canvas);box-shadow:0 6px 20px rgba(0,0,0,.14)}
     .toast span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .toast button{font-weight:600;padding:3px 8px;border-radius:7px}
@@ -170,6 +171,14 @@ ${TRACE_STYLE}
       38%{transform:scale(1.22,.78);animation-timing-function:ease-out}
       45%{transform:translateY(-4px) scale(.97,1.04);animation-timing-function:ease-in}
       51%,100%{transform:none}}
+    @keyframes shake{
+      0%,30%,100%{transform:none}
+      4%{transform:rotate(-14deg)}
+      8%{transform:rotate(12deg)}
+      12%{transform:rotate(-10deg)}
+      16%{transform:rotate(7deg)}
+      20%{transform:rotate(-4deg)}
+      24%{transform:rotate(2deg)}}
     @keyframes knock{
       0%,33.5%,60%,100%{transform:none}
       36%{transform:translateY(1.6px) rotate(-.7deg)}
@@ -366,6 +375,7 @@ ${TRACE_STYLE}
     item.dataset.id = task.threadId;
     if (colors[task.color]) item.style.setProperty("--task", colors[task.color]);
     if (STATUS[task.status]?.human && task.unread) item.dataset.hop = "";
+    else if (task.status === "idle" && task.unread) item.dataset.shake = "";
     if (editing === task.threadId) {
       renderEditor(task, item);
       return item;

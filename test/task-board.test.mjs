@@ -74,6 +74,12 @@ test("以问句收尾或有未回答的提问时为 asking", () => {
   const reply = item("2026-10-28T10:01:00Z", { type: "message", role: "user", content: [{ type: "input_text", text: "<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"c1\\\",0]\",\"answer\":\"A\"}]" }] });
   assert.equal(lastLifecycle([started, call, accepted, working, reply].join("\n")).status, "running");
   assert.equal(lastLifecycle([call, event("2026-10-28T10:02:00Z", "task_started")].join("\n")).status, "running", "新回合清掉旧提问");
+  // 异步提问后又补一句并结束回合：问题卡仍挂着，摘要取问题标题而不是补的那句。
+  const titled = item("2026-10-28T10:00:30Z", { type: "function_call", name: "request_user_input_async", call_id: "c1", arguments: JSON.stringify({ questions: [{ title: "哪种时刻最让你觉得值？", options: ["A", "B"] }] }) });
+  const done = event("2026-10-28T10:00:40Z", "task_complete", { last_agent_message: "挑最让你有成就感的那个。" });
+  assert.deepEqual([lastLifecycle([started, titled, accepted, done].join("\n"))].map(({ status, summary }) => [status, summary]), [["asking", "哪种时刻最让你觉得值？"]]);
+  assert.equal(lastLifecycle([started, titled, accepted, reply, done].join("\n")).status, "idle", "答完后回合结束就是普通回复");
+  assert.equal(lastLifecycle([started, titled, accepted, event("2026-10-28T10:00:40Z", "turn_aborted")].join("\n")).status, "interrupted");
   // 尾部窗口里只有回合内条目：回合开始在窗口之前，仍在进行；异步提问照样识别。
   assert.equal(lastLifecycle([working].join("\n")), null, "不确定是窗口时不猜");
   assert.equal(lastLifecycle([working].join("\n"), { inTurn: true }).status, "running");

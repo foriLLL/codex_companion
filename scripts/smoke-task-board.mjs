@@ -237,6 +237,10 @@ try {
   assert.deepEqual(await evaluate(`[...card.querySelectorAll('.task')].map((item) => item.querySelector('.status').dataset.icon)`), ["ask", "unread", "alert", "spin", "reply"], "按需要处理的程度排序");
   assert.equal(await evaluate(`${task("bHidden")}.hasAttribute('data-hop')`), true, "没看过的提问会跳动");
   assert.equal(await evaluate(`${task("s1")}.hasAttribute('data-hop')`), false, "看过的中断不跳");
+  assert.equal(await evaluate(`${task("a10")}.hasAttribute('data-shake')`), true, "没看过的新回复会摇晃");
+  assert.equal(await evaluate(`${task("a3")}.hasAttribute('data-shake')`), false, "看过的回复不摇");
+  assert.equal(await evaluate(`getComputedStyle(${task("a10")}).backgroundColor`), "rgba(0, 0, 0, 0)", "条目不铺任务色底");
+  assert.notEqual(await evaluate(`getComputedStyle(${task("a10")}.querySelector('.status')).backgroundColor`), "rgba(0, 0, 0, 0)", "任务色铺在图标底块");
   assert.equal(await evaluate(`${task("a10")}.querySelector('.meta').textContent`), "25 分钟前 · 已升级到 1.6.2，播放冒烟通过", "第二行是时间和最后一句回复");
   assert.equal(await evaluate(`${task("a24")}.querySelector('.meta .live')?.textContent`), "运行 npm test", "进行中显示当前动作");
   assert.equal(await evaluate(`${task("bHidden")}.querySelector('.tag')?.textContent`), "需要你");
