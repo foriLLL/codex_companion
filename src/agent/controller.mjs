@@ -186,11 +186,10 @@ export class AgentController {
     }
   }
 
-  #untouched(app, snapshot) {
+  // 只看启动时长：用户刚打开就点击或输入也照常重开，不能因为操作得快就错过注入。
+  #fresh(app, snapshot) {
     const age = snapshot.now - app.launchedAt;
-    return Number.isFinite(age) && age >= 0 && age <= this.#freshWindowMs
-      && Number.isFinite(snapshot.inputIdleMs) && snapshot.inputIdleMs >= age
-      && typeof snapshot.inputStamp === "string";
+    return Number.isFinite(age) && age >= 0 && age <= this.#freshWindowMs;
   }
 
   #latestSnapshot(snapshot) {
@@ -202,9 +201,8 @@ export class AgentController {
     const apps = classify(latest);
     if (apps.length !== 1 || apps[0].key !== app.key) return false;
     if (mode === "user") return apps[0].kind === "plain" || apps[0].kind === "ours";
-    return apps[0].kind === "plain" && this.#untouched(apps[0], latest)
-      && apps[0].finishedLaunching === true && latest.frontmostPid === app.pid
-      && latest.inputStamp === snapshot.inputStamp;
+    return apps[0].kind === "plain" && this.#fresh(apps[0], latest)
+      && apps[0].finishedLaunching === true && latest.frontmostPid === app.pid;
   }
 
   async #processSnapshot(snapshot) {
@@ -216,7 +214,7 @@ export class AgentController {
     const baseline = !this.#hasBaseline;
     this.#hasBaseline = true;
     const protectedApps = baseline ? apps.filter((app) => app.kind === "plain"
-      && !(apps.length === 1 && this.#untouched(app, snapshot))) : [];
+      && !(apps.length === 1 && this.#fresh(app, snapshot))) : [];
     // 必须在首次 await 前保护基线，记录或通知故障也不能让它变成新实例。
     for (const app of protectedApps) this.#seen.add(app.key);
     await this.#observe(snapshot, apps);
@@ -235,8 +233,8 @@ export class AgentController {
       if (!this.#autoRelaunch()) {
         await this.#record("skipped-disabled", details);
         if (this.#notifyWhenManual) await this.#call("notify", "needs-restart", details);
-      } else if (!this.#untouched(app, snapshot)) {
-        await this.#record("skipped-active", details);
+      } else if (!this.#fresh(app, snapshot)) {
+        await this.#record("skipped-stale", details);
         await this.#call("notify", "skipped", details);
       } else if (app.finishedLaunching !== true || snapshot.frontmostPid !== app.pid) {
         this.#pendingLaunch = true;
@@ -256,7 +254,7 @@ export class AgentController {
     }
   }
 
-  async #waitForExit(app, mode, inputStamp) {
+  async #waitForExit(app, mode) {
     const deadline = this.#now() + this.#quitTimeoutMs;
     // snapshot 也可能迟迟不返回；超时后的返回值必须被丢弃，不能恢复重开流程。
     const timeout = this.#pause(this.#quitTimeoutMs).then(() => null);
@@ -274,14 +272,7 @@ export class AgentController {
         await this.#record("another-instance", { processKey: app.key, mode });
         return null;
       }
-      if (apps.length === 0 && latest.apps.length === 0) {
-        if (mode === "fresh" && (snapshot.inputStamp !== inputStamp || latest.inputStamp !== inputStamp)) {
-          await this.#record("canceled-by-input", { processKey: app.key });
-          await this.#call("notify", "skipped", { processKey: app.key });
-          return null;
-        }
-        return snapshot;
-      }
+      if (apps.length === 0 && latest.apps.length === 0) return snapshot;
     }
     await this.#record("quit-timeout", { processKey: app.key, mode });
     return null;
@@ -307,31 +298,30 @@ export class AgentController {
   }
 
   async #restartFresh(app, initial) {
-    const { inputStamp } = initial;
     // 等待落盘时可能已经收到新事实，不能把队列串行化当作忽略守卫的理由。
     if (!this.#canQuit(app, initial, "fresh")) {
       await this.#record("quit-refused", { processKey: app.key, reason: "snapshot-changed" });
       return;
     }
-    const quit = await this.#call("quit", { pid: app.pid, key: app.key, mode: "fresh", inputStamp });
+    const quit = await this.#call("quit", { pid: app.pid, key: app.key, mode: "fresh" });
     if (!quit.accepted) {
       await this.#record("quit-refused", { processKey: app.key, reason: quit.reason });
       return;
     }
-    if (!await this.#waitForExit(app, "fresh", inputStamp)) return;
+    if (!await this.#waitForExit(app, "fresh")) return;
     await this.#pause(250);
     const snapshot = await this.#call("snapshot");
     const apps = await this.#observe(snapshot);
     const latest = this.#latestSnapshot(snapshot);
-    if (apps.length || latest.apps.length || latest.inputStamp !== inputStamp || snapshot.inputStamp !== inputStamp) {
+    if (apps.length || latest.apps.length) {
       for (const entry of [...apps, ...latest.apps]) this.#seen.add(entry.key);
       await this.#record("reopen-canceled", { processKey: app.key });
       return;
     }
-    const guards = { inputStamp, frontmostPid: snapshot.frontmostPid };
-    const launched = await this.#launch({ hidden: true, ...guards }, app.key);
+    // 已经退出就必须带回窗口：重开期间切走或操作也照常显示，否则 Codex 像是自己消失了。
+    const launched = await this.#launch({ hidden: true }, app.key);
     if (!launched) return;
-    const { shown } = await this.#call("show", { pid: launched.pid, key: launched.key, ...guards });
+    const { shown } = await this.#call("show", { pid: launched.pid, key: launched.key });
     await this.#record("reopened", { processKey: app.key, key: launched.key, shown });
   }
 

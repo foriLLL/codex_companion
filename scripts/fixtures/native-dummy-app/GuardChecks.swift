@@ -14,8 +14,8 @@ struct GuardChecks {
       count += 1
     }
     func refusal(_ app: AppInstance? = base, key: String? = nil, mode: String = "fresh",
-                 stamp: String? = input.inputStamp, maxAge: Int64 = 8000, state: InputState = input) -> String? {
-      quitRefusal(app, key: key ?? base.key, mode: mode, stamp: stamp, maxAgeMs: maxAge, input: state)
+                 maxAge: Int64 = 8000, state: InputState = input) -> String? {
+      quitRefusal(app, key: key ?? base.key, mode: mode, maxAgeMs: maxAge, input: state)
     }
     check("fresh", refusal(), nil)
     check("missing", refusal(nil), "instance-mismatch")
@@ -44,22 +44,15 @@ struct GuardChecks {
     state.now = 9001
     check("old", refusal(state: state), "age-out-of-range")
     check("custom-window", refusal(maxAge: 999), "age-out-of-range")
-    check("changed-input", refusal(stamp: "1:2:3:4:6"), "input-changed")
-    check("missing-stamp", refusal(stamp: nil), "input-changed")
     state = input
-    state.inputIdleMs = 999
-    check("recent-input", refusal(state: state), "input-since-launch")
-    state.inputIdleMs = 1000
-    check("idle-boundary", refusal(state: state), nil)
+    state.inputStamp = "9:9:9:9:9"
+    state.inputIdleMs = 0
+    check("input-since-launch-allowed", refusal(state: state), nil)
     state.frontmostPid = 99
     check("background", refusal(state: state), "not-frontmost")
     app.finishedLaunching = false
     app.arguments = nil
-    check("user-bypasses-fresh", refusal(app, mode: "user", stamp: nil, maxAge: 0, state: state), nil)
-    check("context-none", contextRefusal(stamp: nil, frontmostPid: nil, input: input), nil)
-    check("context-matched", contextRefusal(stamp: input.inputStamp, frontmostPid: 42, input: input), nil)
-    check("context-input", contextRefusal(stamp: "changed", frontmostPid: 42, input: input), "input-changed")
-    check("context-frontmost", contextRefusal(stamp: input.inputStamp, frontmostPid: 99, input: input), "frontmost-changed")
+    check("user-bypasses-fresh", refusal(app, mode: "user", maxAge: 0, state: state), nil)
     func encoded(_ value: [String: Any]?) -> String? {
       guard let value else { return nil }
       return String(data: try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), encoding: .utf8)

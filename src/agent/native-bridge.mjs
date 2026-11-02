@@ -179,17 +179,14 @@ export function createNativeBridge({
 
   return {
     snapshot: () => request("snapshot"),
-    quit: ({ pid, key, mode, inputStamp, maxAgeMs }) => request("quit", appendOptional([
+    quit: ({ pid, key, mode, maxAgeMs }) => request("quit", appendOptional([
       "--pid", String(pid), "--key", key, "--mode", mode
-    ], [["--input-stamp", inputStamp], ["--max-age-ms", maxAgeMs]])),
-    launch: ({ args = [], env, unsetEnv, hidden = false, inputStamp, frontmostPid } = {}) => request("launch", appendOptional([
+    ], [["--max-age-ms", maxAgeMs]])),
+    launch: ({ args = [], env, unsetEnv, hidden = false } = {}) => request("launch", appendOptional([
       "--args-json", JSON.stringify(args), ...(hidden ? ["--hidden"] : [])
     ], [["--env-json", env === undefined ? undefined : JSON.stringify(env)],
-      ["--unset-env-json", unsetEnv === undefined ? undefined : JSON.stringify(unsetEnv)],
-      ["--input-stamp", inputStamp], ["--frontmost-pid", frontmostPid]])),
-    show: ({ pid, key, inputStamp, frontmostPid }) => request("show", appendOptional([
-      "--pid", String(pid), "--key", key
-    ], [["--input-stamp", inputStamp], ["--frontmost-pid", frontmostPid]])),
+      ["--unset-env-json", unsetEnv === undefined ? undefined : JSON.stringify(unsetEnv)]])),
+    show: ({ pid, key }) => request("show", ["--pid", String(pid), "--key", key]),
     watch
   };
 }

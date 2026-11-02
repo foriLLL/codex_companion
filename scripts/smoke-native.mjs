@@ -137,17 +137,6 @@ async function main() {
       await waitFor(() => snapshots.length > 0, "watch initial");
       assert.deepEqual(snapshots[0].apps, []);
     });
-    await check("launch 拒绝输入变化", async () => {
-      const state = await bridge.snapshot();
-      assert.deepEqual(await bridge.launch({ args: [], hidden: true, inputStamp: "changed", frontmostPid: state.frontmostPid }),
-        { launched: false, reason: "input-changed" });
-    });
-    await check("launch 拒绝前台变化", async () => {
-      const state = await bridge.snapshot();
-      const result = await bridge.launch({ args: [], hidden: true, inputStamp: state.inputStamp, frontmostPid: state.frontmostPid === 0 ? 1 : 0 });
-      assert.equal(result.launched, false);
-      assert.ok(["frontmost-changed", "input-changed"].includes(result.reason));
-    });
     await check("最小参数隐藏启动", async () => {
       const baselineRecord = join(root, "baseline.json");
       const result = await bridge.launch({ args: ["--record", baselineRecord], hidden: true });
@@ -201,24 +190,17 @@ async function main() {
     });
     for (const mode of ["fresh", "user"]) {
       await check(`quit ${mode} key 不匹配`, async () => {
-        assert.deepEqual(await bridge.quit({ ...launched, key: `${launched.pid}:0`, mode, inputStamp: "0:0:0:0:0" }),
+        assert.deepEqual(await bridge.quit({ ...launched, key: `${launched.pid}:0`, mode }),
           { accepted: false, reason: "key-mismatch" });
       });
     }
     await check("fresh age 超窗拒绝", async () => {
-      const state = await bridge.snapshot();
-      assert.deepEqual(await bridge.quit({ ...launched, mode: "fresh", inputStamp: state.inputStamp, maxAgeMs: 0 }),
+      assert.deepEqual(await bridge.quit({ ...launched, mode: "fresh", maxAgeMs: 0 }),
         { accepted: false, reason: "age-out-of-range" });
     });
-    await check("fresh inputStamp 不一致拒绝", async () => {
-      assert.deepEqual(await bridge.quit({ ...launched, mode: "fresh", inputStamp: "changed", maxAgeMs: 60_000 }),
-        { accepted: false, reason: "input-changed" });
-    });
-    await check("fresh 后台/已有输入拒绝", async () => {
-      const state = await bridge.snapshot();
-      const result = await bridge.quit({ ...launched, mode: "fresh", inputStamp: state.inputStamp, maxAgeMs: 60_000 });
-      assert.equal(result.accepted, false);
-      assert.ok(["not-frontmost", "input-since-launch", "input-changed"].includes(result.reason));
+    await check("fresh 后台拒绝", async () => {
+      assert.deepEqual(await bridge.quit({ ...launched, mode: "fresh", maxAgeMs: 60_000 }),
+        { accepted: false, reason: "not-frontmost" });
     });
     const beforeQuit = snapshots.length;
     await check("quit user 正常退出", () => quitAll());
@@ -264,7 +246,7 @@ async function main() {
       });
     }
     await check("用法错误为 JSON + exit 2", async () => {
-      for (const argv of [["unknown"], ["launch", "--args-json", "{}"], ["quit", "--pid", "1", "--key", "1:0", "--mode", "fresh"]]) {
+      for (const argv of [["unknown"], ["launch", "--args-json", "{}"], ["quit", "--pid", "1", "--key", "1:0", "--mode", "fresh", "--input-stamp", "0:0:0:0:0"]]) {
         await assert.rejects(execFileAsync(helperPath, [...argv, "--app", appPath]), (error) => {
           assert.equal(error.code, 2);
           assert.equal(typeof JSON.parse(error.stdout).error, "string");
@@ -289,13 +271,12 @@ async function main() {
     });
     if (interactive) {
       await check("interactive show 与 fresh 成功", async () => {
-        const before = await bridge.snapshot();
         const app = await bridge.launch({ args: ["--window"], hidden: true,
           env: { DUMMY_APP_RECORD: join(root, "interactive.json") } });
         assert.equal(app.launched, true);
-        assert.deepEqual(await bridge.show({ ...app, inputStamp: before.inputStamp, frontmostPid: before.frontmostPid }), { shown: true }, "show 未成功");
+        assert.deepEqual(await bridge.show(app), { shown: true }, "show 未成功");
         await waitFor(async () => { const value = await bridge.snapshot(); return value.frontmostPid === app.pid && value.apps[0]?.finishedLaunching; }, "show active");
-        assert.deepEqual(await bridge.quit({ ...app, mode: "fresh", inputStamp: before.inputStamp }), { accepted: true });
+        assert.deepEqual(await bridge.quit({ ...app, mode: "fresh" }), { accepted: true });
         await waitFor(async () => (await bridge.snapshot()).apps.length === 0, "fresh terminate");
       });
     }

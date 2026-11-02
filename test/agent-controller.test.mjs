@@ -171,13 +171,11 @@ test("C2.5：基线已有 plain 仅通知一次，之后守卫变好也永不自
   for (const change of [
     { app: { launchedAt: 900000 } },
     { app: { launchedAt: 1000001 } },
-    { app: { finishedLaunching: false }, snapshot: { inputIdleMs: 0 } },
-    { snapshot: { frontmostPid: 99, inputIdleMs: 0 } },
-    { snapshot: { inputIdleMs: 0 } }
+    { app: { launchedAt: 991999, finishedLaunching: false } }
   ]) {
     const h = harness();
     const app = h.app(change.app);
-    await h.feed(h.snapshot([app], change.snapshot));
+    await h.feed(h.snapshot([app]));
     await h.feed(h.snapshot([h.app({ key: app.key })]));
     await h.feed(h.snapshot());
     await h.feed(h.snapshot([h.app({ key: app.key })]));
@@ -190,7 +188,7 @@ test("C2.5：基线登录竞态已经就绪时允许 fresh 退出", async () => 
   const h = harness();
   const app = h.app({ launchedAt: h.clock.now() - 8000 });
   h.impl.quit = async () => ({ accepted: false, reason: "native-check" });
-  await h.feed(h.snapshot([app], { inputIdleMs: 8000 }));
+  await h.feed(h.snapshot([app], { inputIdleMs: 0 }));
   assert.deepEqual(h.events(), ["attempt", "quit-refused"]);
   assert.equal(h.count("quit"), 1);
   assert.equal(h.count("notify"), 0);
@@ -253,8 +251,7 @@ test("C2.5/6：关闭自动重开时基线实例也只记录 skipped-disabled，
     {},
     { app: { finishedLaunching: false } },
     { snapshot: { frontmostPid: 99 } },
-    { app: { launchedAt: 1 } },
-    { snapshot: { inputIdleMs: 0 } }
+    { app: { launchedAt: 1 } }
   ]) {
     const h = harness({ autoRelaunch: () => false });
     const app = h.app(change.app);
@@ -282,13 +279,10 @@ test("不能自动重开的平台（Linux）对基线与新出现的普通实例
   for (const h of [baseline, fresh]) assert.equal(h.count("quit") + h.count("launch"), 0);
 });
 
-test("C2.6：age、输入空闲时间和输入戳守卫逐项拒绝且不重试", async () => {
+test("C2.6：age 守卫逐项拒绝且不重试", async () => {
   for (const change of [
     { app: { launchedAt: 1000001 } },
     { app: { launchedAt: 991999 } },
-    { snapshot: { inputIdleMs: 999 } },
-    { snapshot: { inputIdleMs: NaN } },
-    { snapshot: { inputStamp: null } },
     { app: { launchedAt: NaN } }
   ]) {
     const h = harness();
@@ -296,11 +290,26 @@ test("C2.6：age、输入空闲时间和输入戳守卫逐项拒绝且不重试"
     const app = h.app(change.app);
     await h.feed(h.snapshot([app], change.snapshot));
     await h.feed(h.snapshot([h.app({ key: app.key })]));
-    assert.deepEqual(h.events(), ["skipped-active"]);
+    assert.deepEqual(h.events(), ["skipped-stale"]);
     assert.deepEqual(h.args("notify"), [["skipped", { processKey: app.key }]]);
     assert.equal(h.count("quit"), 0);
     assert.equal(h.controller.pendingLaunch, false);
   }
+});
+
+test("C2.6：刚打开就点击或输入也照常重开，退出与重开期间的输入不取消", async () => {
+  const h = harness();
+  await h.feed(h.snapshot());
+  const app = h.app();
+  const done = h.feed(h.snapshot([app], { inputStamp: "9:9:9:9:9", inputIdleMs: 0 }));
+  await flush();
+  assert.deepEqual(h.args("quit"), [[{ pid: app.pid, key: app.key, mode: "fresh" }]]);
+  await exitFresh(h, { inputStamp: "10:10:10:10:10", inputIdleMs: 0, frontmostPid: 77 });
+  await done;
+  assert.deepEqual(h.events(), ["attempt", "reopened"]);
+  assert.deepEqual(h.args("launch"), [[{ hidden: true }]]);
+  assert.deepEqual(h.args("show"), [[{ pid: 22, key: "22:1000500" }]]);
+  assert.equal(h.count("notify"), 0);
 });
 
 test("C2.6：未完成启动或尚未前台先等待，满足守卫后仅处理一次", async () => {
@@ -318,19 +327,17 @@ test("C2.6：未完成启动或尚未前台先等待，满足守卫后仅处理�
   }
 });
 
-test("C2.6：等待前台或启动完成期间超龄、发生输入或退出即结束等待", async () => {
-  for (const change of ["expired", "input", "exited"]) {
+test("C2.6：等待前台或启动完成期间超龄或退出即结束等待", async () => {
+  for (const change of ["expired", "exited"]) {
     const h = harness();
     await h.feed(h.snapshot());
     const app = h.app({ finishedLaunching: false });
     await h.feed(h.snapshot([app], { frontmostPid: 99 }));
     if (change === "expired") h.clock.advance(8000);
-    await h.feed(h.snapshot(change === "exited" ? [] : [app], {
-      frontmostPid: 99, inputIdleMs: change === "input" ? 0 : 10000
-    }));
+    await h.feed(h.snapshot(change === "exited" ? [] : [app], { frontmostPid: 99 }));
     assert.equal(h.controller.pendingLaunch, false);
     assert.equal(h.count("quit"), 0);
-    assert.deepEqual(h.events(), change === "exited" ? [] : ["skipped-active"]);
+    assert.deepEqual(h.events(), change === "exited" ? [] : ["skipped-stale"]);
   }
 });
 
@@ -379,7 +386,7 @@ test("C2.6：attempt 写成功之后才 quit，时间戳作为下次冷却依据
   write.resolve();
   await done;
   assert.deepEqual(h.args("record")[0], ["attempt", { lastAttemptAt: 1000000, processKey: app.key }]);
-  assert.deepEqual(h.args("quit"), [[{ pid: app.pid, key: app.key, mode: "fresh", inputStamp: "1:2:3:4:5" }]]);
+  assert.deepEqual(h.args("quit"), [[{ pid: app.pid, key: app.key, mode: "fresh" }]]);
   assert.equal(h.controller.status().lastAttemptAt, 1000000);
   await h.feed(h.snapshot([h.app({ pid: 33, key: "33:1" })]));
   assert.equal(h.count("quit"), 1);
@@ -387,7 +394,7 @@ test("C2.6：attempt 写成功之后才 quit，时间戳作为下次冷却依据
 });
 
 test("C2.4/6：attempt 落盘期间新快照使守卫失效时不能再 quit", async () => {
-  for (const cause of ["multiple", "exited", "input", "foreign", "unknown", "frontmost", "launching", "age"]) {
+  for (const cause of ["multiple", "exited", "foreign", "unknown", "frontmost", "launching", "age"]) {
     const h = harness();
     await h.feed(h.snapshot());
     const gate = deferred();
@@ -399,8 +406,8 @@ test("C2.4/6：attempt 落盘期间新快照使守卫失效时不能再 quit", a
       : cause === "unknown" ? { arguments: null } : cause === "launching" ? { finishedLaunching: false } : {};
     const apps = cause === "exited" ? [] : cause === "multiple" ? [app, h.app({ pid: 22, key: "22:1" })]
       : [{ ...app, ...changed }];
-    const snapshot = h.snapshot(apps, cause === "input" ? { inputStamp: "changed", inputIdleMs: 0 }
-      : cause === "frontmost" ? { frontmostPid: 99 } : cause === "age" ? { now: h.clock.now() + 8001 } : {});
+    const snapshot = h.snapshot(apps, cause === "frontmost" ? { frontmostPid: 99 }
+      : cause === "age" ? { now: h.clock.now() + 8001 } : {});
     const queued = h.controller.handleSnapshot(snapshot);
     gate.resolve();
     await Promise.all([done, queued]);
@@ -408,17 +415,6 @@ test("C2.4/6：attempt 落盘期间新快照使守卫失效时不能再 quit", a
     assert.equal(h.count("launch"), 0, cause);
     assert.ok(h.events().includes("quit-refused"), cause);
   }
-});
-
-test("C2.6：退出期间有输入即取消重开，并通知 skipped", async () => {
-  const h = harness();
-  const { app, done } = await startFresh(h);
-  h.set(h.snapshot([], { inputStamp: "2:2:3:4:5" }));
-  await h.tick(200);
-  await done;
-  assert.deepEqual(h.events(), ["attempt", "canceled-by-input"]);
-  assert.deepEqual(h.args("notify"), [["skipped", { processKey: app.key }]]);
-  assert.equal(h.count("launch"), 0);
 });
 
 test("C2.6：退出期间出现另一个实例即终止，包括 PID 重用但 key 改变", async () => {
@@ -495,19 +491,17 @@ test("C2.6/7：snapshot 不返回也会按时结束等待，迟到结果不能�
   }
 });
 
-test("C2.6：退出后的 250ms 窗口再次检查输入和新实例", async () => {
-  for (const cause of ["input", "instance"]) {
-    const h = harness();
-    const { done } = await startFresh(h);
-    h.set(h.snapshot());
-    await h.tick(200);
-    assert.deepEqual(h.clock.waits.map((wait) => wait.ms), [10000, 250]);
-    h.set(cause === "input" ? h.snapshot([], { inputStamp: "changed" }) : h.snapshot([h.app({ pid: 33, key: "33:1" })]));
-    await h.tick(250);
-    await done;
-    assert.deepEqual(h.events(), ["attempt", "reopen-canceled"]);
-    assert.equal(h.count("launch"), 0);
-  }
+test("C2.6：退出后的 250ms 窗口再次检查新实例", async () => {
+  const h = harness();
+  const { done } = await startFresh(h);
+  h.set(h.snapshot());
+  await h.tick(200);
+  assert.deepEqual(h.clock.waits.map((wait) => wait.ms), [10000, 250]);
+  h.set(h.snapshot([h.app({ pid: 33, key: "33:1" })]));
+  await h.tick(250);
+  await done;
+  assert.deepEqual(h.events(), ["attempt", "reopen-canceled"]);
+  assert.equal(h.count("launch"), 0);
 });
 
 test("C2.6/8：launch 返回失败或抛异常都会记录并通知", async () => {
@@ -540,15 +534,15 @@ test("C2.6：launch 缺少有效实例信息时按失败处理，不调用 show"
   }
 });
 
-test("C2.2/6：重开传递守卫，记录 shown，新 key 随后 attach 并在退出时 detach", async () => {
+test("C2.2/6：重开后显示窗口并记录 shown，新 key 随后 attach 并在退出时 detach", async () => {
   for (const shown of [false, true]) {
     const h = harness();
     h.impl.show = async () => ({ shown });
     const { app, done } = await startFresh(h);
     await exitFresh(h);
     await done;
-    assert.deepEqual(h.args("launch"), [[{ hidden: true, inputStamp: "1:2:3:4:5", frontmostPid: 99 }]]);
-    assert.deepEqual(h.args("show"), [[{ pid: 22, key: "22:1000500", inputStamp: "1:2:3:4:5", frontmostPid: 99 }]]);
+    assert.deepEqual(h.args("launch"), [[{ hidden: true }]]);
+    assert.deepEqual(h.args("show"), [[{ pid: 22, key: "22:1000500" }]]);
     assert.deepEqual(h.args("record").at(-1), ["reopened", { processKey: app.key, key: "22:1000500", shown }]);
     assert.deepEqual(h.controller.status().lastEvent, { event: "reopened", at: 1000450 });
     await h.feed(h.snapshot([h.ours({ pid: 22, key: "22:1000500" })]));
@@ -725,8 +719,8 @@ test("C2 串行化：忙时仅处理最新快照，首个快照仍作基线", as
 
 test("C2 串行化：同一轮同步到达的首个基线不能被后续快照覆盖", async () => {
   const h = harness();
-  const app = h.app({ finishedLaunching: false });
-  const first = h.feed(h.snapshot([app], { inputIdleMs: 0 }));
+  const app = h.app({ launchedAt: h.clock.now() - 9000 });
+  const first = h.feed(h.snapshot([app]));
   const next = h.feed(h.snapshot([h.app({ key: app.key })]));
   await Promise.all([first, next]);
   assert.equal(h.count("quit"), 0);

@@ -14,14 +14,14 @@ test("adapter launch 使用随机 loopback 端口，正确覆盖/删除全部代
   let port = 51230;
   const instance = adapter({ nativeBridge: bridge, reservePort: async () => ++port });
   await instance.applyConfig(normalizeCompanionConfigV2({ launch: { proxy: { enabled: true, port: 7891 } } }));
-  const result = await instance.launch({ hidden: true, inputStamp: "1:0:0:0:0", frontmostPid: 88 });
+  const result = await instance.launch({ hidden: true });
   assert.equal(result.finishedLaunching, false);
   assert.equal(result.hidden, false);
   const first = bridge.calls.at(-1)[1];
   assert.deepEqual(first.env, { HTTP_PROXY: "http://127.0.0.1:7891", HTTPS_PROXY: "http://127.0.0.1:7891", http_proxy: "http://127.0.0.1:7891", https_proxy: "http://127.0.0.1:7891" });
   assert.deepEqual(first.unsetEnv, ["ALL_PROXY", "all_proxy"]);
   assert.deepEqual(first.args.slice(0, 3), ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port=51231", "--proxy-server=http://127.0.0.1:7891"]);
-  assert.equal(first.inputStamp, "1:0:0:0:0");
+  assert.equal(first.hidden, true);
   await instance.applyConfig(normalizeCompanionConfigV2({}));
   await instance.launch({ hidden: false });
   assert.deepEqual(bridge.calls.at(-1)[1], { hidden: false,
