@@ -83,9 +83,10 @@ Linux 上 `npm start` 同样以源码注册 systemd 用户服务并覆盖菜单�
 
 ### 打开 Companion
 
-后台服务（launchd `com.codexcompanion.agent`）在 Codex 刚启动、尚未操作且位于前台时，
-请求它正常退出，再以 `--remote-debugging-address=127.0.0.1` 和随机端口重开并注入卡片。
-已经在使用的 Codex 窗口不会被自动退出，只提示需要重开；两次自动重开至少间隔两分钟。
+后台服务（launchd `com.codexcompanion.agent`）在 Codex 刚启动（8 秒内）且位于前台时，
+请求它正常退出，再以 `--remote-debugging-address=127.0.0.1` 和随机端口重开并注入卡片；
+打开后立刻点击或输入也照常重开。启动更久的 Codex 不会被自动退出，只提示需要重开；
+两次自动重开至少间隔两分钟。
 
 注入后 Codex 顶栏出现 Companion 入口，点开即显示卡片；设置（卡片区齿轮）里可以改为
 排在原生摘要下方。后台服务崩溃后由 launchd 自动拉起，并重新连接已开启调试端口的 Codex。

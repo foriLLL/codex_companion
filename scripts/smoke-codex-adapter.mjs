@@ -94,7 +94,7 @@ try {
   await waitFor(`adapter.isOpen()`, "独立面板未打开");
   await waitFor(`video.currentTime > .1`, "测试媒体未播放");
   assert.equal(await evaluate(`getComputedStyle(document.getElementById('frame')).transform`), "matrix(1, 0, 0, 1, -80, 0)", "不改写原生自己的平移");
-  assert.equal(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width === innerWidth && adapter.getDiagnostics().drawerSurface`), "floating", "无原生布局模块时浮在会话上方，不收窄");
+  assert.equal(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width === innerWidth && adapter.getDiagnostics().drawerSurface`), "inline", "没有平移钩子时按内置公式判档，不收窄会话");
   const beforeHide = await evaluate(`video.currentTime`);
   await evaluate(`adapter.setOpen(false)`);
   await waitFor(`!adapter.isOpen() && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').hidden`, "关闭动画未结束");
@@ -298,7 +298,7 @@ try {
   assert.equal(await evaluate(`!!document.querySelector('[data-companion-dock]') || !!document.getElementById('codex-companion-root-dock-style')`), false, "dispose 撤销平移");
   assert.deepEqual(await evaluate(`errors`), []);
 
-  // 没有原生布局模块：不自行判定、不平移，抽屉浮在会话上方。
+  // 没有原生布局模块（新版并进主 chunk）：用照抄原生的内置公式，同样判定 shift 档并平移 154px。
   await evaluate(`(() => {
     document.querySelector('link[rel=modulepreload]').remove();
     performance.clearResourceTimings();
@@ -306,9 +306,9 @@ try {
     globalThis.bareAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
   })()`);
   await evaluate(`bareAdapter.setOpen(true)`);
-  await waitFor(`bareAdapter.isOpen() && drawerOf().dataset.state === 'open'`, "无原生模块时仍可打开");
-  assert.deepEqual(await evaluate(`({native:bareAdapter.getDiagnostics().nativeLayout,surface:bareAdapter.getDiagnostics().drawerSurface,shift:shiftOf('shift-column')})`),
-    { native: false, surface: "floating", shift: 0 }, "无原生模块时只浮层");
+  await waitFor(`bareAdapter.isOpen() && drawerOf().dataset.state === 'open' && Math.round(shiftOf('shift-column')) === ${expectedShift}`, "无原生模块时按内置公式平移");
+  assert.deepEqual(await evaluate(`(() => { const {nativeLayout, layoutSource, displayMode, drawerSurface} = bareAdapter.getDiagnostics(); return {nativeLayout, layoutSource, displayMode, drawerSurface, footer: Math.round(shiftOf('shift-footer'))}; })()`),
+    { nativeLayout: false, layoutSource: "builtin", displayMode: "shift", drawerSurface: "inline", footer: expectedShift }, "内置公式与原生一致");
   await evaluate(`bareAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
@@ -335,6 +335,37 @@ try {
   await evaluate(`document.getElementById('modal-overlay').remove()`);
   await waitFor(`${drawerHit}?.id === 'codex-companion-root-shell'`, "弹窗关闭后抽屉恢复置顶");
   await evaluate(`modalAdapter.dispose()`);
+  assert.deepEqual(await evaluate(`errors`), []);
+
+  // Dot 会话（.messaging-root）右上角有原生通话按钮，与抽屉冲突：此页不提供入口；回到普通会话后按原开关恢复。
+  await evaluate(`(() => {
+    globalThis.threadPage='<header class="toolbar" style="display:flex;justify-content:flex-end;height:40px"><div><button aria-label="Share">S</button></div></header>'
+      + '<div class="thread-scroll-container" style="position:absolute;inset:48px 0 0"><div data-thread-user-message-navigation-content>Conversation</div></div>';
+    globalThis.dotPage='<header class="toolbar" style="display:flex;justify-content:flex-end;height:40px"><div><button aria-label="Share">S</button></div></header>'
+      + '<div class="messaging-root messaging-embedded" style="position:absolute;inset:40px 0 0">'
+      + '<div style="position:absolute;top:8px;right:8px"><button id="dot-call" aria-label="Start call" style="width:32px;height:32px">C</button></div>'
+      + '<div data-role="messages-scroll" class="messages-scroll" style="height:100%;overflow:auto">Message</div></div>'
+      // 普通会话页保活在后台：节点仍在，尺寸为 0。
+      + '<div class="thread-scroll-container" style="display:none"><div data-thread-user-message-navigation-content>Hidden</div></div>';
+    document.body.innerHTML=threadPage;
+    globalThis.dotVisibility=[];
+    globalThis.dotAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message),onVisibilityChange:({visible,reason})=>dotVisibility.push([visible,reason])});
+  })()`);
+  const entryShown = `(() => {
+    const shell=document.getElementById('codex-companion-root-shell');
+    return {toolbar:Boolean(document.getElementById('codex-companion-root-toolbar')?.isConnected),
+      floating:shell?.shadowRoot.querySelector('button').hidden === false, drawer:shell?.shadowRoot.querySelector('.drawer').hidden === false};
+  })()`;
+  await evaluate(`dotAdapter.setOpen(true)`);
+  await waitFor(`dotAdapter.isOpen()`, "普通会话抽屉打开");
+  await evaluate(`document.body.innerHTML=dotPage`);
+  await waitFor(`!dotAdapter.isOpen() && ${entryShown}.drawer === false`, "Dot 页收起抽屉");
+  assert.deepEqual(await evaluate(entryShown), { toolbar: false, floating: false, drawer: false }, "Dot 页不显示入口");
+  assert.equal(await evaluate(`(() => { const call=document.getElementById('dot-call').getBoundingClientRect(); return document.elementFromPoint(call.x+call.width/2,call.y+call.height/2)?.id; })()`), "dot-call", "不挡原生通话按钮");
+  assert.deepEqual(await evaluate(`dotVisibility.at(-1)`), [false, "dot-page"]);
+  await evaluate(`document.body.innerHTML=threadPage`);
+  await waitFor(`dotAdapter.isOpen() && ${entryShown}.toolbar && ${entryShown}.drawer`, "回到普通会话按原开关恢复");
+  await evaluate(`dotAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
   await evaluate(`clearInterval(frameTimer);video.srcObject.getTracks().forEach(track=>track.stop())`);

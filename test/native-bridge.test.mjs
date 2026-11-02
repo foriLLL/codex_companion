@@ -90,24 +90,24 @@ test("snapshot 成功与未知 argv 都按契约返回", async () => {
 test("quit fresh/user 成功或拒绝都 resolve，保持原生理由", async () => {
   const calls = [];
   const bridge = createNativeBridge({ ...paths, execFileImpl: fakeExec({ accepted: true }, calls) });
-  assert.deepEqual(await bridge.quit({ pid: 42, key: app.key, mode: "fresh", inputStamp: snapshot.inputStamp, maxAgeMs: 0 }), { accepted: true });
+  assert.deepEqual(await bridge.quit({ pid: 42, key: app.key, mode: "fresh", maxAgeMs: 0 }), { accepted: true });
   assert.deepEqual(calls[0].args, ["quit", "--app", paths.appPath, "--pid", "42", "--key", app.key,
-    "--mode", "fresh", "--input-stamp", snapshot.inputStamp, "--max-age-ms", "0"]);
+    "--mode", "fresh", "--max-age-ms", "0"]);
   const refusal = { accepted: false, reason: "key-mismatch" };
   assert.deepEqual(await createNativeBridge({ ...paths, execFileImpl: fakeExec(refusal, calls) })
     .quit({ pid: 42, key: app.key, mode: "user" }), refusal);
   assert.deepEqual(calls[1].args.slice(3), ["--pid", "42", "--key", app.key, "--mode", "user"]);
 });
 
-test("launch 用独立 argv 传 JSON 和可选守卫，不经过 shell", async () => {
+test("launch 用独立 argv 传 JSON，不经过 shell", async () => {
   const calls = [];
   const response = { launched: true, pid: app.pid, key: app.key };
   const bridge = createNativeBridge({ ...paths, execFileImpl: fakeExec(response, calls) });
   const args = ["two words", "$(echo never)", "\"quoted\"", ""];
   const env = { DUMMY: "中文\n = value" };
-  assert.deepEqual(await bridge.launch({ args, env, hidden: true, inputStamp: snapshot.inputStamp, frontmostPid: 0 }), response);
+  assert.deepEqual(await bridge.launch({ args, env, hidden: true }), response);
   assert.deepEqual(calls[0].args, ["launch", "--app", paths.appPath, "--args-json", JSON.stringify(args), "--hidden",
-    "--env-json", JSON.stringify(env), "--input-stamp", snapshot.inputStamp, "--frontmost-pid", "0"]);
+    "--env-json", JSON.stringify(env)]);
   assert.equal(calls[0].options.shell, undefined);
   await bridge.launch({ args: [] });
   assert.deepEqual(calls[1].args, ["launch", "--app", paths.appPath, "--args-json", "[]"]);
@@ -153,13 +153,12 @@ test("launch 拒绝非布尔类型的可选状态字段", async () => {
   }
 });
 
-test("show 成功/拒绝与可选守卫编码", async () => {
+test("show 成功/拒绝与参数编码", async () => {
   for (const shown of [true, false]) {
     const calls = [];
     const bridge = createNativeBridge({ ...paths, execFileImpl: fakeExec({ shown }, calls) });
-    assert.deepEqual(await bridge.show({ ...app, inputStamp: snapshot.inputStamp, frontmostPid: 42 }), { shown });
-    assert.deepEqual(calls[0].args, ["show", "--app", paths.appPath, "--pid", "42", "--key", app.key,
-      "--input-stamp", snapshot.inputStamp, "--frontmost-pid", "42"]);
+    assert.deepEqual(await bridge.show(app), { shown });
+    assert.deepEqual(calls[0].args, ["show", "--app", paths.appPath, "--pid", "42", "--key", app.key]);
   }
 });
 

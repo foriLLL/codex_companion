@@ -21,16 +21,14 @@ struct Options {
   var hidden = false
   var pid: Int32 { Int32(values["--pid"] ?? "") ?? 0 }
   var key: String { values["--key"] ?? "" }
-  var stamp: String? { values["--input-stamp"] }
-  var frontmostPid: Int32? { values["--frontmost-pid"].flatMap(Int32.init) }
   var maxAgeMs: Int64 { Int64(values["--max-age-ms"] ?? "8000")! }
 
   init(_ args: [String]) throws {
     let allowed: [String: Set<String>] = [
       "snapshot": [], "watch": [],
-      "quit": ["--pid", "--key", "--mode", "--input-stamp", "--max-age-ms"],
-      "launch": ["--args-json", "--env-json", "--unset-env-json", "--hidden", "--input-stamp", "--frontmost-pid"],
-      "show": ["--pid", "--key", "--input-stamp", "--frontmost-pid"]
+      "quit": ["--pid", "--key", "--mode", "--max-age-ms"],
+      "launch": ["--args-json", "--env-json", "--unset-env-json", "--hidden"],
+      "show": ["--pid", "--key"]
     ]
     guard let action = args.first, let flags = allowed[action] else {
       throw UsageError(message: "unknown-action")
@@ -65,13 +63,6 @@ struct Options {
       guard ["fresh", "user"].contains(values["--mode"] ?? ""),
             let age = Int64(values["--max-age-ms"] ?? "8000"), age >= 0 else {
         throw UsageError(message: "invalid-quit-options")
-      }
-      if values["--mode"] == "fresh" && stamp == nil { throw UsageError(message: "input-stamp-required") }
-    }
-    if action == "launch" || action == "show" {
-      guard (stamp == nil) == (values["--frontmost-pid"] == nil),
-            values["--frontmost-pid"] == nil || (frontmostPid != nil && frontmostPid! >= 0) else {
-        throw UsageError(message: "input-stamp-and-frontmost-pid-required-together")
       }
     }
   }
@@ -142,7 +133,7 @@ func quitApp(_ options: Options) -> [String: Any] {
   let app = NSRunningApplication(processIdentifier: options.pid)
   let current = app.flatMap { instance($0, options.appURL) }
   if let reason = quitRefusal(current, key: options.key, mode: options.values["--mode"]!,
-                              stamp: options.stamp, maxAgeMs: options.maxAgeMs, input: inputState()) {
+                              maxAgeMs: options.maxAgeMs, input: inputState()) {
     return ["accepted": false, "reason": reason]
   }
   let accepted = app?.terminate() ?? false
@@ -154,16 +145,10 @@ func showApp(_ options: Options) -> [String: Any] {
         instance(app, options.appURL)?.key == options.key else {
     return ["shown": false, "reason": "instance-mismatch"]
   }
-  if let reason = contextRefusal(stamp: options.stamp, frontmostPid: options.frontmostPid, input: inputState()) {
-    return ["shown": false, "reason": reason]
-  }
   // 短命进程里 isHidden 不随 hides=true 更新，unhide 对「看似未隐藏」的应用返回 false；
   // 因此总是请求 unhide，但不把返回值当作失败条件。
   _ = app.unhide()
   guard instance(app, options.appURL)?.key == options.key else { return ["shown": false, "reason": "instance-mismatch"] }
-  if let reason = contextRefusal(stamp: options.stamp, frontmostPid: options.frontmostPid, input: inputState()) {
-    return ["shown": false, "reason": reason]
-  }
   return app.activate(options: [.activateAllWindows]) ? ["shown": true] : ["shown": false, "reason": "activate-refused"]
 }
 
@@ -203,9 +188,6 @@ func launchApp(_ options: Options) throws -> [String: Any] {
   configuration.promptsUserIfNeeded = false
   configuration.allowsRunningApplicationSubstitution = false
   guard targetApps(options.appURL).isEmpty else { return ["launched": false, "reason": "already-running"] }
-  if let reason = contextRefusal(stamp: options.stamp, frontmostPid: options.frontmostPid, input: inputState()) {
-    return ["launched": false, "reason": reason]
-  }
   var failure: [String: Any]?
   var launchedApp: NSRunningApplication?
   var launchedKey: String?

@@ -20,8 +20,9 @@ struct InputState {
 }
 
 // 守卫保持纯函数；生产入口必须在调用 AppKit 动作前读取原生状态再判断。
+// fresh 只要求刚启动、启动完成、未带调试端口且在前台；启动后的点击与输入不拒绝。
 func quitRefusal(_ instance: AppInstance?, key: String, mode: String,
-                 stamp: String?, maxAgeMs: Int64, input: InputState) -> String? {
+                 maxAgeMs: Int64, input: InputState) -> String? {
   guard let instance else { return "instance-mismatch" }
   guard instance.key == key else { return "key-mismatch" }
   if mode == "user" { return nil }
@@ -33,15 +34,7 @@ func quitRefusal(_ instance: AppInstance?, key: String, mode: String,
   }
   let age = input.now - instance.launchedAt
   guard age >= 0 && age <= maxAgeMs else { return "age-out-of-range" }
-  guard stamp == input.inputStamp else { return "input-changed" }
-  guard input.inputIdleMs >= Double(age) else { return "input-since-launch" }
   guard input.frontmostPid == instance.pid else { return "not-frontmost" }
-  return nil
-}
-
-func contextRefusal(stamp: String?, frontmostPid: Int32?, input: InputState) -> String? {
-  if let stamp, stamp != input.inputStamp { return "input-changed" }
-  if let frontmostPid, frontmostPid != input.frontmostPid { return "frontmost-changed" }
   return nil
 }
 

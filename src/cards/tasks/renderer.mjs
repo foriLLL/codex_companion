@@ -223,7 +223,14 @@ ${TRACE_STYLE}
   }
   function fail(error) {
     if (signal.aborted || SILENT_CODES.has(error?.code)) return;
+    syncNote = false;
     showNote(error?.message || "操作失败，请稍后重试");
+  }
+  // 同步（list/watch）失败的提示在下一次同步成功时自动清除；操作失败的提示留到下一次操作。
+  let syncNote = false;
+  function failSync(error) {
+    fail(error);
+    syncNote = !note.hidden;
   }
 
   // 新建会话在本次运行中，侧栏条目用客户端临时 id；服务端给出别名，两个都认。
@@ -454,6 +461,10 @@ ${TRACE_STYLE}
   function accept(next) {
     if (signal.aborted || !next) return;
     board = next;
+    if (syncNote) {
+      syncNote = false;
+      showNote("");
+    }
     threads?.setMarks(board.tasks.flatMap((task) => idsOf(task).map((id) => ({ id, color: task.color }))));
     render();
   }
@@ -468,7 +479,7 @@ ${TRACE_STYLE}
   }
 
   function refresh() {
-    loading ??= rpc("list").then(accept, fail).finally(() => { loading = null; });
+    loading ??= rpc("list").then(accept, failSync).finally(() => { loading = null; });
     return loading;
   }
 
@@ -488,7 +499,7 @@ ${TRACE_STYLE}
           if (since !== null && next?.sig === since) await new Promise((resolve) => effects.timeout(resolve, WATCH_RETRY_MS));
         } catch (error) {
           if (controller.signal.aborted || signal.aborted) break;
-          fail(error);
+          failSync(error);
           await new Promise((resolve) => effects.timeout(resolve, WATCH_RETRY_MS));
         }
       }

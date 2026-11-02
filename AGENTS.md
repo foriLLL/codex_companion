@@ -51,8 +51,9 @@ systemd 用户服务常驻发现并注入；主进程 cmdline 被 Chromium setpr
 
 ## 关键陷阱
 - Codex 的 Electron fuse 已关闭 inspect/RunAsNode/NODE_OPTIONS，CDP 只能在**启动参数**上开启；
-  已运行且未带参数的 Codex 只能重启后注入。agent 只自动重开「刚启动、未被操作、在前台」
-  的实例（守卫在 JS 状态机与原生助手两侧各查一次），其余情况只通知，绝不强杀。
+  已运行且未带参数的 Codex 只能重启后注入。agent 只自动重开「刚启动（8 秒内）、在前台」
+  的实例（守卫在 JS 状态机与原生助手两侧各查一次；启动后的点击与输入不拦截，避免操作得快就错过注入），
+  其余情况只通知，绝不强杀。
 - 退出 Codex 只能用 `NSRunningApplication.terminate()`；禁止 SIGKILL、forceTerminate。
   Linux 上 agent 不退出也不重启 Codex，只提示用户从应用菜单重开。
   开发与测试禁止对真实 Codex 执行 quit/launch/show，原生能力只对 dummy app 验证。
