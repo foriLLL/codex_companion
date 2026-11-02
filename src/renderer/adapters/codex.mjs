@@ -641,12 +641,25 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
   //   可见面、会话平移量）。按文件名找到后动态 import，导出名经压缩会变，按行为识别。
   // - 平移：原生在 [data-request-input-activity-root] 上写 --thread-content-x，会话与输入框的
   //   _shiftWithTranscript_* 类据此 translate 并收窄宽块。我们只覆盖这一个变量。
-  // 原生模块或平移钩子缺失（非本地会话、宿主改版）时不平移，抽屉浮在会话上方。
+  // 新版 Codex 把这几个函数并进了主 chunk（app-primary-*.js），按文件名找不到；此时用照抄原生的
+  // BUILTIN_LAYOUT，诊断里 layoutSource 标出来源。平移钩子缺失（非本地会话）时不平移，抽屉浮在会话上方。
   const NATIVE_LAYOUT_CHUNK = /\/thread-summary-panel-layout-[\w-]+\.js(?:[?#]|$)/;
   let nativeLayout = null;
   let nativeLayoutUrl = null;
   let nativeLayoutLoading = false;
   let nativeLayoutCheckedAt = -Infinity;
+  // 照抄 Codex 26.1027 的原生实现：留白=(会话宽-736)/2，<180 overlay，<400 shift，其余 gutter。
+  const BUILTIN_LAYOUT = Object.freeze({
+    resolveMode: (width, panelWidth = 300) => {
+      const gutter = (width - 736) / 2;
+      const extra = panelWidth - 300;
+      return gutter < 180 + extra / 2 ? "overlay" : gutter < 400 + extra ? "shift" : "gutter";
+    },
+    contentOffset: ({ displayMode, isPinned, panelWidth = 300 }) => isPinned && displayMode === "shift" ? -(308 + panelWidth - 300) / 2 : 0,
+    visibility: ({ displayMode, isPinned, isPopoverOpen }) => ({
+      visibleSurface: isPinned && displayMode !== "overlay" ? "inline" : displayMode === "overlay" && isPopoverOpen ? "popover" : null
+    })
+  });
   const pickNativeLayout = (module) => {
     const exports = Object.values(module ?? {}).filter((value) => typeof value === "function");
     const probe = (fn, argument) => { try { return fn(argument); } catch { return undefined; } };
@@ -814,13 +827,14 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     loadNativeLayout();
     const { bounds, shiftRoot } = measureThread();
     observeLayout(shiftRoot);
-    const nextMode = nativeLayout && bounds ? nativeLayout.resolveMode(bounds.width, PANEL_WIDTH) : null;
+    const layout = nativeLayout ?? BUILTIN_LAYOUT;
+    const nextMode = bounds ? layout.resolveMode(bounds.width, PANEL_WIDTH) : null;
     const modeChanged = nextMode !== displayMode;
     // 同原生：离开 overlay 档即收起浮层，常驻开关保留。
     if (modeChanged && nextMode !== "overlay") popoverOpen = false;
     displayMode = nextMode;
     const surface = nativeOpen ? null
-      : nextMode ? nativeLayout.visibility({ displayMode: nextMode, isPinned: pinned, isPopoverOpen: popoverOpen }).visibleSurface
+      : nextMode ? layout.visibility({ displayMode: nextMode, isPinned: pinned, isPopoverOpen: popoverOpen }).visibleSurface
         : (wantsOpen() ? "floating" : null);
     const open = surface !== null;
     ownedRail.dataset.surface = surface ?? "none";
@@ -829,7 +843,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     setDrawerVisible(open);
     // 收起时会话与抽屉同时回位；关闭期间抽屉仍可见。
     const target = surface === "inline"
-      ? Math.round(-nativeLayout.contentOffset({ displayMode: nextMode, isPinned: true, panelWidth: PANEL_WIDTH }))
+      ? Math.round(-layout.contentOffset({ displayMode: nextMode, isPinned: true, panelWidth: PANEL_WIDTH }))
       : 0;
     dockConversation(target, { root: nativeOpen ? null : shiftRoot, visible: !ownedRail.hidden, animate: !modeChanged });
     companionButton.setAttribute("aria-expanded", String(open));
@@ -1065,7 +1079,7 @@ export function createCodexAdapter({ host, placement = "standalone-button", onVi
     isOpen: () => !disposed && Boolean(lastVisibility?.visible),
     isPlaced: () => !disposed && (hasCards || hasSettings) && host.isConnected && placementMode !== "hidden",
     getDiagnostics: () => ({ placement, mode: placementMode, visible: !disposed && Boolean(lastVisibility?.visible), hasCards, hasSettings, disposed, fallbackActive, inlineEntryFallback, summaryUnsupported, moveFallbacks,
-      nativeLayout: Boolean(nativeLayout), displayMode, drawerSurface: ownedRail.dataset.surface ?? "none", dockShift, placementStats: { ...placementStats } }),
+      nativeLayout: Boolean(nativeLayout), layoutSource: nativeLayout ? "native" : "builtin", displayMode, drawerSurface: ownedRail.dataset.surface ?? "none", dockShift, placementStats: { ...placementStats } }),
     dispose() {
       if (disposed) return;
       disposed = true;

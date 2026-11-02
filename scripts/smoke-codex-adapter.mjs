@@ -94,7 +94,7 @@ try {
   await waitFor(`adapter.isOpen()`, "独立面板未打开");
   await waitFor(`video.currentTime > .1`, "测试媒体未播放");
   assert.equal(await evaluate(`getComputedStyle(document.getElementById('frame')).transform`), "matrix(1, 0, 0, 1, -80, 0)", "不改写原生自己的平移");
-  assert.equal(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width === innerWidth && adapter.getDiagnostics().drawerSurface`), "floating", "无原生布局模块时浮在会话上方，不收窄");
+  assert.equal(await evaluate(`document.querySelector('.thread-scroll-container').getBoundingClientRect().width === innerWidth && adapter.getDiagnostics().drawerSurface`), "inline", "没有平移钩子时按内置公式判档，不收窄会话");
   const beforeHide = await evaluate(`video.currentTime`);
   await evaluate(`adapter.setOpen(false)`);
   await waitFor(`!adapter.isOpen() && document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer').hidden`, "关闭动画未结束");
@@ -298,7 +298,7 @@ try {
   assert.equal(await evaluate(`!!document.querySelector('[data-companion-dock]') || !!document.getElementById('codex-companion-root-dock-style')`), false, "dispose 撤销平移");
   assert.deepEqual(await evaluate(`errors`), []);
 
-  // 没有原生布局模块：不自行判定、不平移，抽屉浮在会话上方。
+  // 没有原生布局模块（新版并进主 chunk）：用照抄原生的内置公式，同样判定 shift 档并平移 154px。
   await evaluate(`(() => {
     document.querySelector('link[rel=modulepreload]').remove();
     performance.clearResourceTimings();
@@ -306,9 +306,9 @@ try {
     globalThis.bareAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
   })()`);
   await evaluate(`bareAdapter.setOpen(true)`);
-  await waitFor(`bareAdapter.isOpen() && drawerOf().dataset.state === 'open'`, "无原生模块时仍可打开");
-  assert.deepEqual(await evaluate(`({native:bareAdapter.getDiagnostics().nativeLayout,surface:bareAdapter.getDiagnostics().drawerSurface,shift:shiftOf('shift-column')})`),
-    { native: false, surface: "floating", shift: 0 }, "无原生模块时只浮层");
+  await waitFor(`bareAdapter.isOpen() && drawerOf().dataset.state === 'open' && Math.round(shiftOf('shift-column')) === ${expectedShift}`, "无原生模块时按内置公式平移");
+  assert.deepEqual(await evaluate(`(() => { const {nativeLayout, layoutSource, displayMode, drawerSurface} = bareAdapter.getDiagnostics(); return {nativeLayout, layoutSource, displayMode, drawerSurface, footer: Math.round(shiftOf('shift-footer'))}; })()`),
+    { nativeLayout: false, layoutSource: "builtin", displayMode: "shift", drawerSurface: "inline", footer: expectedShift }, "内置公式与原生一致");
   await evaluate(`bareAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
