@@ -48,6 +48,7 @@ test("validateManifest 接受合法 manifest 并拒绝未知字段与非法枚�
   value.title = "changed";
   assert.equal(validated.title, "Alpha");
   assert.throws(() => validated.title = "nope", TypeError);
+  assert.deepEqual(validateManifest(manifest({ capabilities: ["threads", "overlay"] })).capabilities, ["threads", "overlay"]);
 
   const cases = [
     [manifest({ extra: true }), "UNKNOWN_FIELD", "extra"],
@@ -191,7 +192,7 @@ test("仓库内置卡片可被发现且能力符合冻结枚举", async () => {
   assert.deepEqual(discovered.cards.map((card) => card.manifest.id), ["proxy", "tasks", "games", "hongguo", "emby"]);
   assert.deepEqual(discovered.cards.map((card) => card.manifest.defaultOrder), [0, 5, 10, 20, 40]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "proxy").manifest.capabilities, ["rpc"]);
-  assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "tasks").manifest.capabilities, ["rpc", "threads"]);
+  assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "tasks").manifest.capabilities, ["rpc", "threads", "overlay"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "games").manifest.capabilities, ["storage"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "hongguo").manifest.capabilities, ["rpc", "storage"]);
   assert.deepEqual(discovered.cards.find((card) => card.manifest.id === "emby").manifest.capabilities, ["rpc", "storage"]);

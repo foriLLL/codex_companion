@@ -17,6 +17,7 @@ const ZOOM = 1.6;
 const TICK_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
 
 const LANES = [
+  { id: "plan", name: "计划", icon: '<path d="M7 4.5h6M7 8h6M7 11.5h6"/><path d="M2.8 4.6l.9.9 1.6-1.8M2.8 8.1l.9.9 1.6-1.8"/><circle cx="3.9" cy="11.5" r=".8"/>' },
   { id: "model", name: "模型", icon: '<path d="M8 1.8c.35 3 1.7 4.35 4.7 4.7-3 .35-4.35 1.7-4.7 4.7-.35-3-1.7-4.35-4.7-4.7 3-.35 4.35-1.7 4.7-4.7z"/>' },
   { id: "shell", name: "命令", icon: '<path d="M3 4.5l3 3-3 3M7.5 11.5h5"/>' },
   { id: "edit", name: "文件", icon: '<path d="M10.6 3.2l2.2 2.2-7 7H3.6v-2.2z"/>' },
@@ -24,14 +25,20 @@ const LANES = [
   { id: "you", name: "你", icon: '<circle cx="8" cy="5.5" r="2.5"/><path d="M3.5 13.5c.6-2.5 2.3-3.8 4.5-3.8s3.9 1.3 4.5 3.8"/>' },
   { id: "other", name: "其它", icon: '<circle cx="4" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12" cy="8" r="1"/>' }
 ];
-const KIND_LABEL = { think: "思考", reply: "回复", call: "组织调用", tool: "工具" };
+const KIND_LABEL = { think: "思考", reply: "回复", call: "组织调用", tool: "工具", step: "计划步骤" };
+// 计划区最多显示的进度说明条数（没列计划时的推断）。
+const MAX_NOTES = 8;
 const glyph = (body, size = 14) => `<svg viewBox="0 0 16 16" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 const SEGMENT_ICONS = {
   think: '<path d="M8 2.5c.3 2.6 1.5 3.7 4 4-2.5.3-3.7 1.4-4 4-.3-2.6-1.5-3.7-4-4 2.5-.3 3.7-1.4 4-4z"/>',
   reply: '<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h7A1.5 1.5 0 0 1 13 4.5v5A1.5 1.5 0 0 1 11.5 11H7l-3 2.5V11h.5"/>',
   call: '<path d="M6 4L2.5 8 6 12M10 4l3.5 4-3.5 4"/>',
   failed: '<path d="M5 5l6 6M11 5l-6 6"/>',
-  done: '<path d="M3.5 8.4l2.9 2.9 6.1-6.6"/>'
+  done: '<path d="M3.5 8.4l2.9 2.9 6.1-6.6"/>',
+  pending: '<circle cx="8" cy="8" r="4.4"/>',
+  // 进行中但回合已经停下（在等你回答、被中断）：半实心圆，不转。
+  paused: '<circle cx="8" cy="8" r="4.4"/><path d="M8 3.6a4.4 4.4 0 0 1 0 8.8z" fill="currentColor" stroke="none"/>',
+  note: '<circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"/>'
 };
 // 八道光芒依次点亮，与看板列表里进行中的图标一致。
 const SPINNER = Array.from({ length: 8 }, (_, index) => {
@@ -48,7 +55,7 @@ export const TRACE_STYLE = `
     font-variant-numeric:tabular-nums;color:var(--running);background:color-mix(in srgb,var(--running) 11%,transparent)}
   .trace-live[data-tone=human]{color:var(--attention);background:color-mix(in srgb,var(--attention) 12%,transparent)}
   .trace-live[data-tone=idle]{color:var(--muted);background:color-mix(in srgb,currentColor 5%,transparent)}
-  .trace-live svg .ray,.seg-bar svg .ray{opacity:.18;animation:ray .8s linear infinite}
+  .trace-live svg .ray,.seg-bar svg .ray,.plan-mark svg .ray{opacity:.18;animation:ray .8s linear infinite}
   .stats{display:grid;grid-template-columns:repeat(4,1fr);border-radius:12px;box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.04);overflow:hidden}
   .stat{min-width:0;padding:7px 10px 8px;box-shadow:-1px 0 0 var(--line)}
   .stat:first-child{box-shadow:none}
@@ -102,6 +109,26 @@ export const TRACE_STYLE = `
     background:color-mix(in srgb,currentColor 6%,transparent);box-shadow:inset 0 0 0 1px var(--line)}
   .turn-end[data-status=interrupted],.turn-end[data-status=stalled]{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}
   .trace-empty{margin:4px 6px;font-size:12.5px;line-height:1.55;color:var(--muted)}
+  .plan{display:grid;gap:3px;padding:8px 10px 8px;border-radius:12px;box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.04)}
+  .plan-head{display:flex;align-items:baseline;gap:8px;min-width:0;font-variant-numeric:tabular-nums}
+  .plan-head b{flex:none;font-size:12.5px;font-weight:600}
+  .plan-head span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;color:var(--muted)}
+  .plan-head .plan-elapsed{flex:none;margin-left:auto}
+  .plan-list{list-style:none;margin:0;padding:0;display:grid;max-height:216px;overflow:auto;scrollbar-width:thin}
+  .plan-step{display:grid;grid-template-columns:16px minmax(0,1fr) auto;column-gap:7px;align-items:center;min-height:24px;font-size:12.5px}
+  .plan-mark{display:grid;place-items:center;color:var(--muted)}
+  .plan-step[data-status=completed] .plan-mark{color:#10b981}
+  .plan-step[data-status=in_progress] .plan-mark{color:var(--running)}
+  .plan-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .plan-step[data-status=completed] .plan-text{color:var(--text)}
+  .plan-step[data-status=pending] .plan-text{color:var(--muted)}
+  .plan-step[data-status=in_progress] .plan-text{font-weight:500}
+  .plan-dur{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .plan-note{margin:1px 0 0;font-size:11.5px;line-height:1.5;color:var(--muted)}
+  .seg-bar[data-kind=step]{--tone:#10b981}
+  .seg-bar[data-kind=step][data-live]{--tone:var(--running)}
+  .seg-bar[data-kind=step][data-paused]{--tone:var(--attention)}
+  .tl-lane[data-lane=plan] .tl-tile{color:#10b981}
 `;
 
 function seconds(ms) {
@@ -203,8 +230,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     return Math.min(Math.max((viewport - 56) / span, MIN_SCALE), MAX_SCALE);
   }
 
-  function lanesOf(turns) {
-    const used = new Set(["model"]);
+  function lanesOf(turns, withPlan) {
+    const used = new Set(withPlan ? ["plan", "model"] : ["model"]);
     for (const turn of turns) for (const segment of turn.segments) used.add(segment.lane);
     if (turns.some((turn) => turn.asking)) used.add("you");
     return LANES.filter((lane) => used.has(lane.id));
@@ -232,6 +259,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
   }
 
   function segmentText(segment) {
+    if (segment.kind === "step") return segment.label;
     if (segment.end === null) return segment.lane === "you" ? "等你回答" : segment.label;
     if (segment.kind === "tool") return segment.label;
     if (segment.kind === "reply") return segment.label;
@@ -251,6 +279,78 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     bar.title = segmentTitle(segment, current);
     const duration = bar.querySelector(".seg-dur");
     if (duration) duration.textContent = seconds((segment.end ?? current) - segment.start);
+  }
+
+  // 计划泳道：有起点的步骤画成段。进行中的步骤在回合进行时随时间生长，回合停下后止于回合结束。
+  function planSegments(plan, lastTurn) {
+    if (!plan?.steps?.length) return [];
+    const running = lastTurn.end === null;
+    return plan.steps.flatMap((step, index) => {
+      if (!Number.isFinite(step.start)) return [];
+      const open = step.status === "in_progress";
+      const end = open ? (running ? null : Math.max(step.start, lastTurn.end)) : step.end;
+      if (end !== null && !Number.isFinite(end)) return [];
+      // 和别的步骤一起被标成完成、用时不详的，不画零长度的段。
+      if (step.inferred && end !== null && end - step.start < 1000) return [];
+      return [{ kind: "step", lane: "plan", start: step.start, end, label: `${index + 1}. ${step.text}`, paused: open && !running }];
+    });
+  }
+
+  // 计划区：Codex 用 update_plan 列的步骤、状态与每步用时；没列计划时，退回本回合的进度说明（推断）。
+  function planSection(plan, lastTurn, current) {
+    const running = lastTurn.end === null;
+    const box = element("div", "plan");
+    const list = element("ol", "plan-list");
+    const row = (status, icon, text, duration) => {
+      const item = element("li", "plan-step");
+      item.dataset.status = status;
+      const mark = element("span", "plan-mark");
+      mark.innerHTML = glyph(icon, 12);
+      const label = element("span", "plan-text", text);
+      label.title = text;
+      const time = element("span", "plan-dur", duration);
+      item.append(mark, label, time);
+      list.append(item);
+      return time;
+    };
+    if (plan?.steps?.length) {
+      const done = plan.steps.filter((step) => step.status === "completed").length;
+      const stopAt = running ? current : lastTurn.end;
+      const finished = done === plan.steps.length;
+      const lastEnd = Math.max(...plan.steps.map((step) => step.end ?? -Infinity));
+      const head = element("div", "plan-head");
+      const elapsed = element("span", "plan-elapsed", `${finished ? "共" : "已"}用 ${seconds((finished ? lastEnd : stopAt) - plan.createdAt)}`);
+      head.append(element("b", "", "计划"), element("span", "", finished ? `${done} 步全部完成` : `第 ${Math.min(done + 1, plan.steps.length)}/${plan.steps.length} 步`), elapsed);
+      if (running && !finished) live.push({ kind: "since", node: elapsed, start: plan.createdAt, prefix: "已用 " });
+      plan.steps.forEach((step, index) => {
+        const open = step.status === "in_progress";
+        const icon = step.status === "completed" ? SEGMENT_ICONS.done : open ? (running ? SPINNER : SEGMENT_ICONS.paused) : SEGMENT_ICONS.pending;
+        const end = open ? stopAt : step.end;
+        const span = Number.isFinite(step.start) && Number.isFinite(end) ? Math.max(0, end - step.start) : null;
+        // 推断出的起点：不足 1 秒说明是和别的步骤一起标成完成的，单步用时不详，不显示；否则写「约」。
+        const duration = span === null || (step.inferred && span < 1000) ? "" : `${step.inferred ? "约 " : ""}${seconds(span)}`;
+        const time = row(step.status, icon, `${index + 1}. ${step.text}`, duration);
+        if (step.inferred) time.title = "Codex 没有单独标记这一步开始，用时按前一步完成时刻推断";
+        if (open && running && Number.isFinite(step.start)) live.push({ kind: "since", node: time, start: step.start, prefix: "" });
+      });
+      box.append(head, list);
+      if (plan.explanation) box.append(element("p", "plan-note", plan.explanation));
+      return box;
+    }
+    const notes = (lastTurn.notes ?? []).slice(-MAX_NOTES);
+    if (!notes.length) return null;
+    const head = element("div", "plan-head");
+    head.append(element("b", "", "进展"), element("span", "", "没有列计划，按 Codex 的进度说明推断"));
+    box.dataset.inferred = "";
+    notes.forEach((note, index) => {
+      const next = notes[index + 1]?.at ?? (running ? null : lastTurn.end);
+      const last = index === notes.length - 1;
+      const status = last && running ? "in_progress" : "completed";
+      const time = row(status, last && running ? SPINNER : SEGMENT_ICONS.note, note.text, next === null ? seconds(current - note.at) : seconds(Math.max(0, next - note.at)));
+      if (next === null) live.push({ kind: "since", node: time, start: note.at, prefix: "" });
+    });
+    box.append(head, list);
+    return box;
   }
 
   function draw() {
@@ -280,7 +380,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     const current = now();
     layout = computeLayout(turns, current);
     const lastTurn = turns.at(-1);
-    const lanes = lanesOf(turns);
+    const steps = planSegments(data.plan, lastTurn);
+    const lanes = lanesOf(turns, steps.length > 0);
 
     const head = element("div", "trace-head");
     head.append(element("span", "trace-title", title));
@@ -332,7 +433,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
       const name = element("span", "tl-name");
       const count = turns.reduce((sum, turn) => sum + turn.segments.filter((segment) => segment.lane === lane.id && segment.kind === "tool").length, 0);
       name.append(element("b", "", lane.name));
-      if (lane.id !== "model" && lane.id !== "you") name.append(element("span", "", `${count} 次`));
+      if (lane.id === "plan") name.append(element("span", "", `${data.plan.steps.filter((step) => step.status === "completed").length}/${data.plan.steps.length} 步`));
+      else if (lane.id !== "model" && lane.id !== "you") name.append(element("span", "", `${count} 次`));
       if (lane.id === "model" && data.model) row.title = data.model;
       row.append(tile, name);
       labels.append(row);
@@ -391,29 +493,34 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
       live.push({ kind: "now", node: pill });
     }
 
-    for (const turn of turns) {
-      for (const segment of turn.segments) {
-        const row = rowOf.get(segment.lane) ?? rowOf.get("model");
-        const bar = element("span", "seg-bar");
-        bar.dataset.kind = segment.kind;
-        bar.dataset.lane = segment.lane;
-        if (segment.failed) bar.dataset.failed = "";
-        if (segment.end === null) bar.dataset.live = "";
-        const icon = segment.end === null ? SPINNER : segment.failed ? SEGMENT_ICONS.failed : SEGMENT_ICONS[segment.kind] ?? SEGMENT_ICONS.call;
-        bar.innerHTML = glyph(segment.kind === "tool" && !segment.failed && segment.end !== null ? (LANES.find((lane) => lane.id === segment.lane)?.icon ?? icon) : icon, 11);
-        bar.append(element("span", "seg-text", segmentText(segment)), element("span", "seg-dur", ""));
-        paintSegment(bar, segment, current);
-        row.append(bar);
-        if (segment.end === null) live.push({ kind: "bar", node: bar, segment });
-        // 模型把活交给工具：从模型泳道到工具泳道画一道虚线。
-        if (segment.kind === "tool" && rowIndex.has(segment.lane)) {
-          const link = element("span", "tl-link");
-          link.style.left = `${layout.toX(segment.start)}px`;
-          link.style.top = `${26 + 29}px`;
-          link.style.height = `${rowIndex.get(segment.lane) * 36 - 22}px`;
-          track.append(link);
-        }
+    const modelIndex = rowIndex.get("model");
+    const addBar = (segment) => {
+      const row = rowOf.get(segment.lane) ?? rowOf.get("model");
+      const bar = element("span", "seg-bar");
+      bar.dataset.kind = segment.kind;
+      bar.dataset.lane = segment.lane;
+      if (segment.failed) bar.dataset.failed = "";
+      if (segment.paused) bar.dataset.paused = "";
+      if (segment.end === null) bar.dataset.live = "";
+      const icon = segment.end === null ? SPINNER : segment.failed ? SEGMENT_ICONS.failed : segment.paused ? SEGMENT_ICONS.paused
+        : SEGMENT_ICONS[segment.kind === "step" ? "done" : segment.kind] ?? SEGMENT_ICONS.call;
+      bar.innerHTML = glyph(segment.kind === "tool" && !segment.failed && segment.end !== null ? (LANES.find((lane) => lane.id === segment.lane)?.icon ?? icon) : icon, 11);
+      bar.append(element("span", "seg-text", segmentText(segment)), element("span", "seg-dur", ""));
+      paintSegment(bar, segment, current);
+      row.append(bar);
+      if (segment.end === null) live.push({ kind: "bar", node: bar, segment });
+      // 模型把活交给工具：从模型泳道到工具泳道画一道虚线。
+      if (segment.kind === "tool" && rowIndex.has(segment.lane)) {
+        const link = element("span", "tl-link");
+        link.style.left = `${layout.toX(segment.start)}px`;
+        link.style.top = `${26 + modelIndex * 36 + 29}px`;
+        link.style.height = `${(rowIndex.get(segment.lane) - modelIndex) * 36 - 22}px`;
+        track.append(link);
       }
+    };
+    for (const segment of steps) addBar(segment);
+    for (const turn of turns) {
+      for (const segment of turn.segments) addBar(segment);
       const endX = layout.toX(turn.end ?? current);
       if (turn.asking) {
         // 右边缘对齐回合结束，不越过回合间隔压到下一回合上。
@@ -434,7 +541,8 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
     scrollBox.append(track);
     const timeline = element("div", "tl");
     timeline.append(labels, scrollBox);
-    root.replaceChildren(head, stats, timeline);
+    const plan = planSection(data.plan, lastTurn, current);
+    root.replaceChildren(...[head, stats, plan, timeline].filter(Boolean));
     // 停在最右边时跟随最新进度；用户往回翻看时不打扰。
     if (pinned) scrollBox.scrollLeft = scrollBox.scrollWidth;
     else scrollBox.scrollLeft = previousLeft;
@@ -456,6 +564,7 @@ export function createTraceView({ rpc, effects, signal, threads, element, fail, 
       else if (item.kind === "now") item.node.style.left = `${layout.toX(current) + 2}px`;
       else if (item.kind === "elapsed") item.node.textContent = seconds(current - item.turn.start);
       else if (item.kind === "status") item.node.textContent = `${item.label} ${seconds(current - (item.segment?.start ?? lastTurn.start))}`;
+      else if (item.kind === "since") item.node.textContent = `${item.prefix}${seconds(current - item.start)}`;
     }
     if (pinned) scroller.scrollLeft = scroller.scrollWidth;
   }

@@ -1,4 +1,5 @@
 import { TRACE_STYLE, createTraceView } from "./trace.mjs";
+import { createSwitcher, orderByRecent, touchRecent } from "./switcher.mjs";
 
 // 长轮询：服务端在会话记录变化时立即返回，没变化最多挂 20 秒；出错后隔一会儿再连。
 const WATCH_WAIT_MS = 20_000;
@@ -55,53 +56,14 @@ const STATUS_ICONS = {
   unread: `${gradient("cc-task-reply", "#8fb4ff", "#5b7cf0")}${BUBBLE}<circle cx="16" cy="4.4" r="3" fill="#ff4d4f" stroke="var(--cc-card-bg,#fff)" stroke-width="1.4"/>`,
   gone: '<circle cx="10" cy="10" r="6.8" stroke-dasharray="2.2 2.6" opacity=".45"/>'
 };
-const SPARKLE = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M7 1.5c.3 2.9 1.6 4.2 4.5 4.5-2.9.3-4.2 1.6-4.5 4.5C6.7 7.6 5.4 6.3 2.5 6c2.9-.3 4.2-1.6 4.5-4.5Z"/><circle cx="12.3" cy="12.3" r="1.3" fill="currentColor" opacity=".7"/></svg>';
 let gradientSeq = 0;
 const icon = (name) => `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
 
-function ago(ms, now = Date.now()) {
-  if (!Number.isFinite(ms)) return "";
-  const minutes = Math.floor((now - ms) / 60_000);
-  if (minutes < 1) return "刚刚";
-  if (minutes < 60) return `${minutes} 分钟前`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
-}
-
-
-// 看板只列用户主动加入的会话；颜色与左侧会话条目呼应，点击后由平台定位、动画并打开。
-export function mount({ root, rpc, effects, signal, threads, isVisible }) {
-  const doc = root.ownerDocument;
-  root.innerHTML = `<style>
-    :host{display:block;--text:color-mix(in srgb,currentColor 64%,transparent);--muted:color-mix(in srgb,currentColor 46%,transparent);
+// 看板与 Option+Tab 切换面板共用：颜色变量，以及条目的状态图标、名字、标签与第二行。
+const TOKENS = `--text:color-mix(in srgb,currentColor 64%,transparent);--muted:color-mix(in srgb,currentColor 46%,transparent);
       --line:color-mix(in srgb,currentColor 10%,transparent);--hover:color-mix(in srgb,currentColor 5%,transparent);
-      --attention:#d9661b;--danger:#d4483e;--running:#3b82f6;--ease:cubic-bezier(.22,1,.36,1);
-      font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif;letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
-    *{box-sizing:border-box}
-    .board{padding:14px 8px 8px;font-size:13.5px;line-height:1.4}
-    header{display:flex;align-items:center;gap:10px;padding:0 6px 10px 8px;min-height:22px}
-    h2{flex:none;display:flex;align-items:center;gap:7px;margin:0;font-size:14px;font-weight:600;white-space:nowrap}
-    h2 svg{color:#5b8def}
-    .chips{min-width:0;display:flex;gap:9px;overflow:hidden;font-size:12px;color:var(--text);font-variant-numeric:tabular-nums}
-    .chip{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
-    .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--dot)}
-    .chip[data-kind=running]{--dot:var(--running)}
-    .chip[data-kind=human]{--dot:var(--attention);color:var(--attention)}
-    button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer;letter-spacing:inherit}
-    .add{display:flex;align-items:center;gap:9px;width:100%;padding:9px 8px;border-radius:10px;color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
-    .add:hover{background:var(--hover);color:var(--text)}
-    .add svg{flex:none}
-    .add .title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .add b{font-weight:500;color:currentColor}
-    ul{list-style:none;margin:0;padding:0;display:grid}
-    /* 条目紧挨着排列，不铺底色；任务色只铺在状态图标底下的浅色圆角块上，和左侧侧栏条目的标记呼应。
-       悬停时整行浅浅地铺一层任务色。 */
-    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;border-radius:10px;
-      transition:background-color .16s ease;transform-origin:50% 60%}
-    .task:hover,.task:focus-within,.task[data-peek]{background:color-mix(in srgb,var(--task) 12%,transparent)}
-    .main{flex:1;min-width:0;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:8px;text-align:left;border-radius:10px}
-    .main:focus-visible{outline:2px solid color-mix(in srgb,var(--task) 55%,transparent);outline-offset:-2px}
+      --attention:#d9661b;--danger:#d4483e;--running:#3b82f6;--ease:cubic-bezier(.22,1,.36,1)`;
+const ROW_STYLE = `
     .status{position:relative;z-index:2;display:grid;place-items:center;width:28px;height:28px;border-radius:8px;
       background:color-mix(in srgb,var(--task) 16%,transparent);transform-origin:50% 100%;color:var(--muted)}
     .status svg{display:block;overflow:visible;width:18px;height:18px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.08))}
@@ -124,22 +86,91 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     .label.live.in{animation:roll-in .46s var(--ease) both,sweep 1.8s linear infinite}
     .label.in{animation:roll-in .46s var(--ease) both}
     .label.out{animation:roll-out .32s var(--ease) both}
+    @keyframes turn{to{transform:rotate(360deg)}}
+    @keyframes sweep{from{-webkit-mask-position:100% 0;mask-position:100% 0}to{-webkit-mask-position:0 0;mask-position:0 0}}
+    @keyframes roll-in{from{opacity:0;transform:translateY(70%);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
+    @keyframes roll-out{from{opacity:1;transform:none;filter:none}to{opacity:0;transform:translateY(-70%);filter:blur(3px)}}`;
+
+function ago(ms, now = Date.now()) {
+  if (!Number.isFinite(ms)) return "";
+  const minutes = Math.floor((now - ms) / 60_000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+
+// 看板只列用户主动加入的会话；颜色与左侧会话条目呼应，点击后由平台定位、动画并打开。
+// macOS 上按住 Option 连按 Tab 在看板会话之间切换（settings.switcher 为 false 时关闭）。
+export function mount({ root, rpc, effects, signal, threads, isVisible, overlay, settings }) {
+  const doc = root.ownerDocument;
+  root.innerHTML = `<style>
+    :host{display:block;${TOKENS};
+      font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif;letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
+    *{box-sizing:border-box}
+    .board{padding:14px 8px 8px;font-size:13.5px;line-height:1.4}
+    header{display:flex;align-items:center;gap:10px;padding:0 6px 10px 9px;min-height:22px}
+    h2{flex:none;margin:0;font-size:14px;font-weight:600;white-space:nowrap}
+    .chips{min-width:0;display:flex;gap:9px;overflow:hidden;font-size:12px;color:var(--text);font-variant-numeric:tabular-nums}
+    .chip{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+    .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--dot)}
+    .chip[data-kind=running]{--dot:var(--running)}
+    .chip[data-kind=human]{--dot:var(--attention);color:var(--attention)}
+    button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer;letter-spacing:inherit}
+    .add{display:flex;align-items:center;gap:8px;width:100%;padding:9px 10px 9px 20px;border-radius:9px;color:var(--muted);text-align:left;transition:background-color .16s ease,color .16s ease}
+    .add:hover{background:var(--hover);color:var(--text)}
+    .add svg{flex:none;margin:0 2px}
+    .add .title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .add b{font-weight:500;color:currentColor}
+    ul{list-style:none;margin:0;padding:0;display:grid}
+    /* 条目紧挨着排列，不铺底色；最左侧一道任务色竖条，和左侧侧栏会话条目上的标记呼应。
+       状态图标放在标题最前面，时间在标题行右侧，第二行从图标左边开始；悬停时整行浅浅地铺一层任务色。 */
+    .task{--task:#8b8d98;position:relative;display:flex;align-items:center;border-radius:9px;
+      transition:background-color .16s ease;transform-origin:50% 60%}
+    .task::before{content:"";position:absolute;left:9px;top:9px;bottom:9px;width:3px;border-radius:2px;background:var(--task);pointer-events:none}
+    .task:hover,.task:focus-within,.task[data-peek]{background:color-mix(in srgb,var(--task) 10%,transparent)}
+    .main{flex:1;min-width:0;display:grid;grid-template-columns:18px minmax(0,1fr) auto;grid-template-areas:"status title when" "meta meta meta" "plan plan plan";
+      column-gap:8px;align-items:center;padding:7px 10px 7px 20px;text-align:left;border-radius:9px}
+    .main:focus-visible{outline:2px solid color-mix(in srgb,var(--task) 55%,transparent);outline-offset:-2px}
+${ROW_STYLE}
+    /* 看板里图标不铺底块，和标题排在同一行；ROW_STYLE 里的底块留给 Option+Tab 切换面板。 */
+    .main .status,.editor .status{grid-area:status;width:18px;height:18px;border-radius:0;background:none}
+    .main .text{display:contents}
+    .main .title{grid-area:title}
+    .main .meta{grid-area:meta}
+    .when{grid-area:when;justify-self:end;font-size:11.5px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+    .when:empty{display:none}
+    /* 计划进度：一格一步，做完的填任务色，进行中的那格明暗呼吸；右侧是完成数。 */
+    .progress{grid-area:plan;display:flex;align-items:center;gap:8px;min-width:0;margin-top:5px}
+    .progress-bar{flex:1;min-width:0;display:flex;gap:2px;height:4px}
+    .progress-bar i{flex:1;min-width:2px;border-radius:2px;background:color-mix(in srgb,currentColor 11%,transparent)}
+    .progress-bar i[data-status=completed],.progress-bar i[data-status=in_progress]{background:color-mix(in srgb,var(--task) 80%,currentColor 20%)}
+    .progress-bar i[data-status=in_progress]{animation:breathe 1.6s ease-in-out infinite}
+    .progress-count{flex:none;font-size:11px;line-height:1;color:var(--muted);font-variant-numeric:tabular-nums}
+    @keyframes breathe{0%,100%{opacity:.3}50%{opacity:1}}
     /* 需要人处理且还没看过：图标跳出条目，落下时砸得条目轻晃一下。常驻动画只动 transform，交给合成器。 */
     .task[data-hop]{animation:knock 3.2s infinite;will-change:transform}
     .task[data-hop] .status{animation:hop 3.2s infinite;will-change:transform}
     /* 有新回复还没看：图标像来消息的手机一样隔一会儿摇一下。 */
     .task[data-shake] .status{transform-origin:50% 50%;animation:shake 2.6s infinite;will-change:transform}
-    .actions{position:absolute;right:6px;top:50%;display:flex;gap:2px;transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .16s ease}
-    .task:hover .actions,.task:focus-within .actions{opacity:1;pointer-events:auto}
-    .task:hover .text,.task:focus-within .text{padding-right:86px}
-    .icon{display:grid;place-items:center;width:26px;height:26px;border-radius:7px;color:var(--text);
-      background:var(--cc-card-bg,transparent);box-shadow:inset 0 0 0 1px var(--line),0 1px 2px rgba(0,0,0,.05)}
-    .icon:hover{color:currentColor;background:color-mix(in srgb,currentColor 9%,transparent)}
-    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 8px;min-height:60px}
+    /* 悬停时右侧浮出一组按钮：共用一块底板，按钮本身不带边框；时间收起，标题和第二行让出位置。 */
+    .actions{position:absolute;right:8px;top:50%;z-index:3;display:flex;padding:2px;border-radius:9px;background:var(--cc-card-bg,Canvas);
+      box-shadow:0 0 0 .5px color-mix(in srgb,currentColor 18%,transparent),0 3px 10px rgba(0,0,0,.1);
+      opacity:0;transform:translate(4px,-50%);pointer-events:none;transition:opacity .15s ease,transform .22s var(--ease)}
+    .task:hover .actions,.task:focus-within .actions{opacity:1;transform:translate(0,-50%);pointer-events:auto}
+    .task:hover .when,.task:focus-within .when{display:none}
+    .task:hover .title,.task:focus-within .title{padding-right:70px}
+    .task:hover .meta,.task:focus-within .meta,.task:hover .progress,.task:focus-within .progress{margin-right:76px}
+    .icon{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;color:var(--text)}
+    .icon:hover{color:currentColor;background:var(--hover)}
+    .icon[data-action=done]:hover{color:#2f9e6a;background:color-mix(in srgb,#2f9e6a 13%,transparent)}
+    .palette{flex:1;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:12px 10px 12px 20px;min-height:52px}
     .palette button{width:22px;height:22px;border-radius:50%;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.08);transition:transform .2s var(--ease)}
     .palette button:hover{transform:scale(1.15)}
     .palette button[aria-checked=true]{box-shadow:0 0 0 2px currentColor}
-    .editor{flex:1;display:grid;grid-template-columns:28px 1fr;column-gap:10px;align-items:center;padding:8px}
+    .editor{flex:1;display:grid;grid-template-columns:18px 1fr;column-gap:8px;align-items:center;padding:7px 10px 7px 20px;min-height:52px}
     input{width:100%;font:inherit;font-weight:500;color:inherit;background:transparent;border:0;border-radius:6px;padding:2px 6px;margin:-2px -6px;
       outline:none;box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 30%,transparent)}
     .empty{margin:6px 8px 6px;font-size:12.5px;line-height:1.55;color:var(--muted)}
@@ -159,10 +190,6 @@ export function mount({ root, rpc, effects, signal, threads, isVisible }) {
     @starting-style{.peek:popover-open{opacity:0;transform:translateX(6px)}}
 ${TRACE_STYLE}
     @keyframes ray{0%{opacity:1}100%{opacity:.18}}
-    @keyframes turn{to{transform:rotate(360deg)}}
-    @keyframes sweep{from{-webkit-mask-position:100% 0;mask-position:100% 0}to{-webkit-mask-position:0 0;mask-position:0 0}}
-    @keyframes roll-in{from{opacity:0;transform:translateY(70%);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
-    @keyframes roll-out{from{opacity:1;transform:none;filter:none}to{opacity:0;transform:translateY(-70%);filter:blur(3px)}}
     @keyframes hop{
       0%{transform:none;animation-timing-function:ease-out}
       6%{transform:scale(1.14,.82);animation-timing-function:cubic-bezier(.2,.7,.3,1)}
@@ -187,7 +214,7 @@ ${TRACE_STYLE}
       54%{transform:rotate(.12deg)}}
     @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
   </style><section class="board" aria-label="任务看板">
-    <header><h2>${SPARKLE}任务看板</h2><span class="chips"></span></header>
+    <header><h2>任务看板</h2><span class="chips"></span></header>
     <button type="button" class="add" hidden>${icon("plus")}<span class="title">加入当前会话 · <b></b></span></button>
     <ul></ul>
     <div class="peek" popover="manual" aria-label="会话 Trace"></div>
@@ -216,6 +243,10 @@ ${TRACE_STYLE}
   let undo = null;
   let cancelUndo = () => {};
   let loading = null;
+  // 最近在 Codex 里打开过的看板会话，最近的在前；只记在内存里，Codex 重启后从看板顺序开始。
+  let recent = [];
+  let switcherOn = settings?.switcher !== false;
+  let switcher = null;
 
   function showNote(message) {
     note.textContent = message || "";
@@ -275,6 +306,7 @@ ${TRACE_STYLE}
   function iconButton(name, label, onClick) {
     const button = element("button", "icon");
     button.type = "button";
+    button.dataset.action = name;
     button.title = label;
     button.setAttribute("aria-label", label);
     button.innerHTML = icon(name);
@@ -313,15 +345,26 @@ ${TRACE_STYLE}
     if (!projectId) return "";
     return threads?.projectLabel?.(projectId) ?? (/[\\/]/.test(projectId) ? projectId.split(/[\\/]/).filter(Boolean).at(-1) ?? "" : "");
   }
-  // 第二行：进行中显示 Codex 此刻在做什么；其余显示时间和最后一句回复（提问时是问题本身）。
-  function metaOf(task) {
-    if (task.status === "running") return { live: true, text: task.activity || "思考中" };
-    const when = ago(task.turnAt ?? task.updatedAt);
-    if (task.status === "interrupted") return { text: ["已中断", when].filter(Boolean).join(" · ") };
-    if (task.status === "stalled") return { text: ["长时间没有动静", when].filter(Boolean).join(" · ") };
+  // 第二行：进行中显示计划里正在做的那一步，没有计划时显示 Codex 此刻在做什么；其余显示最后一句回复（提问时是问题本身）。
+  // 切换面板没有右侧一栏，时间写在第二行开头；看板把时间放在标题行右侧（whenOf），第二行不再重复。
+  function metaOf(task, { withTime = true } = {}) {
+    if (task.status === "running") {
+      const step = Number.isInteger(task.plan?.active) ? task.plan.steps[task.plan.active]?.text : null;
+      return { live: true, text: step || task.activity || "思考中" };
+    }
     if (task.status === "archived" || task.status === "missing") return { text: STATUS[task.status].label };
-    return { text: [when, task.summary || projectName(task.projectId)].filter(Boolean).join(" · ") };
+    const when = withTime ? ago(task.turnAt ?? task.updatedAt) : "";
+    if (task.status === "interrupted" || task.status === "stalled") {
+      // 标题旁已有「已中断 / 没动静」标签；看板第二行改说需要你做什么。
+      const text = !withTime ? STATUS[task.status].label : task.status === "interrupted" ? "已中断" : "长时间没有动静";
+      return { text: [text, when].filter(Boolean).join(" · ") };
+    }
+    // 看板第二行不带时间，没有回复内容也拿不到项目名时写状态，不空出一行。
+    return { text: [when, task.summary || projectName(task.projectId)].filter(Boolean).join(" · ") || statusLabel(task) };
   }
+  const BOARD_META = { withTime: false };
+  // 看板标题行右侧的时间；进行中的第二行本身在实时变化，归档或找不到的没有可信时间，都不显示。
+  const whenOf = (task) => (["running", "archived", "missing"].includes(task.status) ? "" : ago(task.turnAt ?? task.updatedAt));
   function tagOf(task) {
     if (!STATUS[task.status]?.human) return null;
     return task.status === "asking" ? { text: "需要你" } : { text: task.status === "stalled" ? "没动静" : "已中断", tone: "danger" };
@@ -376,6 +419,51 @@ ${TRACE_STYLE}
     meta.append(label);
   }
 
+  // 计划进度条：Codex 用自带 update_plan 列了计划才有；悬停列出全部步骤。
+  const STEP_MARK = { completed: "✓", in_progress: "▶", pending: "○" };
+  function progressStrip(plan) {
+    const strip = element("span", "progress");
+    const bar = element("span", "progress-bar");
+    for (const step of plan.steps) {
+      const cell = element("i");
+      cell.dataset.status = step.status;
+      bar.append(cell);
+    }
+    strip.append(bar, element("span", "progress-count", `${plan.done}/${plan.total}`));
+    strip.title = [`计划 ${plan.done}/${plan.total} 步`, ...plan.steps.map((step, index) => `${STEP_MARK[step.status] ?? "○"} ${index + 1}. ${step.text}`)].join("\n");
+    strip.setAttribute("role", "img");
+    strip.setAttribute("aria-label", `计划进度：完成 ${plan.done} 步，共 ${plan.total} 步`);
+    return strip;
+  }
+  // 计划变了只换进度条，不重建条目，第二行的扫光和浮层锚点都不受影响。
+  function syncProgress(main, plan) {
+    const current = main.querySelector(".progress");
+    const sig = plan?.total ? JSON.stringify(plan) : "";
+    if ((current?.dataset.sig ?? "") === sig) return;
+    const next = sig ? progressStrip(plan) : null;
+    if (next) next.dataset.sig = sig;
+    if (current && next) current.replaceWith(next);
+    else if (current) current.remove();
+    else if (next) main.append(next);
+  }
+
+  // 名字、标签与第二行；看板条目和切换面板共用，metaOptions 交给 metaOf。
+  function taskText(task, metaOptions) {
+    const text = element("span", "text");
+    const title = element("span", "title");
+    title.append(element("span", "name", displayName(task)));
+    const tag = tagOf(task);
+    if (tag) {
+      const badge = element("span", "tag", tag.text);
+      if (tag.tone) badge.dataset.tone = tag.tone;
+      title.append(badge);
+    }
+    const meta = element("span", "meta");
+    setLabel(meta, metaOf(task, metaOptions));
+    text.append(title, meta);
+    return text;
+  }
+
   function renderTask(task) {
     const item = element("li", "task");
     item.dataset.status = task.status;
@@ -394,19 +482,8 @@ ${TRACE_STYLE}
     const main = element("button", "main");
     main.type = "button";
     main.title = "在左侧定位并打开这个会话";
-    const text = element("span", "text");
-    const title = element("span", "title");
-    title.append(element("span", "name", displayName(task)));
-    const tag = tagOf(task);
-    if (tag) {
-      const badge = element("span", "tag", tag.text);
-      if (tag.tone) badge.dataset.tone = tag.tone;
-      title.append(badge);
-    }
-    const meta = element("span", "meta");
-    setLabel(meta, metaOf(task));
-    text.append(title, meta);
-    main.append(statusIcon(task), text);
+    main.append(statusIcon(task), taskText(task, BOARD_META), element("span", "when", whenOf(task)));
+    syncProgress(main, task.plan);
     main.addEventListener("click", () => { closePeek(); void reveal(task, item); });
     item.addEventListener("pointerenter", () => hoverPeek(task, item));
     item.addEventListener("pointerleave", schedulePeekClose);
@@ -429,12 +506,23 @@ ${TRACE_STYLE}
     void mutate("seen", { threadId: task.threadId, at: task.turnAt }).finally(() => seeing.delete(task.threadId));
   }
 
+  // 看板的显示顺序：需要处理的在前，同档按加入顺序。
+  const displayOrder = () => board.tasks.map((task, index) => ({ task, index }))
+    .sort((a, b) => rankOf(a.task) - rankOf(b.task) || a.index - b.index).map(({ task }) => task);
+
+  // 当前会话在看板里就记一次最近打开；侧栏切换、点看板和 Option+Tab 切过去都会走到这里。
+  function noteVisit() {
+    const current = threads?.current();
+    const task = current && taskFor(current.id);
+    if (task) recent = touchRecent(recent, task.threadId);
+  }
+
   function render() {
     renderHeader();
     markSeen();
+    noteVisit();
     if (!board || editing && root.activeElement?.tagName === "INPUT") return;
-    const ordered = board.tasks.map((task, index) => ({ task, index }))
-      .sort((a, b) => rankOf(a.task) - rankOf(b.task) || a.index - b.index).map(({ task }) => task);
+    const ordered = displayOrder();
     // 按条目复用节点：只有第二行变了就原地换文字，不重建条目，跳动、扫光和悬停状态都不被打断。
     const existing = new Map([...list.children].map((node) => [node.dataset.id, node]));
     const nodes = ordered.map((task) => {
@@ -442,7 +530,11 @@ ${TRACE_STYLE}
       const previous = existing.get(task.threadId);
       if (previous?.dataset.key === key) {
         const meta = previous.querySelector(".meta");
-        if (meta) setLabel(meta, metaOf(task));
+        if (meta) setLabel(meta, metaOf(task, BOARD_META));
+        const when = previous.querySelector(".when");
+        if (when && when.textContent !== whenOf(task)) when.textContent = whenOf(task);
+        const main = previous.querySelector(".main");
+        if (main) syncProgress(main, task.plan);
         return previous;
       }
       const node = renderTask(task);
@@ -467,6 +559,7 @@ ${TRACE_STYLE}
     }
     threads?.setMarks(board.tasks.flatMap((task) => idsOf(task).map((id) => ({ id, color: task.color }))));
     render();
+    switcher?.refresh();
   }
 
   async function mutate(method, params) {
@@ -555,10 +648,11 @@ ${TRACE_STYLE}
     peekTimer = effects.timeout(() => { peekTimer = null; openPeek(task, item); }, PEEK_OPEN_MS);
   }
 
-  async function reveal(task, item) {
+  // item 是看板里被点的条目，液流从它的图标流向侧栏；键盘切换没有起点，只保留侧栏落点高亮。
+  async function reveal(task, item = null) {
     if (!threads) return;
     const id = idsOf(task).find((item) => threads.has(item)) ?? task.threadId;
-    const result = await threads.reveal(id, { source: item.querySelector(".status") ?? item, projectId: task.projectId });
+    const result = await threads.reveal(id, { source: item ? item.querySelector(".status") ?? item : null, projectId: task.projectId });
     if (signal.aborted || result.ok) return;
     // 侧栏里找不到（例如会话不在当前列表中）时，交给 Codex 深链打开。
     try { await rpc("open", { threadId: task.threadId }); } catch (error) { fail(error); }
@@ -613,10 +707,37 @@ ${TRACE_STYLE}
   const peekResize = new doc.defaultView.ResizeObserver(() => { if (peekItem?.isConnected) placePeek(peekItem); });
   peekResize.observe(peek);
   effects.add(() => peekResize.disconnect());
+  // Option+Tab：需要平台的顶层浮层（抽屉收起时也能弹出）和侧栏会话列表。
+  if (overlay && threads) {
+    switcher = createSwitcher({
+      doc, overlay, effects,
+      style: `.panel{${TOKENS}}${ROW_STYLE}`,
+      enabled: () => switcherOn,
+      items: () => {
+        noteVisit();
+        return board ? orderByRecent(displayOrder(), recent) : [];
+      },
+      current: () => {
+        const current = threads.current();
+        return (current && taskFor(current.id)?.threadId) ?? null;
+      },
+      renderItem: (task, item) => {
+        if (colors[task.color]) item.style.setProperty("--task", colors[task.color]);
+        item.append(statusIcon(task), taskText(task));
+      },
+      // Trace 浮层在页面顶层，开着会盖住切换面板，先收起。
+      prepare: () => { closePeek(); void refresh(); },
+      pick: (task) => { closePeek(); void reveal(task); }
+    });
+  }
   render();
   void refresh();
   if (isVisible()) startWatch();
   return {
+    updateSettings(next) {
+      switcherOn = next?.switcher !== false;
+      if (!switcherOn) switcher?.cancel();
+    },
     visibilityChanged({ visible }) {
       if (visible) { void refresh(); startWatch(); } else stopWatch();
       if (!visible) closePeek();

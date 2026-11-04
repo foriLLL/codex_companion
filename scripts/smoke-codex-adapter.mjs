@@ -368,6 +368,37 @@ try {
   await evaluate(`dotAdapter.dispose()`);
   assert.deepEqual(await evaluate(`errors`), []);
 
+  // 宿主改版保障：认不出结构 → 不透明侧板、不打标记；滚动内容里的按钮不推低抽屉。
+  await evaluate(`(() => {
+    document.body.innerHTML='<header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="margin-left:auto;display:flex;gap:6px"><div><button aria-label="New tab" style="width:28px;height:28px">+</button></div></div></header>'
+      + '<main style="position:absolute;inset:44px 0 0;display:flex;flex-direction:column"><div style="flex:1;overflow:auto"><div style="max-width:600px;margin:0 auto">Unknown<button id="scrolling-action" style="position:absolute;right:20px;top:20px;width:28px;height:28px">R</button></div></div>'
+      + '<div contenteditable="true" style="height:40px;max-width:600px;margin:0 auto 16px;width:100%">Input</div></main>';
+    globalThis.unknownAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+  })()`);
+  await evaluate(`unknownAdapter.setOpen(true)`);
+  await waitFor(`unknownAdapter.isOpen() && unknownAdapter.getDiagnostics().surface === 'sheet'`, "未知结构应退回不透明侧板");
+  assert.deepEqual(await evaluate(`(() => {
+    const drawer=document.getElementById('codex-companion-root-shell').shadowRoot.querySelector('.drawer');
+    return {marks:document.querySelectorAll('[data-companion-dock]').length,top:drawer.style.top,opaque:getComputedStyle(drawer).backgroundColor!=='rgba(0, 0, 0, 0)'};
+  })()`), { marks: 0, top: "48px", opaque: true }, "未知结构不移动原生节点，滚动区按钮不推低抽屉");
+  await evaluate(`unknownAdapter.dispose()`);
+
+  // 选择器命中但平移没有生效（原生样式压过让位样式）：复核发现遮挡，撤销让位并退回侧板，且不再反复尝试。
+  await evaluate(`(() => {
+    document.body.innerHTML='<style>#stuck-list{transform:none !important}</style><header style="position:fixed;top:0;left:0;right:0;height:44px;display:flex"><div style="margin-left:auto;display:flex;gap:6px"><div><button aria-label="New tab" style="width:28px;height:28px">+</button></div></div></header>'
+      + '<main style="position:absolute;inset:44px 0 0;display:flex;flex-direction:column"><div style="display:flex;flex:1;min-height:0"><div data-role="messages-scroll" style="flex:1;overflow:auto"><div id="stuck-list" class="message-list" style="max-width:600px;margin:0 auto">Message</div></div></div></main>';
+    globalThis.stuckAdapter=createCodexAdapter({host,onError:error=>errors.push(error.message)});
+  })()`);
+  await evaluate(`stuckAdapter.setOpen(true)`);
+  await waitFor(`stuckAdapter.isOpen() && stuckAdapter.getDiagnostics().surface === 'sheet'`, "平移失效应退回侧板");
+  assert.deepEqual(await evaluate(`(async () => {
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const {dockFallbacks, surface} = stuckAdapter.getDiagnostics();
+    return {dockFallbacks, surface, marks:document.querySelectorAll('[data-companion-dock]').length};
+  })()`), { dockFallbacks: 1, surface: "sheet", marks: 0 }, "复核失败后撤销且不重试");
+  await evaluate(`stuckAdapter.dispose()`);
+  assert.deepEqual(await evaluate(`errors`), []);
+
   await evaluate(`clearInterval(frameTimer);video.srcObject.getTracks().forEach(track=>track.stop())`);
   console.log("Codex adapter smoke passed:", JSON.stringify(evidence));
 } finally {

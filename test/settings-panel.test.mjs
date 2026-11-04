@@ -74,7 +74,7 @@ const initialConfig = () => ({
   cards: { alpha: { enabled: true, settings: { keep: true } }, beta: { enabled: false, settings: {} }, future: { enabled: true, settings: { unknown: true } } },
   launch: { proxy: { enabled: false, port: 7890 } }, agent: { autoRelaunch: true }
 });
-function fixture(handler) {
+function fixture(handler, options = {}) {
   const document = makeDocument();
   const calls = [];
   let closed = 0;
@@ -85,7 +85,7 @@ function fixture(handler) {
     if (method === "companion.agent.status") return { available: false };
     throw Error(`unexpected ${method}`);
   };
-  const panel = createSettingsPanel({ document, call, onClose: () => { closed++; } });
+  const panel = createSettingsPanel({ document, call, onClose: () => { closed++; }, ...options });
   document.body.append(panel.element);
   return { document, panel, calls, get closed() { return closed; } };
 }
@@ -119,7 +119,7 @@ test("设置页首次打开才读取，渲染全部区块与 catalog 标题，�
   await f.panel.open();
   const root = f.panel.element;
   assert.deepEqual(f.calls.map(item => item.method), ["companion.settings.get", "companion.agent.status"]);
-  assert.deepEqual(descendants(root).filter(item => item.tagName === "legend").map(item => item.textContent), ["卡片", "显示方式", "启动", "自动加载", "状态"]);
+  assert.deepEqual(descendants(root).filter(item => item.tagName === "legend").map(item => item.textContent), ["卡片", "显示方式", "任务看板", "启动", "自动加载", "状态"]);
   assert.ok(bySetting(root, "enabled").checked);
   assert.ok(bySetting(root, "card-alpha").parentNode.textContent.includes("甲卡片"));
   assert.equal(bySetting(root, "card-beta").checked, false);
@@ -205,6 +205,59 @@ test("卡片开关、排序、placement 和代理开关只发送最小补丁，�
   assert.deepEqual(f.calls.at(-1).params.patch, { launch: { proxy: { enabled: true } } });
   assert.deepEqual(config, initialConfig(), "不能修改 RPC 返回的原始配置对象");
   f.panel.destroy();
+});
+
+test("任务看板设置：Option+Tab 只在 macOS 显示、缺省开启；长任务先列计划缺省关闭；都写入卡片 settings，卡片关闭时禁用", async () => {
+  const withTasks = [...catalog, { id: "tasks", title: "任务看板", defaultEnabled: true, defaultOrder: 5 }];
+  const base = initialConfig();
+  let config = { ...base, cards: { ...base.cards, tasks: { enabled: true, settings: { keep: 1 } } } };
+  const f = fixture((method, params) => {
+    if (method === "companion.settings.get") return { config, catalog: withTasks };
+    if (method === "companion.agent.status") return { available: false };
+    const patch = params.patch.cards.tasks;
+    const tasks = { ...config.cards.tasks, ...patch, settings: { ...config.cards.tasks.settings, ...patch.settings } };
+    config = { ...config, revision: config.revision + 1, cards: { ...config.cards, tasks } };
+    return { config };
+  }, { platform: "MacIntel" });
+  await f.panel.open();
+  const root = f.panel.element;
+  const group = () => descendants(root).find(item => item.tagName === "legend" && item.textContent === "任务看板").parentNode;
+  assert.equal(group().hidden, false);
+  const hint = bySetting(root, "tasks-plan-hint");
+  assert.equal(hint.checked, false, "长任务先列计划缺省关闭");
+  assert.ok(hint.parentNode.textContent.includes("AGENTS.md"));
+  change(hint, true);
+  await turn();
+  assert.deepEqual(f.calls.at(-1).params, { expectedRevision: 4, patch: { cards: { tasks: { settings: { planHint: true } } } } });
+  assert.equal(hint.checked, true);
+  const input = bySetting(root, "tasks-switcher");
+  assert.equal(input.parentNode.hidden, false);
+  assert.equal(input.checked, true, "没写过设置时缺省开启");
+  assert.equal(input.disabled, false);
+  assert.ok(input.parentNode.textContent.includes("Option+Tab 切换看板会话"));
+  assert.ok(input.parentNode.textContent.includes("按住 Option 连按 Tab 选择"));
+  change(input, false);
+  await turn();
+  assert.deepEqual(f.calls.at(-1).params, { expectedRevision: 5, patch: { cards: { tasks: { settings: { switcher: false } } } } });
+  assert.equal(input.checked, false);
+  assert.deepEqual(config.cards.tasks.settings, { keep: 1, planHint: true, switcher: false }, "只改这一项，保留卡片其它设置");
+  change(bySetting(root, "card-tasks"), false);
+  await turn();
+  assert.equal(input.disabled, true, "任务看板关闭时开关不可用");
+  assert.equal(hint.disabled, true);
+  assert.ok(input.parentNode.textContent.includes("需先启用任务看板"));
+  f.panel.destroy();
+
+  const linux = fixture(method => method === "companion.settings.get" ? { config: initialConfig(), catalog: withTasks } : { available: false }, { platform: "Linux x86_64" });
+  await linux.panel.open();
+  const legend = (panel) => descendants(panel.element).find(item => item.tagName === "legend" && item.textContent === "任务看板").parentNode;
+  assert.equal(legend(linux.panel).hidden, false, "Linux 也能开关长任务先列计划");
+  assert.equal(bySetting(linux.panel.element, "tasks-switcher").parentNode.hidden, true, "Linux 不显示 Option+Tab");
+  linux.panel.destroy();
+  const noTasks = fixture(null, { platform: "MacIntel" });
+  await noTasks.panel.open();
+  assert.equal(legend(noTasks.panel).hidden, true, "没有任务看板卡片时隐藏");
+  noTasks.panel.destroy();
 });
 
 test("CONFIG_CONFLICT 重新读取，不重放旧 patch，下一次编辑使用刷新后的 revision", async () => {

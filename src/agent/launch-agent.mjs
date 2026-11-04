@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createPlanHint } from "../codex-plan-hint.mjs";
+import { defaultCodexHome } from "../codex-sessions.mjs";
 import { CodexInjector } from "../injector.mjs";
 import { createAgentAdapter } from "./adapter.mjs";
 import { createAgentDependencies, readAgentStatus, runAgent } from "./main.mjs";
@@ -132,7 +134,13 @@ export async function uninstallAgent(options = {}) {
     } catch (error) { unmountError = String(error.message ?? error); }
     finally { injector?.stop(); }
   }
-  return { uninstalled: true, ...removed, unmounted, ...(unmountError ? { unmountError } : {}) };
+  // 撤掉「长任务先列计划」写进 Codex 指令文件的提示；只动带 Companion 标记的那一段，失败不影响卸载。
+  let planHintRemoved = false;
+  try {
+    const codexHome = defaultCodexHome({ env: options.env ?? (options.home ? {} : process.env), home: options.home ?? homedir() });
+    planHintRemoved = await (options.planHint ?? createPlanHint({ codexHome })).set(false);
+  } catch {}
+  return { uninstalled: true, ...removed, unmounted, ...(unmountError ? { unmountError } : {}), ...(planHintRemoved ? { planHintRemoved } : {}) };
 }
 
 export async function restartCodex(options = {}) {

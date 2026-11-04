@@ -8,7 +8,7 @@ import { reserveLoopbackPort } from "../src/launcher.mjs";
 import { listCdpTargets } from "../src/targets.mjs";
 
 // 任务看板冒烟：独立临时 Chrome profile + 模拟的 Codex 侧栏，验证定位、自动展开、滚动、
-// 指向动画、颜色标记与点击打开。不访问用户 Codex 的 CDP 端口、配置或会话数据。
+// 指向动画、颜色标记、点击打开与 Option+Tab 切换。不访问用户 Codex 的 CDP 端口、配置或会话数据。
 //   node scripts/smoke-task-board.mjs [--screenshot-dir <dir>]
 const shotIndex = process.argv.indexOf("--screenshot-dir");
 const shotDir = shotIndex > 0 ? process.argv[shotIndex + 1] : null;
@@ -60,10 +60,11 @@ try {
   };
 
   await evaluate(`(async () => {
-    const [{ createCodexThreads }, { mount }, { createEffects }] = await Promise.all([
+    const [{ createCodexThreads }, { mount }, { createEffects }, { createOverlayLayer }] = await Promise.all([
       import(${JSON.stringify(await moduleUrl("src/renderer/adapters/codex-threads.mjs"))}),
       import(${JSON.stringify(await moduleUrl("src/cards/tasks/renderer.mjs"))}),
-      import(${JSON.stringify(await moduleUrl("src/renderer/platform/effects.mjs"))})
+      import(${JSON.stringify(await moduleUrl("src/renderer/platform/effects.mjs"))}),
+      import(${JSON.stringify(await moduleUrl("src/renderer/shell/overlay-layer.mjs"))})
     ]);
     const id = (n) => '01a18216-3b02-7db0-b394-' + String(n).padStart(12, '0');
     globalThis.ids = { a3: id(3), a10: id(10), a24: id(24), b1: id(101), bHidden: id(105), s1: id(201) };
@@ -71,8 +72,10 @@ try {
     const titles = ['修复登录页闪烁', '整理周报数据', '升级 hls.js', '接入任务看板', '排查代理超时', 'Emby 字幕偏移', '重构播放器状态机', '补齐 Windows 测试'];
     const rowsA = Array.from({ length: 25 }, (_, n) => row(n, n === 24 ? '发布 v0.2 检查清单' : titles[n % titles.length] + (n >= titles.length ? ' ' + n : ''))).join('');
     document.body.innerHTML = \`<style>
-      :root{--bg:#fff;--side:#f7f7f7;--fg:#0d0d0d;--fg2:#8f8f8f;--line:#ececec;--active:rgba(0,0,0,.055);--card:#fff;--cardline:rgba(0,0,0,.08);color-scheme:light}
-      :root[data-theme=dark]{--bg:#212121;--side:#181818;--fg:#ececec;--fg2:#8a8a8a;--line:#2a2a2a;--active:rgba(255,255,255,.07);--card:#2a2a2a;--cardline:rgba(255,255,255,.08);color-scheme:dark}
+      :root{--bg:#fff;--side:#f7f7f7;--fg:#0d0d0d;--fg2:#8f8f8f;--line:#ececec;--active:rgba(0,0,0,.055);--card:#fff;--cardline:rgba(0,0,0,.08);color-scheme:light;
+        --color-token-dropdown-background:#fff;--color-token-text-primary:#0d0d0d}
+      :root[data-theme=dark]{--bg:#212121;--side:#181818;--fg:#ececec;--fg2:#8a8a8a;--line:#2a2a2a;--active:rgba(255,255,255,.07);--card:#2a2a2a;--cardline:rgba(255,255,255,.08);color-scheme:dark;
+        --color-token-dropdown-background:#2f2f2f;--color-token-text-primary:#ececec;--color-token-border-heavy:rgba(255,255,255,.14)}
       html,body{margin:0;height:100%;font:13px/1.4 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:var(--bg);color:var(--fg);overflow:hidden;-webkit-font-smoothing:antialiased}
       nav{position:fixed;left:0;top:0;bottom:0;width:264px;background:var(--side);border-right:1px solid var(--line)}
       .brand{display:flex;align-items:center;gap:8px;height:48px;padding:0 18px;font-weight:600;font-size:14px}
@@ -89,6 +92,7 @@ try {
       main header{height:48px;display:flex;align-items:center;padding:0 24px;font-weight:500;border-bottom:1px solid var(--line)}
       .msg{max-width:560px;margin:28px auto 0;padding:0 24px;color:var(--fg2);line-height:1.7}
       .msg p{margin:0 0 14px}.msg .user{margin-left:auto;width:fit-content;max-width:70%;padding:8px 14px;border-radius:18px;background:var(--active);color:var(--fg)}
+      #composer{position:absolute;left:50%;bottom:24px;width:520px;height:56px;margin-left:-300px;padding:12px 14px;border:1px solid var(--line);border-radius:18px;font:inherit;color:var(--fg);background:var(--bg);resize:none}
       #companion{position:fixed;right:14px;top:60px;width:332px;background:var(--card);color:var(--fg);border-radius:18px;box-shadow:0 0 0 1px var(--cardline),0 8px 28px rgba(0,0,0,.08);--cc-card-bg:var(--card)}
     </style>
     <nav id="app-shell-sidebar"><div class="brand">Codex</div><div class="newchat">＋ 新对话</div><div data-app-action-sidebar-scroll="">
@@ -97,7 +101,7 @@ try {
       <div class="project" data-app-action-sidebar-project-row="" data-app-action-sidebar-project-id="/Users/me/projects/codex-companion" data-app-action-sidebar-project-label="codex-companion" data-app-action-sidebar-project-collapsed="false">codex-companion</div>
       <div data-app-action-sidebar-project-list-id="/Users/me/projects/codex-companion" data-app-action-sidebar-project-show-all="true">\${rowsA}</div>
       <div class="project" id="project-b" data-app-action-sidebar-project-row="" data-app-action-sidebar-project-id="/Users/me/projects/ecam" data-app-action-sidebar-project-label="ecam" data-app-action-sidebar-project-collapsed="true">ecam</div>
-    </div></nav><main><header>接入任务看板</header><div class="msg"><p class="user">帮我给 Companion 加一个任务看板卡片</p><p>好的，先梳理现有卡片平台的接口……</p></div></main><div id="companion"></div>\`;
+    </div></nav><main><header>接入任务看板</header><div class="msg"><p class="user">帮我给 Companion 加一个任务看板卡片</p><p>好的，先梳理现有卡片平台的接口……</p></div><textarea id="composer" placeholder="要求后续变更"></textarea></main><div id="companion"></div>\`;
     // 模拟 React：异步提交展开结果，点击条目即切换当前会话。
     globalThis.clicks = [];
     globalThis.flowAtClick = [];
@@ -141,6 +145,8 @@ try {
     const ageOf = { [ids.a24]: 40e3, [ids.bHidden]: 2 * 3600e3, [ids.s1]: 3 * 86400e3, [ids.a10]: 25 * 60e3 };
     const started = Date.now();
     globalThis.activityOf = { [ids.a24]: '运行 npm test' };
+    // 计划（Codex 自带 update_plan）：冒烟后段才给 a24 加上。
+    globalThis.planOf = {};
     const summaryOf = { [ids.bHidden]: '要先合并 #482 还是先发预览？', [ids.a10]: '已升级到 1.6.2，播放冒烟通过', [ids.a3]: '看板已接入，等你确认样式' };
     // 长轮询：sig 没变就挂起，变了（或超时）再返回。
     let wake = null;
@@ -149,8 +155,8 @@ try {
       const updatedAt = started - (ageOf[task.threadId] ?? 6 * 60e3);
       const status = statusOf[task.threadId] ?? 'idle';
       return { ...task, name: task.customName ?? task.suggestedName ?? '未命名会话', status, updatedAt, turnAt: updatedAt, unread: status !== 'running' && updatedAt > task.seenAt,
-        activity: status === 'running' ? activityOf[task.threadId] ?? '思考中' : null, summary: summaryOf[task.threadId] ?? null };
-    }), sig: String(revision) + ':' + JSON.stringify(activityOf) });
+        activity: status === 'running' ? activityOf[task.threadId] ?? '思考中' : null, summary: summaryOf[task.threadId] ?? null, plan: planOf[task.threadId] ?? null };
+    }), sig: String(revision) + ':' + JSON.stringify(activityOf) + JSON.stringify(planOf) });
     const pick = () => { const used = new Array(8).fill(0); for (const task of tasks) used[task.color] += 1; return used.indexOf(Math.min(...used)); };
     const methods = {
       list: () => view(),
@@ -185,9 +191,15 @@ try {
             seg('model', 'reply', t2 + 130 * s, t2 + 150 * s, '改好了，要我提交吗？', { tokens: { output: 1700, reasoning: 700, perSecond: 60 } })] },
           { start: t3, end: null, status: 'running', asking: false, ttftMs: null, tokens: { input: 61000, output: 900, reasoning: 300 }, segments: [
             seg('model', 'think', t3, t3 + 12 * s, '思考'), seg('model', 'call', t3 + 12 * s, t3 + 16 * s, '准备运行 npm run smoke', { tokens: { output: 900, reasoning: 300, perSecond: 56 } }),
-            seg('shell', 'tool', t3 + 16 * s, t3 + 52 * s, '运行 npm run smoke', { failed: false }), seg('model', 'think', t3 + 52 * s, null, '思考中')] }
+            seg('shell', 'tool', t3 + 16 * s, t3 + 52 * s, '运行 npm run smoke', { failed: false }), seg('model', 'think', t3 + 52 * s, null, '思考中')],
+            notes: [{ at: t3 + 5 * s, text: '先跑一遍冒烟，看看现在的状态' }, { at: t3 + 14 * s, text: '冒烟脚本在跑，等结果出来再决定改哪里' }] }
         ];
-        const data = { threadId, model: 'gpt-5.6-sol', contextWindow: 258400, turns, updatedAt: now };
+        // 计划：第 1 步在上一个回合做完，第 2 步跨回合，第 3 步正在做。
+        const summary = planOf[threadId];
+        const timings = [[t2 + 5 * s, t2 + 60 * s], [t2 + 60 * s, t3 + 20 * s], [t3 + 20 * s, null], [null, null]];
+        const plan = summary ? { createdAt: t2 + 5 * s, updatedAt: t3 + 20 * s, explanation: '样式已改完，正在跑冒烟确认',
+          steps: summary.steps.map((step, index) => ({ ...step, start: timings[index][0], end: timings[index][1] })) } : null;
+        const data = { threadId, model: 'gpt-5.6-sol', contextWindow: 258400, turns, updatedAt: now, plan };
         return { ...data, sig: 'trace-' + threadId + (globalThis.traceRevision ?? ''), now };
       },
       watch: async ({ since, waitMs }) => {
@@ -206,7 +218,8 @@ try {
     globalThis.card = host.attachShadow({ mode: 'open' });
     globalThis.controller = new AbortController();
     const effects = createEffects({ signal: controller.signal, onError: (error) => errors.push(error.message) });
-    globalThis.handle = mount({ root: card, rpc, effects, signal: controller.signal, threads, isVisible: () => true });
+    const overlay = createOverlayLayer({ document, cardId: 'tasks', effects });
+    globalThis.handle = mount({ root: card, rpc, effects, signal: controller.signal, threads, overlay, settings: {}, isVisible: () => true });
   })()`);
 
   const $ = (selector) => `card.querySelector(${JSON.stringify(selector)})`;
@@ -241,8 +254,13 @@ try {
   assert.equal(await evaluate(`${task("a10")}.hasAttribute('data-shake')`), true, "没看过的新回复会摇晃");
   assert.equal(await evaluate(`${task("a3")}.hasAttribute('data-shake')`), false, "看过的回复不摇");
   assert.equal(await evaluate(`getComputedStyle(${task("a10")}).backgroundColor`), "rgba(0, 0, 0, 0)", "条目不铺任务色底");
-  assert.notEqual(await evaluate(`getComputedStyle(${task("a10")}.querySelector('.status')).backgroundColor`), "rgba(0, 0, 0, 0)", "任务色铺在图标底块");
-  assert.equal(await evaluate(`${task("a10")}.querySelector('.meta').textContent`), "25 分钟前 · 已升级到 1.6.2，播放冒烟通过", "第二行是时间和最后一句回复");
+  assert.notEqual(await evaluate(`getComputedStyle(${task("a10")}, '::before').backgroundColor`), "rgba(0, 0, 0, 0)", "任务色是最左侧的竖条");
+  assert.equal(await evaluate(`getComputedStyle(${task("a10")}.querySelector('.status')).backgroundColor`), "rgba(0, 0, 0, 0)", "图标不铺底块");
+  assert.equal(await evaluate(`${task("a10")}.querySelector('.when').textContent`), "25 分钟前", "时间在标题行右侧");
+  assert.equal(await evaluate(`${task("a10")}.querySelector('.meta').textContent`), "已升级到 1.6.2，播放冒烟通过", "第二行是最后一句回复");
+  // 用 offsetLeft 量：图标在摇晃（rotate），外框会随角度变宽。
+  assert.equal(await evaluate(`(() => { const row = ${task("a10")}; return row.querySelector('.meta').offsetLeft - row.querySelector('.status').offsetLeft; })()`), 0, "第二行与图标左对齐");
+  assert.equal(await evaluate(`card.querySelector('h2').children.length`), 0, "标题前没有图标");
   assert.equal(await evaluate(`${task("a24")}.querySelector('.meta .live')?.textContent`), "运行 npm test", "进行中显示当前动作");
   assert.equal(await evaluate(`${task("bHidden")}.querySelector('.tag')?.textContent`), "需要你");
   assert.deepEqual(await evaluate(`[...card.querySelectorAll('.chip')].map((chip) => chip.textContent)`), ["1 进行中", "2 需要你"]);
@@ -269,6 +287,8 @@ try {
   };
   await pointAt(`${task("a3")}.querySelector('.name')`);
   await waitFor(`card.querySelector('.peek').matches(':popover-open') && card.querySelectorAll('.seg-bar').length === 18`, "悬停打开 Trace 浮层");
+  // 内容画出来后浮层变高，ResizeObserver 在下一帧重新贴位置。
+  await waitFor(`(() => { const peek = card.querySelector('.peek').getBoundingClientRect(); return peek.top >= 0 && peek.bottom <= innerHeight; })()`, "浮层重新贴位置");
   assert.deepEqual(await evaluate(`(() => {
     const peek = card.querySelector('.peek').getBoundingClientRect();
     const board = document.getElementById('companion').getBoundingClientRect();
@@ -306,8 +326,30 @@ try {
     return { kept, redrawn: card.querySelector('.tl-scroll') !== box };
   })()`);
   assert.deepEqual(settle, { kept: true, redrawn: true }, "滚动中不重建，停下后再画");
+  // 没列计划：计划区退回本回合的进度说明。
+  assert.deepEqual(await evaluate(`[...card.querySelectorAll('.plan[data-inferred] .plan-text')].map((node) => node.textContent)`),
+    ["先跑一遍冒烟，看看现在的状态", "冒烟脚本在跑，等结果出来再决定改哪里"], "没列计划时按进度说明推断");
+  // Codex 列了计划：条目第二行换成正在做的那一步，下面一条按步分格的进度条。
+  await evaluate(`planOf[ids.a24] = { total: 4, done: 2, active: 2, steps: [
+    { text: '梳理现有看板卡片结构', status: 'completed' }, { text: '改条目样式与配色', status: 'completed' },
+    { text: '跑冒烟并截图确认', status: 'in_progress' }, { text: '整理改动说明', status: 'pending' }] }; bump()`);
+  await waitFor(`${task("a24")}.querySelector('.progress-count')?.textContent === '2/4'`, "条目显示计划进度");
+  assert.deepEqual(await evaluate(`[...${task("a24")}.querySelectorAll('.progress-bar i')].map((cell) => cell.dataset.status)`), ["completed", "completed", "in_progress", "pending"]);
+  await waitFor(`${task("a24")}.querySelector('.meta .label:not(.out)')?.textContent === '跑冒烟并截图确认'`, "第二行显示正在做的那一步");
+  assert.equal(await evaluate(`(() => { const row = ${task("a24")}; return row.querySelector('.progress').offsetLeft - row.querySelector('.status').offsetLeft; })()`), 0, "进度条与图标左对齐");
+  await screenshot("task-board-6-plan-row.png");
   await pointAt(`${task("a24")}.querySelector('.name')`);
   await waitFor(`card.querySelector('.trace-title')?.textContent === ${task("a24")}.querySelector('.name').textContent && ${task("a24")}.hasAttribute('data-peek')`, "移到别的任务直接切换");
+  await waitFor(`card.querySelectorAll('.plan-step').length === 4`, "Trace 显示计划");
+  assert.deepEqual(await evaluate(`[...card.querySelectorAll('.tl-lane')].map((lane) => lane.dataset.lane)`), ["plan", "model", "shell", "edit", "agent", "you"], "计划泳道在最上面");
+  assert.equal(await evaluate(`card.querySelectorAll('.seg-bar[data-kind=step]').length`), 3, "有起点的步骤画成段");
+  assert.equal(await evaluate(`card.querySelectorAll('.seg-bar[data-kind=step][data-live]').length`), 1, "进行中的步骤在生长");
+  assert.match(await evaluate(`card.querySelector('.plan-head').textContent`), /^计划第 3\/4 步已用 \d+m \d+s$/);
+  assert.equal(await evaluate(`(() => { const link = card.querySelector('.tl-link'); const model = card.querySelectorAll('.tl-row')[1].getBoundingClientRect(); return Math.round(link.getBoundingClientRect().top - model.top); })()`), 29, "工具连线从模型泳道出发");
+  await screenshot("task-board-7-plan-trace-light.png");
+  await evaluate(`document.documentElement.dataset.theme = 'dark'`);
+  await screenshot("task-board-8-plan-trace-dark.png");
+  await evaluate(`delete document.documentElement.dataset.theme`);
   await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 600, y: 700 });
   await waitFor(`!card.querySelector('.peek').matches(':popover-open') && !card.querySelector('[data-peek]')`, "移出后关闭浮层");
 
@@ -350,8 +392,100 @@ try {
   // 侧栏找不到时回退到深链。
   await evaluate(`seed([{ threadId: '01a18216-3b02-7db0-b394-999999999999', title: '已不在列表中的会话' }]); handle.visibilityChanged({ visible: true })`);
   await waitFor(`card.querySelectorAll('.task').length === 6`, "加入不在侧栏的会话");
+  assert.equal(await evaluate(`card.querySelector('.task[data-id="01a18216-3b02-7db0-b394-999999999999"] .meta').textContent`), "已回复", "没有回复内容时第二行写状态");
   await evaluate(`card.querySelector('.task[data-id="01a18216-3b02-7db0-b394-999999999999"] .main').click()`);
   await waitFor(`rpcCalls.includes('open')`, "回退深链", 8000);
+
+  // Option+Tab：照 ⌘Tab，按最近打开的顺序在看板会话间切换。到这里依次打开过 a3、a24、bHidden、s1。
+  const ALT = 1;
+  const SHIFT = 8;
+  const key = (type, name, code, keyCode, modifiers, text) => connection.send("Input.dispatchKeyEvent", {
+    type, key: name, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers, ...(text ? { text, unmodifiedText: text } : {})
+  });
+  const altDown = () => key("rawKeyDown", "Alt", "AltLeft", 18, ALT);
+  const altUp = () => key("keyUp", "Alt", "AltLeft", 18, 0);
+  const tab = async (modifiers = ALT) => { await key("rawKeyDown", "Tab", "Tab", 9, modifiers); await key("keyUp", "Tab", "Tab", 9, modifiers); };
+  const layer = `document.getElementById('codex-companion-overlay-tasks')?.shadowRoot`;
+  const panelOpen = `Boolean(${layer}?.querySelector('.backdrop:not([hidden])'))`;
+  const switchRows = `[...${layer}.querySelectorAll('.item')].map((item) => Object.keys(ids).find((name) => ids[name] === item.dataset.id) ?? 'other')`;
+  const switchSelected = `Object.keys(ids).find((name) => ids[name] === ${layer}?.querySelector('.item[aria-selected=true]')?.dataset.id)`;
+  await evaluate(`(() => { const box = document.getElementById('composer'); box.value = ''; box.focus(); })()`);
+  assert.equal(await evaluate(`threads.current()?.id === ids.s1`), true);
+
+  // 快速点按：不弹面板，直接回到上一个会话。
+  await altDown();
+  await tab();
+  await altUp();
+  await waitFor(`threads.current()?.id === ids.bHidden`, "快速点按回到上一个会话", 6000);
+  assert.equal(await evaluate(panelOpen), false, "快速点按不弹面板");
+
+  // 按住：面板列出看板会话（最近打开的在前），默认选中上一个；连按 Tab 往下选，松开切过去。
+  await altDown();
+  await tab();
+  await waitFor(panelOpen, "按住 Option 后弹出切换面板");
+  assert.deepEqual(await evaluate(switchRows), ["bHidden", "s1", "a24", "a3", "a10", "other"], "最近打开的在前，没打开过的按看板顺序");
+  assert.equal(await evaluate(switchSelected), "s1");
+  assert.equal(await evaluate(`${layer}.querySelector('.item[aria-selected=true] .name').textContent`), "准备周五分享");
+  await tab();
+  assert.equal(await evaluate(switchSelected), "a24");
+  await tab(ALT | SHIFT);
+  await tab();
+  assert.equal(await evaluate(switchSelected), "a24", "Shift+Tab 反向");
+  // 面板期间的按键不进输入框：Tab 不移焦点，Option+A 不打出 å。
+  await key("keyDown", "å", "KeyA", 65, ALT, "å");
+  await key("keyUp", "å", "KeyA", 65, ALT);
+  assert.deepEqual(await evaluate(`(() => { const box = document.getElementById('composer'); return { value: box.value, focused: document.activeElement === box }; })()`), { value: "", focused: true });
+  assert.deepEqual(await evaluate(`(() => {
+    const panel = ${layer}.querySelector('.panel').getBoundingClientRect();
+    return { centered: Math.abs(panel.left + panel.width / 2 - innerWidth / 2) < 2, inView: panel.top >= 0 && panel.bottom <= innerHeight, bg: getComputedStyle(${layer}.querySelector('.panel')).backgroundColor };
+  })()`), { centered: true, inView: true, bg: "rgb(255, 255, 255)" }, "面板居中、不出窗口、用 Codex 的浮层底色");
+  await screenshot("task-board-8-switcher.png");
+  await evaluate(`document.documentElement.dataset.theme = 'dark'`);
+  await connection.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+  await screenshot("task-board-9-switcher-dark.png");
+  await connection.send("Emulation.setEmulatedMedia", { features: [] });
+  await evaluate(`delete document.documentElement.dataset.theme`);
+  await altUp();
+  await waitFor(`threads.current()?.id === ids.a24 && !${panelOpen}`, "松开 Option 切到选中的会话", 6000);
+
+  // Esc 取消：松开 Option 后不切换。
+  await altDown();
+  await tab();
+  await waitFor(panelOpen, "再次弹出面板");
+  assert.equal(await evaluate(switchSelected), "bHidden", "a24 成了当前，上一个是 bHidden");
+  await key("rawKeyDown", "Escape", "Escape", 27, ALT);
+  await key("keyUp", "Escape", "Escape", 27, ALT);
+  assert.equal(await evaluate(panelOpen), false, "Esc 关闭面板");
+  await altUp();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(await evaluate(`threads.current()?.id === ids.a24`), true, "Esc 后不切换");
+
+  // 抽屉收起（卡片整块隐藏）时照样能弹出；鼠标移到条目上改选中，点一下直接切过去。
+  await evaluate(`document.getElementById('companion').style.display = 'none'`);
+  await altDown();
+  await tab();
+  await waitFor(panelOpen, "抽屉收起时也能弹出面板");
+  assert.deepEqual(await evaluate(switchRows), ["a24", "bHidden", "s1", "a3", "a10", "other"]);
+  assert.equal(await evaluate(switchSelected), "bHidden", "鼠标没动时不改选中");
+  await pointAt(`${layer}.querySelectorAll('.item')[2]`);
+  await waitFor(`${switchSelected} === 's1'`, "鼠标移到条目上改选中");
+  const target = await evaluate(`(() => { const rect = ${layer}.querySelectorAll('.item')[2].getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; })()`);
+  await connection.send("Input.dispatchMouseEvent", { type: "mousePressed", ...target, button: "left", clickCount: 1, modifiers: ALT });
+  await connection.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...target, button: "left", clickCount: 1, modifiers: ALT });
+  await waitFor(`threads.current()?.id === ids.s1 && !${panelOpen}`, "点击条目直接切换", 6000);
+  await altUp();
+  await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 600, y: 700 });
+  await evaluate(`document.getElementById('companion').style.display = ''`);
+
+  // 设置里关掉后不再拦截 Option+Tab。
+  await evaluate(`handle.updateSettings({ switcher: false })`);
+  await altDown();
+  await tab();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(await evaluate(panelOpen), false, "关闭后不弹面板");
+  await altUp();
+  assert.equal(await evaluate(`threads.current()?.id === ids.s1`), true, "关闭后不切换");
+  await evaluate(`handle.updateSettings({})`);
 
   // 改名：默认推荐名，可改，留空回到推荐名。
   await evaluate(`${task("a3")}.querySelectorAll('.icon')[1].click()`);
@@ -386,6 +520,7 @@ try {
 
   await evaluate(`controller.abort(); handle.dispose(); threads.dispose()`);
   assert.equal(await evaluate(`document.querySelectorAll('[data-codex-companion-task]').length + (document.getElementById('codex-companion-thread-marks') ? 1 : 0)`), 0, "释放后不残留标记");
+  assert.equal(await evaluate(`document.getElementById('codex-companion-overlay-tasks')`), null, "释放后移除顶层浮层");
   assert.deepEqual(await evaluate(`errors`), []);
   console.log("Task board smoke passed:", JSON.stringify({ clicks: (await evaluate(`clicks`)).length, rpc: await evaluate(`rpcCalls.length`), idleFrames, flowFrames: frameStats }));
 } finally {

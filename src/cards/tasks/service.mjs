@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { createPlanHint } from "../../codex-plan-hint.mjs";
+import { planSummary } from "../../codex-plan.mjs";
 import { CodexSessions, THREAD_ID_PATTERN } from "../../codex-sessions.mjs";
 import { rpcError } from "../../platform/services/errors.mjs";
 import { COLOR_COUNT, MAX_TASKS, TaskBoardStorage, normalizeName, normalizeTask, pickColor } from "../../task-board-storage.mjs";
@@ -30,18 +32,29 @@ async function openThreadLink(id, { platform = process.platform } = {}) {
   await execFileAsync("/usr/bin/open", [`codex://threads/${id}`], { timeout: 5000 });
 }
 
-export function createService({ taskBoard = new TaskBoardStorage(), codexSessions = new CodexSessions(), openThread = openThreadLink } = {}) {
+// 「长任务先列计划」开关：只在配置里明确给出 planHint 时才动 Codex 指令文件，从没碰过开关的配置不读不写。
+// 任务看板或整个 Companion 被停用时也删掉提示。
+function wantPlanHint(config) {
+  const value = config?.cards?.tasks?.settings?.planHint;
+  if (typeof value !== "boolean") return null;
+  return value && config?.enabled !== false && config?.cards?.tasks?.enabled !== false;
+}
+
+export function createService({ taskBoard = new TaskBoardStorage(), codexSessions = new CodexSessions(), openThread = openThreadLink, planHint = null } = {}) {
+  let hint = planHint;
+  let hintApplied = null;
   async function view(board, signal) {
     const titles = await codexSessions.titles();
     const tasks = await Promise.all(board.tasks.map(async (task) => {
       const { status, updatedAt, turnAt, activity = null, summary = null } = await codexSessions.status(task.threadId)
         .catch(() => ({ status: "missing", updatedAt: null, turnAt: null }));
+      const plan = planSummary(await codexSessions.plan?.(task.threadId).catch(() => null));
       const suggestedName = titles.get(await codexSessions.canonicalId(task.threadId)) ?? task.suggestedName;
       // unread：回合结束（回复、提问、中断）之后用户还没在 Codex 里看过。
       const unread = status !== "running" && Number.isFinite(turnAt) && turnAt > task.seenAt;
       // 侧栏条目可能用真实 id，也可能用新建时的客户端临时 id，看板两个都认。
       const aliases = await codexSessions.aliases(task.threadId);
-      return { ...task, aliases, suggestedName, name: task.customName ?? suggestedName ?? "未命名会话", status, updatedAt, turnAt, unread, activity, summary };
+      return { ...task, aliases, suggestedName, name: task.customName ?? suggestedName ?? "未命名会话", status, updatedAt, turnAt, unread, activity, summary, plan };
     }));
     signal?.throwIfAborted();
     // sig 只覆盖界面上会变的内容；mtime 每次写入都变，不放进来，免得进行中的任务每次都触发重绘。
@@ -51,6 +64,14 @@ export function createService({ taskBoard = new TaskBoardStorage(), codexSession
   }
 
   return {
+    // 平台在启动和配置变化时调用；只在期望值变化时改写文件，失败的下次配置变化再试。
+    async applyConfig(config) {
+      const want = wantPlanHint(config);
+      if (want === null || want === hintApplied) return;
+      hint ??= createPlanHint();
+      await hint.set(want);
+      hintApplied = want;
+    },
     methods: {
       async list(input, { signal }) {
         params(input, []);
@@ -88,9 +109,9 @@ export function createService({ taskBoard = new TaskBoardStorage(), codexSession
         if (since !== null && typeof since !== "string") throw rpcError("RPC_INVALID_PARAMS", "since 无效");
         const deadline = Date.now() + Math.min(Math.max(Number(waitMs) || 0, 0), WATCH_MAX_MS);
         const read = async () => {
-          const trace = await codexSessions.trace(id);
+          const [trace, plan] = await Promise.all([codexSessions.trace(id), codexSessions.plan?.(id).catch(() => null) ?? null]);
           const sig = createHash("sha1").update(JSON.stringify(trace)).digest("hex").slice(0, 16);
-          return { threadId: id, ...trace, sig };
+          return { threadId: id, ...trace, plan, sig };
         };
         let stamp = await codexSessions.stamp(id);
         let current = await read();
