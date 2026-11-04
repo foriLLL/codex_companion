@@ -15,7 +15,7 @@ Companion 是一个非官方的 Codex 桌面端（macOS / Linux）增强，把�
 - **小游戏**：2048、扫雷和纸牌，存档保存在本机。
 - **代理状态**：查看当前 Codex 的启动代理与本机端口连通性。
 - **任务看板**：把正在推进的 Codex 会话钉在一处，实时显示进行中、等你回答、已中断等状态，
-  悬停查看单个会话的 Trace。
+  悬停查看单个会话的 Trace；macOS 上按 Option+Tab 像 ⌘Tab 一样在这些会话之间切换。
 - **卡片管理**：分别启停、调整顺序；跟随宿主明暗主题。
 
 收起卡片保留页面状态；关闭页面、取消请求或后台退出时回收
@@ -149,6 +149,17 @@ npm run probe:emby -- --server https://emby.example.com --username alice --searc
   颜色可以单独调整。
 - 鼠标在任务上停一会儿，看板左侧会弹出这个会话的 Trace：按模型、命令、文件、子代理和你分道展示
   时间线，失败与等待你输入的片段单独标出；鼠标移进面板可滚动和缩放，按 Esc 关闭。
+- Codex 用自带的计划工具（update_plan）列了步骤时，任务下方出现按步分格的进度条和完成数，
+  进行中的任务第二行显示正在做的那一步；Trace 里多一个「计划」区（每步状态与用时）和「计划」泳道。
+  没列计划时，Trace 按 Codex 干活途中的进度说明列出做过的阶段。
+- Codex 默认很少列计划。设置的「任务看板」里打开「长任务先列计划」，会在 Codex 的全局指令文件
+  （`~/.codex/AGENTS.md`；`AGENTS.override.md` 非空时写在它里面）末尾加一段带标记的提示，
+  让 Codex 对多步任务先列计划、每完成一步就更新；对新会话生效。只增删标记之间的内容，
+  关闭开关、停用任务看板或卸载 Companion 时删除。
+- macOS 上按住 Option 连按 Tab，窗口中间弹出看板会话列表（最近打开的在前），松开 Option 切过去；
+  快速点一下直接回到上一个会话。Shift+Tab 或方向键反向，Esc 取消，也可以用鼠标点选。
+  卡片收起时同样可用；看板为空时不拦截按键。设置的「任务看板」里可以关闭。
+  Linux 桌面环境自己占用 Alt+Tab，暂不提供。
 
 ## 工作原理
 
@@ -190,8 +201,9 @@ Emby Token 只发往配置的 Emby origin，不进入 DOM、媒体 URL、FFmpeg 
 `package-lock.json` 固定，运行时不加载 CDN 脚本。
 
 任务看板只读本机 Codex 数据目录（`~/.codex`，或 `CODEX_HOME`）下的会话记录、
-`session_index.jsonl` 与 `.codex-global-state.json`，不写入、不上传；看板自身的
-任务列表保存在数据目录下的 `task-board.json`。
+`session_index.jsonl` 与 `.codex-global-state.json`，不上传；唯一的写入是你打开
+「长任务先列计划」后对 `AGENTS.md` 那一段带标记的提示。看板自身的任务列表保存在
+数据目录下的 `task-board.json`。
 
 安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要在公开 issue 中提交 Token、
 服务器地址、日志原文或其他隐私信息。

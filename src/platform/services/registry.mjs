@@ -141,6 +141,12 @@ export class ServiceRegistry {
   async applyConfig(config) {
     const disabled = [...this.scopes.values()].filter(scope => config.enabled === false || config.cards?.[scope.entry.id]?.enabled === false || config.cards?.[scope.entry.id] === false);
     await this.cleanScopes(disabled);
+    // 需要跟着配置做本机动作的卡片服务（如任务看板维护 Codex 指令文件）；一张卡失败不影响其它卡。
+    for (const entry of this.services.values()) {
+      if (typeof entry.service.applyConfig !== "function") continue;
+      try { await entry.service.applyConfig(config); }
+      catch (error) { this.logger.warn?.(`[codex-companion] 卡片 ${entry.id} 应用配置失败：${error?.code ?? error?.message ?? error}`); }
+    }
   }
 
   async disposeCard(cardId) {

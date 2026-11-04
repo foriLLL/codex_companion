@@ -1,5 +1,5 @@
 {
-  "hash": "c7af35f82ae6ae1e0dbf9d144190a729123d17a6f06019acd1524d97fa49881d",
+  "hash": "55d38fa8afc9e2f70f02417e0f84f1ddd9a429776f32e23e979e60cf722abb97",
   "cards": [
     {
       "id": "proxy",
@@ -49,7 +49,8 @@
       },
       "capabilities": [
         "rpc",
-        "threads"
+        "threads",
+        "overlay"
       ],
       "entries": {
         "renderer": true,

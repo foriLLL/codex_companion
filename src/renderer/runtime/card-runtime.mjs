@@ -4,6 +4,7 @@ import { createRpcClient } from "../platform/rpc-client.mjs";
 import { createCardShell } from "../shell/card-shell.mjs";
 import { createCodexAdapter } from "../adapters/codex.mjs";
 import { createCodexThreads } from "../adapters/codex-threads.mjs";
+import { createOverlayLayer } from "../shell/overlay-layer.mjs";
 
 import { normalizeRuntimeConfig } from "../../platform/config/runtime-config.mjs";
 export { normalizeRuntimeConfig };
@@ -129,6 +130,9 @@ export function createCardRuntime({
           reportError: (error) => report(error, { cardId: manifest.id, phase: "card" }),
           isVisible: () => visibility.visible,
           ...(manifest.capabilities.includes("threads") ? { threads } : {}),
+          // 顶层浮层与本实例同生命周期：卸载、关闭或重试时随 effects 一起移除。
+          ...(manifest.capabilities.includes("overlay")
+            ? { overlay: createOverlayLayer({ document: shell.host.ownerDocument, cardId: manifest.id, effects }) } : {}),
           // 只有平台负责可见性；业务可以申请展开，不能操作原生 DOM。
           requestOpen: () => adapter?.setOpen(true)
         };

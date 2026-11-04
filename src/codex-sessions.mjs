@@ -1,6 +1,7 @@
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { applyPlanEvents, createPlanState, currentPlan, parsePlanEvents } from "./codex-plan.mjs";
 
 // 只读 Codex 本机会话数据：session_index.jsonl 里的会话名，以及 rollout 尾部的回合事件。
 // 为了在看板上显示「正在做什么」，会返回一行截短的进度：工具与命令首行、修改的文件名、
@@ -15,6 +16,10 @@ const CLIENT_PREFIX = "client-new-thread:";
 export const STALLED_AFTER_MS = 15 * 60_000;
 const MISS_CACHE_MS = 60_000;
 const LIFECYCLE = { task_started: "running", task_complete: "idle", turn_aborted: "interrupted" };
+// 计划快照可能远在尾部窗口之前（一步就能写出几 MB 输出）：首次按 2MB → 16MB 往前找到回合开头，之后只读新增部分。
+const PLAN_WINDOWS = [2 * 1024 * 1024, 16 * 1024 * 1024];
+const PLAN_CACHE_LIMIT = 64;
+const MAX_TURN_NOTES = 20;
 
 export function defaultCodexHome({ env = process.env, home = homedir() } = {}) {
   return env.CODEX_HOME && isAbsolute(env.CODEX_HOME) ? env.CODEX_HOME : join(home, ".codex");
@@ -234,7 +239,7 @@ export function parseTrace(text) {
     const event = line.includes("\"event_msg\"") && line.match(/"payload":\{"type":"(\w+)"/)?.[1];
     if (event === "task_started") {
       if (turn && turn.end === null) { turn.end = at; turn.status = "interrupted"; }
-      turn = { start: at, end: null, status: "running", ttftMs: null, asking: false, segments: [], tokens: { input: 0, output: 0, reasoning: 0 } };
+      turn = { start: at, end: null, status: "running", ttftMs: null, asking: false, segments: [], notes: [], tokens: { input: 0, output: 0, reasoning: 0 } };
       turns.push(turn);
       cursor = at;
       group = [];
@@ -289,7 +294,10 @@ export function parseTrace(text) {
     try { payload = JSON.parse(line).payload ?? {}; } catch { continue; }
     if (payload.type === "reasoning") modelSegment("think", at, "思考");
     else if (payload.type === "message" && payload.role === "assistant") {
-      modelSegment("reply", at, firstLine((payload.content ?? []).map((part) => part?.text ?? "").join("\n")) ?? "回复");
+      const text = firstLine((payload.content ?? []).map((part) => part?.text ?? "").join("\n"));
+      modelSegment("reply", at, text ?? "回复");
+      // Codex 干活途中的进度说明（commentary）；没列计划时，Trace 用它们推断做过哪些阶段。
+      if (text && payload.phase !== "final_answer") turn.notes = [...turn.notes, { at, text }].slice(-MAX_TURN_NOTES);
     } else if (payload.type === "function_call" || payload.type === "custom_tool_call") {
       const input = payload.arguments ?? payload.input;
       const label = describeTool(payload.name, input);
@@ -305,6 +313,24 @@ export function parseTrace(text) {
     if (!pending.size) push({ kind: "think", lane: "model", start: cursor, end: null, label: "思考中" });
   }
   return { model, contextWindow, turns: turns.slice(-MAX_TRACE_TURNS) };
+}
+
+async function readRange(path, start, end) {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(Math.max(0, end - start));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    return buffer.subarray(0, bytesRead);
+  } finally { await handle.close(); }
+}
+
+// 只取完整的行：窗口中途开始时丢掉第一段残行，末尾没写完的半行留到下次。used 为消费到的字节数。
+function completeLines(buffer, skipFirst) {
+  const from = skipFirst ? buffer.indexOf(10) + 1 : 0;
+  if (skipFirst && from === 0) return { text: "", used: 0 };
+  const last = buffer.lastIndexOf(10);
+  if (last < from) return { text: "", used: from };
+  return { text: buffer.subarray(from, last + 1).toString("utf8"), used: last + 1 };
 }
 
 async function readTail(path, size, bytes) {
@@ -325,6 +351,9 @@ export class CodexSessions {
     this.misses = new Map();
     this.index = { mtimeMs: -1, size: -1, titles: new Map() };
     this.state = { mtimeMs: -1, size: -1, real: new Map(), client: new Map() };
+    // rollout 路径 → { offset: 已读到的字节, state: 计划状态 }；多个长轮询并发时排队读，避免重复计入事件。
+    this.plans = new Map();
+    this.planQueue = Promise.resolve();
   }
 
   /**
@@ -434,6 +463,41 @@ export class CodexSessions {
       for (const segment of last.segments) segment.end ??= updatedAt;
     }
     return { ...trace, updatedAt };
+  }
+
+  /** 会话当前的计划（Codex 自带 update_plan 的最新快照，带每步起止时间）；没有或已过期时为 null。 */
+  plan(id) {
+    const run = this.planQueue.then(() => this.readPlan(id));
+    this.planQueue = run.catch(() => {});
+    return run;
+  }
+
+  async readPlan(id) {
+    const path = await this.locate(id);
+    if (!path) return null;
+    let size;
+    try { size = (await stat(path)).size; } catch { return null; }
+    let entry = this.plans.get(path);
+    // 文件被截短，或新增内容比最大窗口还多：从尾部重新找起。
+    if (entry && (size < entry.offset || size - entry.offset > PLAN_WINDOWS.at(-1))) entry = null;
+    if (!entry) {
+      for (const window of PLAN_WINDOWS) {
+        const start = Math.max(0, size - window);
+        const { text, used } = completeLines(await readRange(path, start, size), start > 0);
+        const events = parsePlanEvents(text);
+        if (start === 0 || window === PLAN_WINDOWS.at(-1) || events.some((event) => event.type === "turn")) {
+          entry = { offset: start + used, state: applyPlanEvents(createPlanState(), events) };
+          break;
+        }
+      }
+      this.plans.set(path, entry);
+      while (this.plans.size > PLAN_CACHE_LIMIT) this.plans.delete(this.plans.keys().next().value);
+    } else if (size > entry.offset) {
+      const { text, used } = completeLines(await readRange(path, entry.offset, size), false);
+      applyPlanEvents(entry.state, parsePlanEvents(text));
+      entry.offset += used;
+    }
+    return currentPlan(entry.state);
   }
 
   /** 单个会话记录文件的指纹，Trace 长轮询用。 */

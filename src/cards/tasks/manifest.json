@@ -7,5 +7,5 @@
   "layout": { "height": "content", "minHeight": 0, "scroll": "outer" },
   "lifecycle": { "hidden": "retain", "start": "immediate" },
   "state": { "scope": "global", "version": 1 },
-  "capabilities": ["rpc", "threads"]
+  "capabilities": ["rpc", "threads", "overlay"]
 }

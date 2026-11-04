@@ -21,7 +21,10 @@ const ICONS = {
 };
 
 // 平台设置只读写 RPC；运行时配置仍由 watcher 推送，不能在这里直接改卡片。
-export function createSettingsPanel({ document: doc, call, onClose = () => {} }) {
+// platform 缺省取页面 navigator，测试显式传入。
+export function createSettingsPanel({ document: doc, call, onClose = () => {}, platform }) {
+  const nav = doc.defaultView?.navigator;
+  const mac = /mac|darwin/i.test(String(platform ?? nav?.userAgentData?.platform ?? nav?.platform ?? ""));
   const element = doc.createElement("section");
   element.className = "cc-settings";
   element.hidden = true;
@@ -67,16 +70,16 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
     element.append(value);
     return group;
   }
-  // 原生 checkbox 保留键盘与表单语义，外观按 Codex 开关绘制。
-  function checkbox(parent, title, key, patch, hint) {
+  // 原生 checkbox 保留键盘与表单语义，外观按 Codex 开关绘制。hint 可以是文字或现成的 small 节点。
+  function checkbox(parent, title, key, patch, hint, disabled) {
     const label = node("label", null, "cc-settings-row");
-    const input = control(node("input"));
+    const input = control(node("input"), disabled);
     input.type = "checkbox";
     input.className = "cc-switch";
     input.setAttribute("role", "switch");
     input.dataset.setting = key;
     const text = node("span", title);
-    if (hint) text.append(node("small", hint));
+    if (hint) text.append(typeof hint === "string" ? node("small", hint) : hint);
     label.append(text, input);
     parent.append(label);
     listen(input, "change", () => { void save(patch(input.checked)); });
@@ -218,6 +221,18 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
     placements.set(value, input);
     listen(input, "change", () => { if (input.checked) void save({ placement: value }); });
   }
+  // 任务看板的设置写在卡片 settings 里；没有任务看板卡片时整组隐藏。
+  // 「长任务先列计划」由后台写进 Codex 的全局指令文件（AGENTS.md），关闭即删除。
+  // 快捷键只在 macOS 显示（Linux 桌面环境自己占用 Alt+Tab）。
+  const tasksSection = section("任务看板");
+  const tasksOff = () => config.cards?.tasks?.enabled === false;
+  const planHintHint = node("small");
+  const planHint = checkbox(tasksSection, "长任务先列计划", "tasks-plan-hint",
+    value => ({ cards: { tasks: { settings: { planHint: value } } } }), planHintHint, tasksOff);
+  const switcherHint = node("small");
+  const switcher = checkbox(tasksSection, "Option+Tab 切换看板会话", "tasks-switcher",
+    value => ({ cards: { tasks: { settings: { switcher: value } } } }), switcherHint, tasksOff);
+  switcher.parentNode.hidden = !mac;
   const proxySection = section("启动");
   const proxyEnabled = checkbox(proxySection, "通过代理启动", "proxy-enabled", value => ({ launch: { proxy: { enabled: value } } }));
   const portForm = node("form", null, "cc-settings-row");
@@ -388,6 +403,11 @@ export function createSettingsPanel({ document: doc, call, onClose = () => {} })
     else cardList.setAttribute("data-off", "");
     for (const [value, input] of placements) input.checked = value === config.placement;
     proxyEnabled.checked = config.launch?.proxy?.enabled ?? false;
+    tasksSection.parentElement.hidden = !catalog.some(card => card.id === "tasks");
+    planHint.checked = config.cards?.tasks?.settings?.planHint === true;
+    planHintHint.textContent = tasksOff() ? "需先启用任务看板" : "在 Codex 的 AGENTS.md 加一段提示，让它拆步骤并同步进度，看板据此显示计划；对新会话生效，关闭即删除";
+    switcher.checked = config.cards?.tasks?.settings?.switcher !== false;
+    switcherHint.textContent = tasksOff() ? "需先启用任务看板" : "按住 Option 连按 Tab 选择，松开即切换";
     autoRelaunch.checked = config.agent?.autoRelaunch ?? true;
     if (resetPort) {
       portInput.value = String(config.launch?.proxy?.port ?? 7890);
